@@ -93,7 +93,8 @@ X:\SomeFolder\OfflineMeetingTranscriber
 - Setup auto-starts and shows a task list, spinner, command text, and progress bars.
 - Setup extracts the app source and resources into the install folder.
 - Setup creates `config.json`, `models\`, and `transcripts\` there.
-- Missing Python packages install with `pip --user`.
+- Missing Python packages install into `OfflineMeetingTranscriber\.runtime\venv`.
+- No Python packages are installed into global Python or user site-packages.
 - Important setup messages stay visible for 5 seconds before moving on.
 - When prerequisites finish, setup shows a 5-second launch countdown.
 - After setup closes, the small startup window appears again while the main transcriber loads.
@@ -157,15 +158,28 @@ Saved transcript format:
 
 The console also prints live lines and later speaker updates.
 
+## Error Logs
+
+Setup and runtime errors are appended here:
+
+```text
+OfflineMeetingTranscriber\error_log.txt
+```
+
+Use this file when setup fails, dependencies fail to install, or Record shows a model/configuration error. The installer also shows step details on mouseover in the left task list.
+
 ## First-Run Folder Layout
 
 After opening copied `.pyw`, install folder contains:
 
 ```text
 OfflineMeetingTranscriber/
+  .runtime/
+    venv/
   app/
   resources/
   config.json
+  error_log.txt   (created after an error)
   models/
     faster-whisper/
     pyannote-pipeline/
@@ -174,6 +188,8 @@ OfflineMeetingTranscriber/
 ```
 
 Keep model folders and transcripts in this local folder. Avoid OneDrive for large model files.
+
+The `.pyw` launcher still needs Python 3.12 to start. After that, app dependencies live inside `.runtime\venv` under this same install folder.
 
 ## Portable App Status
 
@@ -289,7 +305,7 @@ py -3.12 -B -m unittest discover -s tests -v
 py -3.12 -B -m py_compile app\app_config.py app\bootstrap_launcher.py app\meeting_transcriber_gui.py app\transcriber_engine.py packaging\build_standalone_pyw.py "Open Offline Meeting Transcriber.pyw" tests\test_bootstrap_launcher.py tests\test_app_config.py tests\test_engine_core.py tests\test_standalone_launcher.py packaging\local_whisper_transcriber.spec
 ```
 
-Expected current result: 30 tests pass.
+Expected current result: 36 tests pass.
 
 ## Corporate Laptop Notes
 

@@ -61,6 +61,7 @@ class StandaloneLauncherTests(unittest.TestCase):
             self.assertTrue((app_root / "app" / "bootstrap_launcher.py").is_file())
             self.assertTrue((app_root / "resources" / "requirements.txt").is_file())
             self.assertTrue((app_root / "config.json").is_file())
+            self.assertTrue((app_root / ".runtime").is_dir())
             self.assertTrue((app_root / "models" / "faster-whisper").is_dir())
             self.assertTrue((app_root / "transcripts").is_dir())
 

@@ -5,7 +5,7 @@ import threading
 from typing import Any
 import warnings
 
-from app_config import load_portable_config
+from app_config import append_error_log, application_root, load_portable_config
 from transcriber_engine import (
     EngineConfig,
     MeetingTranscriberEngine,
@@ -274,7 +274,9 @@ class MainWindow(QMainWindow):
         config = self._read_config()
         errors = config.validate()
         if errors:
-            QMessageBox.critical(self, "Configuration error", "\n".join(errors))
+            message = "\n".join(errors)
+            log_path = self._write_error_log("Configuration error", message, {"errors": errors})
+            QMessageBox.critical(self, "Configuration error", f"{message}\n\nError details saved to {log_path}")
             return
 
         self.transcript_table.setRowCount(0)
@@ -285,8 +287,10 @@ class MainWindow(QMainWindow):
         try:
             self.engine.start()
         except Exception as exc:
-            self._append_log(str(exc))
-            QMessageBox.critical(self, "Start failed", str(exc))
+            message = str(exc)
+            log_path = self._write_error_log("Start failed", message)
+            self._append_log(message)
+            QMessageBox.critical(self, "Start failed", f"{message}\n\nError details saved to {log_path}")
             self.engine = None
             return
         self._set_running(True)
@@ -333,7 +337,10 @@ class MainWindow(QMainWindow):
         elif event_type == "speakers":
             self._update_speakers(payload.get("speakers", []))
         elif event_type == "error":
-            self._append_log(str(payload.get("message", "")))
+            message = str(payload.get("message", ""))
+            if message:
+                log_path = self._write_error_log("Runtime error", message)
+                self._append_log(f"{message}\nError details saved to {log_path}")
         elif event_type == "log":
             self._append_log(str(payload.get("message", "")))
 
@@ -373,6 +380,12 @@ class MainWindow(QMainWindow):
     def _append_log(self, message: str) -> None:
         if message:
             self.log_box.append(message)
+
+    def _write_error_log(self, context: str, message: str, details: Any | None = None) -> str:
+        try:
+            return str(append_error_log(application_root(), context, message, details))
+        except Exception as exc:  # pragma: no cover - logging must not block UI
+            return f"error_log.txt (failed to write: {exc})"
 
     def _set_running(self, running: bool) -> None:
         self.record_button.setEnabled(not running)

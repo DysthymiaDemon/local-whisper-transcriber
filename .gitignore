@@ -1,6 +1,8 @@
 __pycache__/
 *.py[cod]
+*.zip
 .venv/
+.runtime/
 build/
 dist/
 OfflineMeetingTranscriber/

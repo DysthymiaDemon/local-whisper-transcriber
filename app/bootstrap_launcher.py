@@ -8,12 +8,13 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Mapping
+from typing import Callable, Mapping
 
-from app_config import application_root, source_root
+from app_config import append_error_log, application_root, source_root
 
 
 REQUIRED_IMPORTS: dict[str, str] = {
@@ -47,6 +48,8 @@ MODEL_GUIDES: dict[str, str] = {
 }
 SETUP_MARKER = ".setup_complete"
 IMPORTANT_MESSAGE_SECONDS = 5
+RUNTIME_DIR = ".runtime"
+VENV_DIR = "venv"
 
 BOOTSTRAP_STEPS = [
     "Checking Python runtime",
@@ -78,6 +81,85 @@ class PipProgressEvent:
     detail: str
     progress_percent: int | None = None
     raw_line: str = ""
+
+
+@dataclass
+class StepDiagnostic:
+    name: str
+    state: StepState = StepState.PENDING
+    detail: str = ""
+    command: str = ""
+    last_output: str = ""
+    error: str = ""
+    start_time: float | None = None
+    end_time: float | None = None
+
+
+@dataclass(frozen=True)
+class PipInstallResult:
+    code: int
+    command: str
+    recent_output: list[str]
+
+
+def format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "0s"
+    seconds = max(0, int(seconds))
+    minutes, remaining = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes}m {remaining}s"
+    if minutes:
+        return f"{minutes}m {remaining}s"
+    return f"{remaining}s"
+
+
+def build_step_tooltip(diagnostic: StepDiagnostic, now: float | None = None) -> str:
+    current = time.time() if now is None else now
+    elapsed_end = diagnostic.end_time if diagnostic.end_time is not None else current
+    started = diagnostic.start_time if diagnostic.start_time is not None else elapsed_end
+    lines = [
+        diagnostic.name,
+        f"Status: {diagnostic.state.value}",
+        f"Elapsed: {format_duration(elapsed_end - started)}",
+    ]
+    if diagnostic.detail:
+        lines.append(f"Detail: {diagnostic.detail}")
+    if diagnostic.command:
+        lines.append(f"Command: {diagnostic.command}")
+    if diagnostic.last_output:
+        lines.append(f"Last output: {diagnostic.last_output}")
+    if diagnostic.error:
+        lines.append(f"Error: {diagnostic.error}")
+    return "\n".join(lines)
+
+
+class PipInstallProgressTracker:
+    def __init__(self, start_time: float | None = None) -> None:
+        self.start_time = time.time() if start_time is None else start_time
+        self.event_count = 0
+        self.progress = 0
+
+    def record(self, event: PipProgressEvent, now: float | None = None) -> tuple[int, str]:
+        self.event_count += 1
+        current = time.time() if now is None else now
+        if event.progress_percent == 100:
+            self.progress = 100
+        elif event.progress_percent == 0:
+            self.progress = max(self.progress, 20)
+        else:
+            self.progress = min(95, max(self.progress + 3, 8 + self.event_count * 4))
+
+        elapsed = current - self.start_time
+        if self.progress >= 100:
+            eta = "ETA complete"
+        elif self.event_count < 3 or self.progress < 10:
+            eta = "ETA estimating..."
+        else:
+            remaining = elapsed * ((100 - self.progress) / self.progress)
+            eta = f"ETA ~{format_duration(remaining)}"
+        return self.progress, f"Elapsed {format_duration(elapsed)} | {eta}"
 
 
 class PipProgressParser:
@@ -119,12 +201,88 @@ class PipProgressParser:
         return PipProgressEvent("Running pip", stripped, None, line)
 
 
+class ToolTip:
+    def __init__(self, widget, text_callback: Callable[[], str]) -> None:
+        self.widget = widget
+        self.text_callback = text_callback
+        self.tip = None
+        widget.bind("<Enter>", self.show)
+        widget.bind("<Leave>", self.hide)
+        widget.bind("<Motion>", self.move)
+
+    def show(self, event=None) -> None:
+        del event
+        if self.tip is not None:
+            return
+        text = self.text_callback()
+        if not text:
+            return
+        import tkinter as tk
+
+        self.tip = tk.Toplevel(self.widget)
+        self.tip.wm_overrideredirect(True)
+        label = tk.Label(
+            self.tip,
+            text=text,
+            justify="left",
+            background="#ffffe0",
+            relief="solid",
+            borderwidth=1,
+            font=("Segoe UI", 9),
+            padx=6,
+            pady=4,
+        )
+        label.pack()
+        self.move()
+
+    def move(self, event=None) -> None:
+        del event
+        if self.tip is None:
+            return
+        x = self.widget.winfo_pointerx() + 14
+        y = self.widget.winfo_pointery() + 12
+        self.tip.wm_geometry(f"+{x}+{y}")
+
+    def hide(self, event=None) -> None:
+        del event
+        if self.tip is not None:
+            self.tip.destroy()
+            self.tip = None
+
+
 def runtime_root() -> Path:
     return application_root()
 
 
 def installer_source_root() -> Path:
     return source_root()
+
+
+def local_runtime_dir(root: Path) -> Path:
+    return root / RUNTIME_DIR
+
+
+def local_venv_dir(root: Path) -> Path:
+    return local_runtime_dir(root) / VENV_DIR
+
+
+def local_venv_python(root: Path, prefer_windowed: bool = False) -> Path:
+    scripts = local_venv_dir(root) / "Scripts"
+    preferred = scripts / ("pythonw.exe" if prefer_windowed else "python.exe")
+    if preferred.exists():
+        return preferred
+    return scripts / "python.exe"
+
+
+def running_in_local_venv(root: Path) -> bool:
+    if getattr(sys, "frozen", False):
+        return True
+    try:
+        executable = Path(sys.executable).resolve()
+        venv = local_venv_dir(root).resolve()
+        return executable == local_venv_python(root).resolve() or venv in executable.parents
+    except OSError:
+        return False
 
 
 def app_source_dir(root: Path | None = None) -> Path:
@@ -150,7 +308,39 @@ def missing_imports(required: Mapping[str, str] = REQUIRED_IMPORTS) -> list[str]
     return missing
 
 
+def missing_runtime_imports(root: Path, required: Mapping[str, str] = REQUIRED_IMPORTS) -> list[str]:
+    if getattr(sys, "frozen", False):
+        return missing_imports(required)
+
+    python_path = local_venv_python(root)
+    if not python_path.exists():
+        return list(required.keys())
+
+    probe = (
+        "import importlib.util, json, sys; "
+        f"required = {json.dumps(dict(required))}; "
+        "missing = [label for label, module in required.items() if importlib.util.find_spec(module) is None]; "
+        "print(json.dumps(missing)); "
+        "sys.exit(1 if missing else 0)"
+    )
+    result = subprocess.run(
+        [str(python_path), "-c", probe],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    try:
+        parsed = json.loads(result.stdout.strip() or "[]")
+    except json.JSONDecodeError:
+        return list(required.keys())
+    return [item for item in parsed if isinstance(item, str)]
+
+
 def ensure_portable_layout(root: Path, template_root: Path | None = None) -> Path:
+    local_runtime_dir(root).mkdir(parents=True, exist_ok=True)
     models = root / "models"
     for name in MODEL_DIRS:
         model_dir = models / name
@@ -272,6 +462,21 @@ def launch_gui(root: Path, splash=None, splash_status=None) -> int:
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
     os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+
+    if not running_in_local_venv(root):
+        python_path = local_venv_python(root, prefer_windowed=True)
+        if python_path.exists():
+            update_startup_splash(splash, splash_status, "Switching to local app Python...")
+            close_startup_splash(splash)
+            script_path = app_source_dir(root) / "bootstrap_launcher.py"
+            env = os.environ.copy()
+            env["LOCAL_WHISPER_APP_ROOT"] = str(root)
+            env["LOCAL_WHISPER_SOURCE_ROOT"] = str(root)
+            env.setdefault("HF_HUB_OFFLINE", "1")
+            env.setdefault("TRANSFORMERS_OFFLINE", "1")
+            env.setdefault("HF_DATASETS_OFFLINE", "1")
+            return subprocess.call([str(python_path), str(script_path)], cwd=str(root), env=env)
+
     if splash is None:
         try:
             splash, splash_status = create_startup_splash()
@@ -293,11 +498,32 @@ def launch_gui(root: Path, splash=None, splash_status=None) -> int:
     return main()
 
 
-def run_pip_install(root: Path, on_event, package_root: Path | None = None) -> int:
+def run_pip_install(root: Path, on_event, package_root: Path | None = None) -> PipInstallResult:
     package_root = package_root or installer_source_root()
     requirements_path = resource_root(package_root) / "requirements.txt"
-    cmd = [sys.executable, "-m", "pip", "install", "--user", "-r", str(requirements_path)]
-    on_event(PipProgressEvent("Running command", " ".join(cmd), 0, " ".join(cmd)))
+    venv_path = local_venv_dir(root)
+    if not local_venv_python(root).exists():
+        venv_cmd = [sys.executable, "-m", "venv", str(venv_path)]
+        venv_command = subprocess.list2cmdline(venv_cmd)
+        on_event(PipProgressEvent("Creating local Python environment", venv_command, 0, venv_command))
+        venv_result = subprocess.run(
+            venv_cmd,
+            cwd=str(root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        if venv_result.returncode != 0:
+            recent = [line for line in venv_result.stdout.splitlines() if line.strip()][-25:]
+            return PipInstallResult(venv_result.returncode, venv_command, recent)
+
+    python_path = local_venv_python(root)
+    cmd = [str(python_path), "-m", "pip", "install", "--no-cache-dir", "-r", str(requirements_path)]
+    command = subprocess.list2cmdline(cmd)
+    on_event(PipProgressEvent("Running command", command, 0, command))
     process = subprocess.Popen(
         cmd,
         cwd=str(package_root),
@@ -309,14 +535,35 @@ def run_pip_install(root: Path, on_event, package_root: Path | None = None) -> i
     )
     assert process.stdout is not None
     parser = PipProgressParser()
+    recent_output: deque[str] = deque(maxlen=25)
     for line in process.stdout:
-        on_event(parser.parse(line.rstrip()))
-    return process.wait()
+        stripped = line.rstrip()
+        recent_output.append(stripped)
+        on_event(parser.parse(stripped))
+    return PipInstallResult(process.wait(), command, list(recent_output))
+
+
+def write_setup_error_log(
+    root: Path,
+    context: str,
+    message: str,
+    command: str = "",
+    recent_output: list[str] | None = None,
+) -> Path:
+    return append_error_log(
+        root,
+        context,
+        message,
+        {
+            "command": command,
+            "recent_output": recent_output or [],
+        },
+    )
 
 
 def needs_setup(root: Path, required: Mapping[str, str] = REQUIRED_IMPORTS) -> bool:
     ensure_portable_layout(root, installer_source_root())
-    return bool(missing_imports(required)) or not (root / SETUP_MARKER).exists()
+    return bool(missing_runtime_imports(root, required)) or not (root / SETUP_MARKER).exists()
 
 
 def run_bootstrap() -> int:
@@ -333,7 +580,7 @@ def run_bootstrap() -> int:
 
     ensure_portable_layout(root, package_root)
     update_startup_splash(splash, splash_status, "Checking Python packages...")
-    missing_packages = missing_imports()
+    missing_packages = missing_runtime_imports(root)
     update_startup_splash(splash, splash_status, "Checking first-time setup status...")
     setup_missing = not (root / SETUP_MARKER).exists()
     if not missing_packages and not setup_missing:
@@ -370,8 +617,12 @@ def run_bootstrap() -> int:
     overall_progress_value = tk.IntVar(value=0)
     package_detail = tk.StringVar(value="Waiting to start")
     command_detail = tk.StringVar(value="")
+    eta_detail = tk.StringVar(value="")
     final_message_active = tk.BooleanVar(value=False)
     ui_thread = threading.current_thread()
+    step_diagnostics = {step: StepDiagnostic(step) for step in BOOTSTRAP_STEPS}
+    tooltip_refs = []
+    pip_tracker: dict[str, PipInstallProgressTracker | None] = {"value": None}
 
     title = tk.Label(
         window,
@@ -427,6 +678,7 @@ def run_bootstrap() -> int:
         )
         row.pack(fill="x", pady=3)
         task_labels[step] = row
+        tooltip_refs.append(ToolTip(row, lambda name=step: build_step_tooltip(step_diagnostics[name])))
 
     detail_title = tk.Label(
         detail_frame,
@@ -472,6 +724,17 @@ def run_bootstrap() -> int:
     )
     detail_bar.pack(fill="x", padx=18, pady=(0, 12))
 
+    eta_label = tk.Label(
+        detail_frame,
+        textvariable=eta_detail,
+        font=("Segoe UI", 9),
+        anchor="w",
+        justify="left",
+        bg="#ffffff",
+        fg="#666666",
+    )
+    eta_label.pack(fill="x", padx=18, pady=(0, 8))
+
     package_text = readonly_text(
         detail_frame,
         height=7,
@@ -492,6 +755,11 @@ def run_bootstrap() -> int:
         widget.delete("1.0", "end")
         widget.insert("1.0", value)
         widget.configure(state="disabled")
+
+    def set_command_text(value: str) -> None:
+        command_detail.set(value)
+        set_text(command_text, value)
+        step_diagnostics[current_step].last_output = value
 
     def run_on_ui(callback):
         if threading.current_thread() is ui_thread:
@@ -542,6 +810,16 @@ def run_bootstrap() -> int:
             nonlocal current_step
             current_step = step
             step_states[step] = state
+            diagnostic = step_diagnostics[step]
+            diagnostic.state = state
+            if diagnostic.start_time is None and state == StepState.RUNNING:
+                diagnostic.start_time = time.time()
+            if state in (StepState.DONE, StepState.WARNING, StepState.ERROR):
+                diagnostic.end_time = time.time()
+            if detail:
+                diagnostic.detail = detail
+            if state == StepState.ERROR:
+                diagnostic.error = detail
             detail_title.config(text=step)
             if detail:
                 package_detail.set(detail)
@@ -556,8 +834,7 @@ def run_bootstrap() -> int:
     def important_message(step: str, message: str) -> None:
         set_step(step, StepState.RUNNING, message, None)
         def apply_message() -> None:
-            command_detail.set(message)
-            set_text(command_text, message)
+            set_command_text(message)
 
         run_on_ui(apply_message)
         time.sleep(IMPORTANT_MESSAGE_SECONDS)
@@ -587,13 +864,21 @@ def run_bootstrap() -> int:
 
     def update_from_pip(event: PipProgressEvent) -> None:
         def apply_event() -> None:
-            command_detail.set(event.phase)
-            set_text(command_text, event.phase)
+            set_command_text(event.phase)
             if event.detail:
                 package_detail.set(event.detail)
                 set_text(package_text, event.detail)
+                step_diagnostics[BOOTSTRAP_STEPS[3]].detail = event.detail
+            step_diagnostics[BOOTSTRAP_STEPS[3]].last_output = event.raw_line or event.detail or event.phase
+            tracker = pip_tracker["value"]
+            progress = None
+            if tracker is not None:
+                progress, eta = tracker.record(event)
+                eta_detail.set(eta)
+                detail_progress_value.set(progress)
             if event.progress_percent is not None:
-                detail_progress_value.set(event.progress_percent)
+                current_progress = progress if progress is not None else detail_progress_value.get()
+                detail_progress_value.set(max(current_progress, event.progress_percent))
             render_steps()
 
         window.after(0, apply_event)
@@ -610,6 +895,7 @@ def run_bootstrap() -> int:
             detail_title.config(text="Prerequisites setup done")
             command_detail.set("")
             set_text(command_text, "")
+            eta_detail.set("")
             detail = f"Launching transcriber in {seconds} seconds..."
             package_detail.set(detail)
             set_text(package_text, detail)
@@ -625,7 +911,7 @@ def run_bootstrap() -> int:
         countdown()
 
     def launch_if_ready() -> None:
-        missing = missing_imports()
+        missing = missing_runtime_imports(root)
         if missing:
             messagebox.showerror("Missing packages", "Install packages first:\n" + "\n".join(missing))
             return
@@ -647,16 +933,45 @@ def run_bootstrap() -> int:
             set_step(BOOTSTRAP_STEPS[1], StepState.DONE, "App folders ready", 100)
 
             important_message(BOOTSTRAP_STEPS[2], "Checking required Python packages...")
-            missing = missing_imports()
+            missing = missing_runtime_imports(root)
             if missing:
                 set_step(BOOTSTRAP_STEPS[2], StepState.WARNING, "Missing: " + ", ".join(missing), 100)
                 set_step(BOOTSTRAP_STEPS[3], StepState.RUNNING, "Installing missing packages", 0)
-                command = f"{sys.executable} -m pip install --user -r {resource_root(package_root) / 'requirements.txt'}"
-                run_on_ui(lambda: (command_detail.set("Running command:\n" + command), set_text(command_text, "Running command:\n" + command)))
+                command = subprocess.list2cmdline(
+                    [
+                        str(local_venv_python(root)),
+                        "-m",
+                        "pip",
+                        "install",
+                        "--no-cache-dir",
+                        "-r",
+                        str(resource_root(package_root) / "requirements.txt"),
+                    ]
+                )
+                def show_command() -> None:
+                    set_command_text("Running command:\n" + command)
+                    step_diagnostics[BOOTSTRAP_STEPS[3]].command = command
+
+                run_on_ui(show_command)
                 time.sleep(IMPORTANT_MESSAGE_SECONDS)
-                code = run_pip_install(root, update_from_pip, package_root)
-                if code != 0:
-                    set_step(BOOTSTRAP_STEPS[3], StepState.ERROR, f"pip failed with exit code {code}", 100)
+                pip_tracker["value"] = PipInstallProgressTracker()
+                result = run_pip_install(root, update_from_pip, package_root)
+                if result.code != 0:
+                    log_path = write_setup_error_log(
+                        root,
+                        BOOTSTRAP_STEPS[3],
+                        f"pip failed with exit code {result.code}",
+                        result.command,
+                        result.recent_output,
+                    )
+                    step_diagnostics[BOOTSTRAP_STEPS[3]].command = result.command
+                    step_diagnostics[BOOTSTRAP_STEPS[3]].last_output = "\n".join(result.recent_output[-3:])
+                    set_step(
+                        BOOTSTRAP_STEPS[3],
+                        StepState.ERROR,
+                        f"pip failed with exit code {result.code}\nError details saved to {log_path}",
+                        100,
+                    )
                     return
                 set_step(BOOTSTRAP_STEPS[3], StepState.DONE, "Python packages installed", 100)
             else:
@@ -680,9 +995,10 @@ def run_bootstrap() -> int:
             set_step(BOOTSTRAP_STEPS[5], StepState.DONE, "Setup complete", 100)
             window.after(0, finish_with_launch_countdown)
         except Exception as exc:
+            log_path = write_setup_error_log(root, current_step, f"Setup failed: {exc}")
             window.after(
                 0,
-                lambda: set_step(current_step, StepState.ERROR, f"Setup failed:\n{exc}", 100),
+                lambda: set_step(current_step, StepState.ERROR, f"Setup failed:\n{exc}\nError details saved to {log_path}", 100),
             )
 
     def start_flow() -> None:

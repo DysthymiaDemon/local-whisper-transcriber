@@ -7,10 +7,26 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
-from app_config import ENV_APP_ROOT, default_local_app_root, default_portable_config, load_portable_config
+from app_config import ENV_APP_ROOT, append_error_log, default_local_app_root, default_portable_config, load_portable_config
 
 
 class PortableConfigTests(unittest.TestCase):
+    def test_append_error_log_creates_debug_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = append_error_log(
+                tmp,
+                "Configuration error",
+                "Missing model files",
+                {"errors": ["model.bin missing"], "command": "python -m pip"},
+            )
+            content = log_path.read_text(encoding="utf-8")
+
+        self.assertEqual(log_path.name, "error_log.txt")
+        self.assertIn("context: Configuration error", content)
+        self.assertIn("message: Missing model files", content)
+        self.assertIn("model.bin missing", content)
+        self.assertIn("python -m pip", content)
+
     def test_default_local_app_root_can_be_overridden(self):
         with tempfile.TemporaryDirectory() as tmp:
             previous = os.environ.get(ENV_APP_ROOT)

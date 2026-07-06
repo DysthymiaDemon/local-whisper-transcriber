@@ -95,6 +95,7 @@ def write_payload_file(root: Path, rel_path: str, encoded: str, expected_sha: st
 
 
 def ensure_runtime_folders(root: Path) -> None:
+    (root / ".runtime").mkdir(parents=True, exist_ok=True)
     for model in ("faster-whisper", "pyannote-pipeline", "pyannote-embedding"):
         (root / "models" / model).mkdir(parents=True, exist_ok=True)
     (root / "transcripts").mkdir(parents=True, exist_ok=True)

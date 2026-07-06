@@ -3,19 +3,29 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 from bootstrap_launcher import (
     BOOTSTRAP_STEPS,
     PipProgressParser,
+    PipInstallProgressTracker,
+    PipProgressEvent,
     REQUIRED_IMPORTS,
     SETUP_MARKER,
     BootstrapStatus,
+    StepDiagnostic,
+    StepState,
+    build_step_tooltip,
     ensure_portable_layout,
+    local_runtime_dir,
+    local_venv_dir,
     missing_imports,
+    missing_runtime_imports,
     model_folder_status,
     needs_setup,
+    write_setup_error_log,
 )
 
 
@@ -49,6 +59,7 @@ class BootstrapLauncherTests(unittest.TestCase):
             config_path = ensure_portable_layout(root)
 
             self.assertTrue(config_path.exists())
+            self.assertTrue((root / ".runtime").is_dir())
             self.assertTrue((root / "models" / "faster-whisper").is_dir())
             self.assertTrue((root / "models" / "pyannote-pipeline").is_dir())
             self.assertTrue((root / "models" / "pyannote-embedding").is_dir())
@@ -58,6 +69,19 @@ class BootstrapLauncherTests(unittest.TestCase):
 
         self.assertEqual(config["whisper_model_dir"], "models/faster-whisper")
         self.assertEqual(config["output_file"], "transcripts/meeting_transcript.txt")
+
+    def test_local_runtime_paths_stay_under_install_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            self.assertEqual(local_runtime_dir(root), root / ".runtime")
+            self.assertEqual(local_venv_dir(root), root / ".runtime" / "venv")
+
+    def test_missing_runtime_imports_requires_local_venv(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            self.assertEqual(missing_runtime_imports(root, {"json": "json"}), ["json"])
 
     def test_ensure_portable_layout_uses_external_template_root(self):
         with tempfile.TemporaryDirectory() as runtime_tmp, tempfile.TemporaryDirectory() as source_tmp:
@@ -95,7 +119,8 @@ class BootstrapLauncherTests(unittest.TestCase):
             self.assertTrue(needs_setup(root, {"json": "json"}))
             (root / SETUP_MARKER).write_text("complete\n", encoding="utf-8")
 
-            self.assertFalse(needs_setup(root, {"json": "json"}))
+            with patch("bootstrap_launcher.local_venv_python", return_value=Path(sys.executable)):
+                self.assertFalse(needs_setup(root, {"json": "json"}))
 
     def test_pip_progress_parser_reports_download_and_install_progress(self):
         parser = PipProgressParser()
@@ -122,6 +147,54 @@ class BootstrapLauncherTests(unittest.TestCase):
         self.assertEqual(event.phase, "Already installed")
         self.assertEqual(event.detail, "numpy==2.4.2")
         self.assertEqual(event.progress_percent, 100)
+
+    def test_step_tooltip_includes_error_command_and_last_output(self):
+        diagnostic = StepDiagnostic(
+            name="Installing Python packages",
+            state=StepState.ERROR,
+            detail="pip failed",
+            command="python -m pip install",
+            last_output="ERROR: no matching distribution",
+            error="exit code 1",
+            start_time=100.0,
+            end_time=145.0,
+        )
+
+        tooltip = build_step_tooltip(diagnostic, now=150.0)
+
+        self.assertIn("Installing Python packages", tooltip)
+        self.assertIn("Status: error", tooltip)
+        self.assertIn("Elapsed: 45s", tooltip)
+        self.assertIn("Command: python -m pip install", tooltip)
+        self.assertIn("Last output: ERROR: no matching distribution", tooltip)
+        self.assertIn("Error: exit code 1", tooltip)
+
+    def test_pip_progress_tracker_reports_elapsed_and_eta(self):
+        tracker = PipInstallProgressTracker(start_time=100.0)
+
+        tracker.record(PipProgressEvent("Resolving package", "PySide6"), now=110.0)
+        tracker.record(PipProgressEvent("Downloading package", "PySide6 wheel"), now=120.0)
+        progress, detail = tracker.record(PipProgressEvent("Running pip", "Installing"), now=130.0)
+
+        self.assertGreater(progress, 0)
+        self.assertIn("Elapsed 30s", detail)
+        self.assertIn("ETA", detail)
+
+    def test_write_setup_error_log_records_command_and_recent_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = write_setup_error_log(
+                Path(tmp),
+                "Installing Python packages",
+                "pip failed with exit code 1",
+                "python -m pip install -r requirements.txt",
+                ["line one", "line two"],
+            )
+            content = log_path.read_text(encoding="utf-8")
+
+        self.assertIn("context: Installing Python packages", content)
+        self.assertIn("pip failed with exit code 1", content)
+        self.assertIn("python -m pip install -r requirements.txt", content)
+        self.assertIn("line two", content)
 
 
 if __name__ == "__main__":

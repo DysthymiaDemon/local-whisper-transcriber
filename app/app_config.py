@@ -3,14 +3,16 @@ from __future__ import annotations
 import json
 import os
 import sys
+from datetime import datetime
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Mapping
 
 from transcriber_engine import EngineConfig
 
 
 CONFIG_FILE_NAME = "config.json"
+ERROR_LOG_FILE_NAME = "error_log.txt"
 APP_FOLDER_NAME = "OfflineMeetingTranscriber"
 ENV_APP_ROOT = "LOCAL_WHISPER_APP_ROOT"
 ENV_SOURCE_ROOT = "LOCAL_WHISPER_SOURCE_ROOT"
@@ -87,3 +89,42 @@ def load_portable_config(root: Path | None = None) -> EngineConfig:
         if isinstance(value, str) and value and not Path(value).is_absolute():
             overrides[key] = str(app_root / value)
     return replace(config, **overrides)
+
+
+def append_error_log(
+    root: Path | str | None,
+    context: str,
+    message: str,
+    details: Mapping[str, Any] | Iterable[str] | str | None = None,
+) -> Path:
+    app_root = Path(root).expanduser().resolve() if root else application_root()
+    app_root.mkdir(parents=True, exist_ok=True)
+    log_path = app_root / ERROR_LOG_FILE_NAME
+
+    lines = [
+        "=" * 72,
+        f"timestamp: {datetime.now().isoformat(timespec='seconds')}",
+        f"app_root: {app_root}",
+        f"context: {context}",
+        f"message: {message}",
+    ]
+    if details:
+        lines.append("details:")
+        if isinstance(details, Mapping):
+            for key, value in details.items():
+                if isinstance(value, (list, tuple)):
+                    lines.append(f"  {key}:")
+                    for item in value:
+                        lines.append(f"    {item}")
+                else:
+                    lines.append(f"  {key}: {value}")
+        elif isinstance(details, str):
+            lines.append(details)
+        else:
+            for item in details:
+                lines.append(f"  {item}")
+    lines.append("")
+
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write("\n".join(lines))
+    return log_path
