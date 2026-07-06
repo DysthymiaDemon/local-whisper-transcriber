@@ -89,13 +89,14 @@ X:\SomeFolder\OfflineMeetingTranscriber
 
 - If the file is already inside a folder named `OfflineMeetingTranscriber`, it uses that folder directly.
 - First launch opens a medium-sized setup window.
+- Before setup opens, a small startup window checks local folders, Python packages, and first-time setup status.
 - Setup auto-starts and shows a task list, spinner, command text, and progress bars.
 - Setup extracts the app source and resources into the install folder.
 - Setup creates `config.json`, `models\`, and `transcripts\` there.
 - Missing Python packages install with `pip --user`.
 - Important setup messages stay visible for 5 seconds before moving on.
 - When prerequisites finish, setup shows a 5-second launch countdown.
-- A small startup window appears while the main transcriber loads.
+- After setup closes, the small startup window appears again while the main transcriber loads.
 - Model folder buttons open/prepare local model locations.
 - After setup is marked complete, future double-clicks open the GUI immediately.
 

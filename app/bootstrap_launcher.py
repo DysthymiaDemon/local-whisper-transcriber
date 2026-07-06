@@ -260,21 +260,25 @@ def update_startup_splash(splash, status, message: str) -> None:
     splash.update()
 
 
-def launch_gui(root: Path) -> int:
+def close_startup_splash(splash) -> None:
+    if splash is not None:
+        splash.destroy()
+
+
+def launch_gui(root: Path, splash=None, splash_status=None) -> int:
     os.chdir(root)
     os.environ["LOCAL_WHISPER_APP_ROOT"] = str(root)
     os.environ["LOCAL_WHISPER_SOURCE_ROOT"] = str(installer_source_root())
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
     os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
-    splash = None
-    splash_status = None
-    try:
-        splash, splash_status = create_startup_splash()
-        update_startup_splash(splash, splash_status, "Checking local app files...")
-    except Exception:
-        splash = None
-        splash_status = None
+    if splash is None:
+        try:
+            splash, splash_status = create_startup_splash()
+        except Exception:
+            splash = None
+            splash_status = None
+    update_startup_splash(splash, splash_status, "Checking local app files...")
 
     app_dir = str(app_source_dir())
     if app_dir not in sys.path:
@@ -285,8 +289,7 @@ def launch_gui(root: Path) -> int:
 
         update_startup_splash(splash, splash_status, "Opening transcriber window...")
     finally:
-        if splash is not None:
-            splash.destroy()
+        close_startup_splash(splash)
     return main()
 
 
@@ -319,9 +322,30 @@ def needs_setup(root: Path, required: Mapping[str, str] = REQUIRED_IMPORTS) -> b
 def run_bootstrap() -> int:
     root = runtime_root()
     package_root = installer_source_root()
+    splash = None
+    splash_status = None
+    try:
+        splash, splash_status = create_startup_splash()
+        update_startup_splash(splash, splash_status, "Preparing local app folder...")
+    except Exception:
+        splash = None
+        splash_status = None
+
     ensure_portable_layout(root, package_root)
-    if not needs_setup(root):
-        return launch_gui(root)
+    update_startup_splash(splash, splash_status, "Checking Python packages...")
+    missing_packages = missing_imports()
+    update_startup_splash(splash, splash_status, "Checking first-time setup status...")
+    setup_missing = not (root / SETUP_MARKER).exists()
+    if not missing_packages and not setup_missing:
+        update_startup_splash(splash, splash_status, "Dependencies ready.")
+        return launch_gui(root, splash, splash_status)
+
+    if missing_packages:
+        update_startup_splash(splash, splash_status, "Dependencies missing. Opening first-time setup...")
+    else:
+        update_startup_splash(splash, splash_status, "First-time setup required. Opening installer...")
+    time.sleep(0.8)
+    close_startup_splash(splash)
 
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
