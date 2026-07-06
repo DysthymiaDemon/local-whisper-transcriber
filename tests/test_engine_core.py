@@ -175,6 +175,50 @@ class EngineConfigTests(unittest.TestCase):
         self.assertIn("Pyannote pipeline path does not exist", "\n".join(errors))
         self.assertIn("Pyannote embedding model path does not exist", "\n".join(errors))
 
+    def test_empty_model_folders_return_incomplete_validation_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            whisper = os.path.join(tmp, "whisper")
+            pipeline = os.path.join(tmp, "pipeline")
+            embedding = os.path.join(tmp, "embedding")
+            os.mkdir(whisper)
+            os.mkdir(pipeline)
+            os.mkdir(embedding)
+            config = EngineConfig(
+                whisper_model_dir=whisper,
+                pyannote_pipeline_dir=pipeline,
+                pyannote_embedding_model_dir=embedding,
+                output_file=os.path.join(tmp, "out.txt"),
+            )
+
+            errors = "\n".join(config.validate())
+
+        self.assertIn("Whisper model is incomplete: expected model.bin", errors)
+        self.assertIn("Pyannote pipeline is incomplete: expected config.yaml", errors)
+        self.assertIn("Pyannote embedding model is incomplete", errors)
+
+    def test_minimal_required_model_files_pass_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            whisper = os.path.join(tmp, "whisper")
+            pipeline = os.path.join(tmp, "pipeline")
+            embedding = os.path.join(tmp, "embedding")
+            os.mkdir(whisper)
+            os.mkdir(pipeline)
+            os.mkdir(embedding)
+            open(os.path.join(whisper, "model.bin"), "wb").close()
+            open(os.path.join(pipeline, "config.yaml"), "w", encoding="utf-8").close()
+            open(os.path.join(embedding, "config.yaml"), "w", encoding="utf-8").close()
+            open(os.path.join(embedding, "pytorch_model.bin"), "wb").close()
+            config = EngineConfig(
+                whisper_model_dir=whisper,
+                pyannote_pipeline_dir=pipeline,
+                pyannote_embedding_model_dir=embedding,
+                output_file=os.path.join(tmp, "out.txt"),
+            )
+
+            errors = config.validate()
+
+        self.assertEqual(errors, [])
+
 
 if __name__ == "__main__":
     unittest.main()

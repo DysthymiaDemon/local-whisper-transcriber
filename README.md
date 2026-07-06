@@ -95,6 +95,7 @@ X:\SomeFolder\OfflineMeetingTranscriber
 - Missing Python packages install with `pip --user`.
 - Important setup messages stay visible for 5 seconds before moving on.
 - When prerequisites finish, setup shows a 5-second launch countdown.
+- A small startup window appears while the main transcriber loads.
 - Model folder buttons open/prepare local model locations.
 - After setup is marked complete, future double-clicks open the GUI immediately.
 
@@ -117,6 +118,7 @@ That wrapper checks for Python 3.12. If missing, it attempts a current-user inst
 ## How To Use The App
 
 1. Open the app.
+   A small startup window shows current loading status before the main window appears.
 2. Select microphone from the dropdown.
 3. Confirm model paths point to local folders:
 
@@ -264,9 +266,9 @@ $env:LOCAL_WHISPER_APP_ROOT = "D:\Apps\OfflineMeetingTranscriber"
 
 Recommended starting folders:
 
-- `models\faster-whisper`: CTranslate2 faster-whisper model, such as `Systran/faster-whisper-small`.
-- `models\pyannote-pipeline`: local pyannote diarization pipeline with `config.yaml`.
-- `models\pyannote-embedding`: local pyannote embedding model.
+- `models\faster-whisper`: CTranslate2 faster-whisper model, such as `Systran/faster-whisper-small`; must contain `model.bin`.
+- `models\pyannote-pipeline`: local pyannote diarization pipeline; must contain `config.yaml`.
+- `models\pyannote-embedding`: local pyannote embedding model; must contain `config.yaml` plus `pytorch_model.bin` or `model.safetensors`.
 
 Runtime must not download models. Pyannote `config.yaml` must reference local paths only.
 
@@ -286,7 +288,7 @@ py -3.12 -B -m unittest discover -s tests -v
 py -3.12 -B -m py_compile app\app_config.py app\bootstrap_launcher.py app\meeting_transcriber_gui.py app\transcriber_engine.py packaging\build_standalone_pyw.py "Open Offline Meeting Transcriber.pyw" tests\test_bootstrap_launcher.py tests\test_app_config.py tests\test_engine_core.py tests\test_standalone_launcher.py packaging\local_whisper_transcriber.spec
 ```
 
-Expected current result: 28 tests pass.
+Expected current result: 30 tests pass.
 
 ## Corporate Laptop Notes
 

@@ -25,6 +25,26 @@ REQUIRED_IMPORTS: dict[str, str] = {
 }
 
 MODEL_DIRS = ("faster-whisper", "pyannote-pipeline", "pyannote-embedding")
+MODEL_GUIDES: dict[str, str] = {
+    "faster-whisper": (
+        "Copy a CTranslate2 faster-whisper model here.\n\n"
+        "Required file:\n"
+        "- model.bin\n\n"
+        "Example source model: Systran/faster-whisper-small\n"
+    ),
+    "pyannote-pipeline": (
+        "Copy the local pyannote diarization pipeline here.\n\n"
+        "Required file:\n"
+        "- config.yaml\n\n"
+        "The config.yaml must reference local model paths only.\n"
+    ),
+    "pyannote-embedding": (
+        "Copy the local pyannote embedding model here.\n\n"
+        "Required files:\n"
+        "- config.yaml\n"
+        "- pytorch_model.bin or model.safetensors\n"
+    ),
+}
 SETUP_MARKER = ".setup_complete"
 IMPORTANT_MESSAGE_SECONDS = 5
 
@@ -133,7 +153,11 @@ def missing_imports(required: Mapping[str, str] = REQUIRED_IMPORTS) -> list[str]
 def ensure_portable_layout(root: Path, template_root: Path | None = None) -> Path:
     models = root / "models"
     for name in MODEL_DIRS:
-        (models / name).mkdir(parents=True, exist_ok=True)
+        model_dir = models / name
+        model_dir.mkdir(parents=True, exist_ok=True)
+        guide = model_dir / "README_MODEL_FILES.txt"
+        if not guide.exists():
+            guide.write_text(MODEL_GUIDES[name], encoding="utf-8")
     (root / "transcripts").mkdir(parents=True, exist_ok=True)
 
     config_path = root / "config.json"
@@ -169,9 +193,71 @@ def model_folder_status(root: Path) -> dict[str, BootstrapStatus]:
     status: dict[str, BootstrapStatus] = {}
     for name in MODEL_DIRS:
         folder = root / "models" / name
-        ready = folder.is_dir() and any(folder.iterdir())
+        if name == "faster-whisper":
+            ready = (folder / "model.bin").is_file()
+        elif name == "pyannote-pipeline":
+            ready = (folder / "config.yaml").is_file()
+        else:
+            ready = (folder / "config.yaml").is_file() and any(
+                (folder / filename).is_file() for filename in ("pytorch_model.bin", "model.safetensors")
+            )
         status[name] = BootstrapStatus.READY if ready else BootstrapStatus.MISSING
     return status
+
+
+def create_startup_splash():
+    import tkinter as tk
+    from tkinter import ttk
+
+    splash = tk.Tk()
+    splash.title("Starting Offline Meeting Transcriber")
+    splash.geometry("420x170")
+    splash.resizable(False, False)
+    splash.configure(bg="#f7f7f7")
+
+    width = 420
+    height = 170
+    screen_width = splash.winfo_screenwidth()
+    screen_height = splash.winfo_screenheight()
+    left = int((screen_width - width) / 2)
+    top = int((screen_height - height) / 2)
+    splash.geometry(f"{width}x{height}+{left}+{top}")
+
+    title = tk.Label(
+        splash,
+        text="Offline Meeting Transcriber",
+        font=("Segoe UI", 14, "bold"),
+        bg="#f7f7f7",
+        fg="#1f1f1f",
+    )
+    title.pack(fill="x", padx=24, pady=(22, 8))
+
+    status = tk.StringVar(value="Starting...")
+    status_label = tk.Label(
+        splash,
+        textvariable=status,
+        font=("Segoe UI", 10),
+        bg="#f7f7f7",
+        fg="#333333",
+        anchor="w",
+    )
+    status_label.pack(fill="x", padx=24, pady=(0, 12))
+
+    progress = ttk.Progressbar(splash, mode="indeterminate")
+    progress.pack(fill="x", padx=24, pady=(0, 18))
+    progress.start(12)
+
+    splash.update_idletasks()
+    splash.update()
+    return splash, status
+
+
+def update_startup_splash(splash, status, message: str) -> None:
+    if splash is None:
+        return
+    status.set(message)
+    splash.update_idletasks()
+    splash.update()
 
 
 def launch_gui(root: Path) -> int:
@@ -181,11 +267,26 @@ def launch_gui(root: Path) -> int:
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
     os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+    splash = None
+    splash_status = None
+    try:
+        splash, splash_status = create_startup_splash()
+        update_startup_splash(splash, splash_status, "Checking local app files...")
+    except Exception:
+        splash = None
+        splash_status = None
+
     app_dir = str(app_source_dir())
     if app_dir not in sys.path:
         sys.path.insert(0, app_dir)
-    from meeting_transcriber_gui import main
+    try:
+        update_startup_splash(splash, splash_status, "Loading audio and AI components...")
+        from meeting_transcriber_gui import main
 
+        update_startup_splash(splash, splash_status, "Opening transcriber window...")
+    finally:
+        if splash is not None:
+            splash.destroy()
     return main()
 
 
@@ -227,8 +328,8 @@ def run_bootstrap() -> int:
 
     window = tk.Tk()
     window.title("Offline Meeting Transcriber Setup")
-    window.geometry("780x520")
-    window.minsize(720, 500)
+    window.geometry("860x560")
+    window.minsize(820, 540)
     window.resizable(False, False)
     window.configure(bg="#f7f7f7")
 
@@ -264,7 +365,7 @@ def run_bootstrap() -> int:
             "First-time setup checks local prerequisites. Future launches open "
             "the transcriber immediately."
         ),
-        wraplength=720,
+        wraplength=800,
         justify="left",
         anchor="w",
         bg="#f7f7f7",
@@ -313,17 +414,31 @@ def run_bootstrap() -> int:
     )
     detail_title.pack(fill="x", padx=18, pady=(18, 6))
 
-    command_label = tk.Label(
+    def readonly_text(parent, height: int, font: tuple[str, int], foreground: str, wrap: str = "word") -> tk.Text:
+        widget = tk.Text(
+            parent,
+            height=height,
+            wrap=wrap,
+            font=font,
+            bg="#ffffff",
+            fg=foreground,
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=0,
+            padx=0,
+            pady=0,
+        )
+        widget.configure(state="disabled", cursor="arrow", takefocus=False)
+        return widget
+
+    command_text = readonly_text(
         detail_frame,
-        textvariable=command_detail,
+        height=4,
         font=("Cascadia Mono", 9),
-        anchor="w",
-        justify="left",
-        wraplength=350,
-        bg="#ffffff",
-        fg="#505050",
+        foreground="#505050",
+        wrap="char",
     )
-    command_label.pack(fill="x", padx=18, pady=(0, 10))
+    command_text.pack(fill="x", padx=18, pady=(0, 10))
 
     detail_bar = ttk.Progressbar(
         detail_frame,
@@ -333,20 +448,26 @@ def run_bootstrap() -> int:
     )
     detail_bar.pack(fill="x", padx=18, pady=(0, 12))
 
-    package_label = tk.Label(
+    package_text = readonly_text(
         detail_frame,
-        textvariable=package_detail,
+        height=7,
         font=("Segoe UI", 10),
-        anchor="nw",
-        justify="left",
-        wraplength=360,
-        bg="#ffffff",
-        fg="#222222",
+        foreground="#222222",
+        wrap="word",
     )
-    package_label.pack(fill="both", expand=True, padx=18, pady=(0, 14))
+    package_text.pack(fill="both", expand=True, padx=18, pady=(0, 14))
 
     button_row = tk.Frame(detail_frame, bg="#ffffff")
-    button_row.pack(fill="x", padx=18, pady=(0, 18))
+    button_row.pack(fill="x", padx=18, pady=(0, 6))
+
+    model_button_row = tk.Frame(detail_frame, bg="#ffffff")
+    model_button_row.pack(fill="x", padx=18, pady=(0, 18))
+
+    def set_text(widget: tk.Text, value: str) -> None:
+        widget.configure(state="normal")
+        widget.delete("1.0", "end")
+        widget.insert("1.0", value)
+        widget.configure(state="disabled")
 
     def run_on_ui(callback):
         if threading.current_thread() is ui_thread:
@@ -400,6 +521,7 @@ def run_bootstrap() -> int:
             detail_title.config(text=step)
             if detail:
                 package_detail.set(detail)
+                set_text(package_text, detail)
             if progress is not None:
                 detail_progress_value.set(progress)
             render_steps()
@@ -409,7 +531,11 @@ def run_bootstrap() -> int:
 
     def important_message(step: str, message: str) -> None:
         set_step(step, StepState.RUNNING, message, None)
-        run_on_ui(lambda: command_detail.set(message))
+        def apply_message() -> None:
+            command_detail.set(message)
+            set_text(command_text, message)
+
+        run_on_ui(apply_message)
         time.sleep(IMPORTANT_MESSAGE_SECONDS)
 
     def choose_model_folder(model_name: str) -> None:
@@ -423,19 +549,25 @@ def run_bootstrap() -> int:
             f"Selected source folder:\n{selected}\n\nCopy model files here or update config.json manually.\n",
             encoding="utf-8",
         )
-        package_detail.set(f"Recorded selected folder for {model_name}: {selected}")
+        detail = f"Recorded selected folder for {model_name}:\n{selected}"
+        package_detail.set(detail)
+        set_text(package_text, detail)
         render_steps()
 
     def open_model_folder() -> None:
         model_root = root / "models"
         os.startfile(model_root)
-        package_detail.set(f"Opened model folder:\n{model_root}")
+        detail = f"Opened model folder:\n{model_root}"
+        package_detail.set(detail)
+        set_text(package_text, detail)
 
     def update_from_pip(event: PipProgressEvent) -> None:
         def apply_event() -> None:
             command_detail.set(event.phase)
+            set_text(command_text, event.phase)
             if event.detail:
                 package_detail.set(event.detail)
+                set_text(package_text, event.detail)
             if event.progress_percent is not None:
                 detail_progress_value.set(event.progress_percent)
             render_steps()
@@ -453,7 +585,10 @@ def run_bootstrap() -> int:
             seconds = remaining["seconds"]
             detail_title.config(text="Prerequisites setup done")
             command_detail.set("")
-            package_detail.set(f"Launching transcriber in {seconds} seconds...")
+            set_text(command_text, "")
+            detail = f"Launching transcriber in {seconds} seconds..."
+            package_detail.set(detail)
+            set_text(package_text, detail)
             detail_progress_value.set(100)
             if seconds <= 0:
                 step_states[BOOTSTRAP_STEPS[-1]] = StepState.DONE
@@ -493,7 +628,7 @@ def run_bootstrap() -> int:
                 set_step(BOOTSTRAP_STEPS[2], StepState.WARNING, "Missing: " + ", ".join(missing), 100)
                 set_step(BOOTSTRAP_STEPS[3], StepState.RUNNING, "Installing missing packages", 0)
                 command = f"{sys.executable} -m pip install --user -r {resource_root(package_root) / 'requirements.txt'}"
-                command_detail.set("Running command:\n" + command)
+                run_on_ui(lambda: (command_detail.set("Running command:\n" + command), set_text(command_text, "Running command:\n" + command)))
                 time.sleep(IMPORTANT_MESSAGE_SECONDS)
                 code = run_pip_install(root, update_from_pip, package_root)
                 if code != 0:
@@ -529,16 +664,21 @@ def run_bootstrap() -> int:
     def start_flow() -> None:
         for child in button_row.winfo_children():
             child.config(state="disabled")
+        for child in model_button_row.winfo_children():
+            child.config(state="disabled")
         threading.Thread(target=run_setup_flow, daemon=True).start()
 
     install_button = tk.Button(button_row, text="Start setup", command=start_flow)
     install_button.pack(side="left", padx=(0, 8))
     tk.Button(button_row, text="Open model folder", command=open_model_folder).pack(side="left", padx=(0, 8))
+    tk.Button(button_row, text="Launch GUI", command=launch_if_ready).pack(side="right")
     for model in MODEL_DIRS:
-        tk.Button(button_row, text=f"Set {model}", command=lambda name=model: choose_model_folder(name)).pack(
+        tk.Button(model_button_row, text=f"Set {model}", command=lambda name=model: choose_model_folder(name)).pack(
             side="left", padx=(0, 8)
         )
-    tk.Button(button_row, text="Launch GUI", command=launch_if_ready).pack(side="right")
+
+    set_text(command_text, command_detail.get())
+    set_text(package_text, package_detail.get())
 
     render_steps()
     tick_spinner()

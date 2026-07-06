@@ -39,6 +39,7 @@ with warnings.catch_warnings():
 
 try:
     from PySide6.QtCore import QObject, Qt, Signal
+    from PySide6.QtGui import QColor, QPainter, QPen
     from PySide6.QtWidgets import (
         QApplication,
         QComboBox,
@@ -55,7 +56,6 @@ try:
         QMainWindow,
         QMessageBox,
         QPushButton,
-        QProgressBar,
         QSpinBox,
         QTableWidget,
         QTableWidgetItem,
@@ -74,6 +74,48 @@ except ImportError as exc:  # pragma: no cover - depends on local GUI deps
 
 class EngineSignalBridge(QObject):
     event = Signal(str, object)
+
+
+class MicLevelMeter(QWidget):
+    def __init__(self, segments: int = 30) -> None:
+        super().__init__()
+        self.segments = segments
+        self.level = 0
+        self.setMinimumHeight(24)
+
+    def set_level(self, value: int) -> None:
+        self.level = max(0, min(100, value))
+        self.update()
+
+    def paintEvent(self, event: Any) -> None:  # pragma: no cover - visual widget
+        del event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        width = self.width()
+        height = self.height()
+        gap = 5
+        bar_width = max(3, int((width - gap * (self.segments - 1)) / self.segments))
+        bar_height = max(10, min(18, height - 6))
+        top = int((height - bar_height) / 2)
+        active_segments = round((self.level / 100) * self.segments)
+
+        for index in range(self.segments):
+            left = index * (bar_width + gap)
+            if left + bar_width > width:
+                break
+            active = index < active_segments
+            ratio = (index + 1) / self.segments
+            if not active:
+                color = QColor("#d8d8dc")
+            elif ratio <= 0.60:
+                color = QColor("#4ac11f")
+            elif ratio <= 0.82:
+                color = QColor("#f1c232")
+            else:
+                color = QColor("#d93025")
+            painter.fillRect(left, top, bar_width, bar_height, color)
+            painter.setPen(QPen(QColor("#8b8b8b"), 1))
+            painter.drawRect(left, top, bar_width, bar_height)
 
 
 class MainWindow(QMainWindow):
@@ -134,11 +176,10 @@ class MainWindow(QMainWindow):
         status_row = QFormLayout()
         self.status_label = QLabel("Idle")
         self.lag_label = QLabel("Diarization: 0 chunks behind")
-        self.level_bar = QProgressBar()
-        self.level_bar.setRange(0, 100)
+        self.level_meter = MicLevelMeter()
         status_row.addRow("Status", self.status_label)
         status_row.addRow("Speaker sync", self.lag_label)
-        status_row.addRow("Mic level", self.level_bar)
+        status_row.addRow("Mic level", self.level_meter)
         controls_layout.addLayout(status_row)
         top.addWidget(controls, 0, 1)
 
@@ -282,7 +323,7 @@ class MainWindow(QMainWindow):
             self.status_label.setText(str(payload.get("message", "")))
         elif event_type == "level":
             rms = float(payload.get("rms", 0.0))
-            self.level_bar.setValue(min(100, int(rms * 800)))
+            self.level_meter.set_level(min(100, int(rms * 800)))
         elif event_type == "lag":
             self.lag_label.setText(str(payload.get("message", "")))
         elif event_type == "transcript":

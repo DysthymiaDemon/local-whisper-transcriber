@@ -53,6 +53,7 @@ class BootstrapLauncherTests(unittest.TestCase):
             self.assertTrue((root / "models" / "pyannote-pipeline").is_dir())
             self.assertTrue((root / "models" / "pyannote-embedding").is_dir())
             self.assertTrue((root / "transcripts").is_dir())
+            self.assertTrue((root / "models" / "faster-whisper" / "README_MODEL_FILES.txt").is_file())
             config = json.loads(config_path.read_text(encoding="utf-8"))
 
         self.assertEqual(config["whisper_model_dir"], "models/faster-whisper")
@@ -77,12 +78,13 @@ class BootstrapLauncherTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             ensure_portable_layout(root)
-            (root / "models" / "faster-whisper" / "config.json").write_text("{}", encoding="utf-8")
+            (root / "models" / "faster-whisper" / "model.bin").write_bytes(b"model")
+            (root / "models" / "pyannote-pipeline" / "config.yaml").write_text("pipeline", encoding="utf-8")
 
             status = model_folder_status(root)
 
         self.assertEqual(status["faster-whisper"], BootstrapStatus.READY)
-        self.assertEqual(status["pyannote-pipeline"], BootstrapStatus.MISSING)
+        self.assertEqual(status["pyannote-pipeline"], BootstrapStatus.READY)
         self.assertEqual(status["pyannote-embedding"], BootstrapStatus.MISSING)
 
     def test_needs_setup_uses_marker_after_first_run(self):

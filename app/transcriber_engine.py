@@ -14,6 +14,7 @@ from typing import Any, Callable, Iterable, Optional
 
 
 UNKNOWN_SPEAKER_LABEL = "Speaker ?"
+EMBEDDING_WEIGHT_FILES = ("pytorch_model.bin", "model.safetensors")
 
 
 def _force_offline_mode() -> None:
@@ -52,16 +53,48 @@ class EngineConfig:
             errors.append("Overlap seconds cannot be negative.")
         if self.overlap_seconds >= self.chunk_seconds:
             errors.append("Overlap seconds must be smaller than chunk seconds.")
-        for label, raw_path in (
-            ("Whisper model", self.whisper_model_dir),
-            ("Pyannote pipeline", self.pyannote_pipeline_dir),
-            ("Pyannote embedding model", self.pyannote_embedding_model_dir),
-        ):
-            if not raw_path:
-                errors.append(f"{label} path is required.")
-            elif not Path(raw_path).exists():
-                errors.append(f"{label} path does not exist: {raw_path}")
+        whisper_path = self._validate_folder("Whisper model", self.whisper_model_dir, errors)
+        if whisper_path and not (whisper_path / "model.bin").is_file():
+            errors.append(
+                "Whisper model is incomplete: expected model.bin in "
+                f"{whisper_path}. Copy a CTranslate2 faster-whisper model folder into this path."
+            )
+
+        pipeline_path = self._validate_folder("Pyannote pipeline", self.pyannote_pipeline_dir, errors)
+        if pipeline_path and not (pipeline_path / "config.yaml").is_file():
+            errors.append(
+                "Pyannote pipeline is incomplete: expected config.yaml in "
+                f"{pipeline_path}. Copy the local pyannote pipeline folder into this path."
+            )
+
+        embedding_path = self._validate_folder("Pyannote embedding model", self.pyannote_embedding_model_dir, errors)
+        if embedding_path:
+            missing_embedding_files: list[str] = []
+            if not (embedding_path / "config.yaml").is_file():
+                missing_embedding_files.append("config.yaml")
+            if not any((embedding_path / name).is_file() for name in EMBEDDING_WEIGHT_FILES):
+                missing_embedding_files.append("pytorch_model.bin or model.safetensors")
+            if missing_embedding_files:
+                errors.append(
+                    "Pyannote embedding model is incomplete: expected "
+                    + ", ".join(missing_embedding_files)
+                    + f" in {embedding_path}. Copy the local pyannote embedding model folder into this path."
+                )
         return errors
+
+    @staticmethod
+    def _validate_folder(label: str, raw_path: str, errors: list[str]) -> Path | None:
+        if not raw_path:
+            errors.append(f"{label} path is required.")
+            return None
+        path = Path(raw_path)
+        if not path.exists():
+            errors.append(f"{label} path does not exist: {raw_path}")
+            return None
+        if not path.is_dir():
+            errors.append(f"{label} path must be a folder: {raw_path}")
+            return None
+        return path
 
 
 @dataclass
