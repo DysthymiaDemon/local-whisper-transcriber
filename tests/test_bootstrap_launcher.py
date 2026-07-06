@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -19,8 +20,10 @@ from bootstrap_launcher import (
     StepState,
     build_step_tooltip,
     ensure_portable_layout,
+    is_onedrive_path,
+    local_package_dir,
     local_runtime_dir,
-    local_venv_dir,
+    migrate_legacy_onedrive_runtime,
     missing_imports,
     missing_runtime_imports,
     model_folder_status,
@@ -70,18 +73,116 @@ class BootstrapLauncherTests(unittest.TestCase):
         self.assertEqual(config["whisper_model_dir"], "models/faster-whisper")
         self.assertEqual(config["output_file"], "transcripts/meeting_transcript.txt")
 
-    def test_local_runtime_paths_stay_under_install_root(self):
+    def test_local_runtime_paths_stay_under_install_root_without_venv(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
 
             self.assertEqual(local_runtime_dir(root), root / ".runtime")
-            self.assertEqual(local_venv_dir(root), root / ".runtime" / "venv")
+            self.assertEqual(local_package_dir(root), root / ".runtime" / "site-packages")
 
-    def test_missing_runtime_imports_requires_local_venv(self):
+    def test_onedrive_install_uses_local_appdata_runtime(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            onedrive = base / "OneDrive - Company"
+            root = onedrive / "OfflineMeetingTranscriber"
+            local_app_data = base / "LocalAppData"
+            root.mkdir(parents=True)
+            local_app_data.mkdir()
+
+            with patch.dict(
+                os.environ,
+                {"OneDriveCommercial": str(onedrive), "LOCALAPPDATA": str(local_app_data)},
+                clear=False,
+            ):
+                runtime = local_runtime_dir(root)
+                packages = local_package_dir(root)
+
+            self.assertTrue(is_onedrive_path(root))
+            self.assertEqual(runtime, local_app_data / "OfflineMeetingTranscriberRuntime")
+            self.assertEqual(packages, runtime / "site-packages")
+
+    def test_onedrive_install_migrates_existing_runtime_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            onedrive = base / "OneDrive - Company"
+            root = onedrive / "OfflineMeetingTranscriber"
+            local_app_data = base / "LocalAppData"
+            legacy_runtime = root / ".runtime"
+            legacy_runtime.mkdir(parents=True)
+            (legacy_runtime / "marker.txt").write_text("keep", encoding="utf-8")
+            local_app_data.mkdir()
+
+            with patch.dict(
+                os.environ,
+                {"OneDriveCommercial": str(onedrive), "LOCALAPPDATA": str(local_app_data)},
+                clear=False,
+            ):
+                migrated = migrate_legacy_onedrive_runtime(root)
+
+            expected = local_app_data / "OfflineMeetingTranscriberRuntime"
+            self.assertEqual(migrated, expected)
+            self.assertFalse(legacy_runtime.exists())
+            self.assertEqual((expected / "marker.txt").read_text(encoding="utf-8"), "keep")
+
+    def test_onedrive_install_moves_legacy_runtime_as_backup_when_target_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            onedrive = base / "OneDrive - Company"
+            root = onedrive / "OfflineMeetingTranscriber"
+            local_app_data = base / "LocalAppData"
+            legacy_runtime = root / ".runtime"
+            target_runtime = local_app_data / "OfflineMeetingTranscriberRuntime"
+            legacy_runtime.mkdir(parents=True)
+            target_runtime.mkdir(parents=True)
+            (legacy_runtime / "legacy.txt").write_text("keep legacy", encoding="utf-8")
+            (target_runtime / "current.txt").write_text("keep current", encoding="utf-8")
+
+            with patch.dict(
+                os.environ,
+                {"OneDriveCommercial": str(onedrive), "LOCALAPPDATA": str(local_app_data)},
+                clear=False,
+            ):
+                migrated = migrate_legacy_onedrive_runtime(root)
+
+            expected_backup = target_runtime / "legacy-runtime"
+            self.assertEqual(migrated, expected_backup)
+            self.assertFalse(legacy_runtime.exists())
+            self.assertEqual((target_runtime / "current.txt").read_text(encoding="utf-8"), "keep current")
+            self.assertEqual((expected_backup / "legacy.txt").read_text(encoding="utf-8"), "keep legacy")
+
+    def test_missing_runtime_imports_requires_local_package_dir(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
 
             self.assertEqual(missing_runtime_imports(root, {"json": "json"}), ["json"])
+
+    def test_run_pip_install_uses_target_package_dir_without_venv(self):
+        from bootstrap_launcher import run_pip_install
+
+        with tempfile.TemporaryDirectory() as runtime_tmp, tempfile.TemporaryDirectory() as package_tmp:
+            root = Path(runtime_tmp)
+            package_root = Path(package_tmp)
+            resources = package_root / "resources"
+            resources.mkdir()
+            (resources / "requirements.txt").write_text("example-package==1.0\n", encoding="utf-8")
+            captured = {}
+
+            class FakeProcess:
+                def __init__(self, cmd, **kwargs):
+                    captured["cmd"] = cmd
+                    captured["kwargs"] = kwargs
+                    self.stdout = iter(["Successfully installed example-package-1.0\n"])
+
+                def wait(self):
+                    return 0
+
+            with patch("bootstrap_launcher.subprocess.Popen", FakeProcess):
+                result = run_pip_install(root, lambda event: None, package_root)
+
+            self.assertEqual(result.code, 0)
+            self.assertIn("--target", captured["cmd"])
+            self.assertIn(str(root / ".runtime" / "site-packages"), captured["cmd"])
+            self.assertNotIn("venv", captured["cmd"])
 
     def test_ensure_portable_layout_uses_external_template_root(self):
         with tempfile.TemporaryDirectory() as runtime_tmp, tempfile.TemporaryDirectory() as source_tmp:
@@ -118,9 +219,9 @@ class BootstrapLauncherTests(unittest.TestCase):
 
             self.assertTrue(needs_setup(root, {"json": "json"}))
             (root / SETUP_MARKER).write_text("complete\n", encoding="utf-8")
+            local_package_dir(root).mkdir(parents=True)
 
-            with patch("bootstrap_launcher.local_venv_python", return_value=Path(sys.executable)):
-                self.assertFalse(needs_setup(root, {"json": "json"}))
+            self.assertFalse(needs_setup(root, {"json": "json"}))
 
     def test_pip_progress_parser_reports_download_and_install_progress(self):
         parser = PipProgressParser()

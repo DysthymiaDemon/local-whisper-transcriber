@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -49,7 +50,9 @@ MODEL_GUIDES: dict[str, str] = {
 SETUP_MARKER = ".setup_complete"
 IMPORTANT_MESSAGE_SECONDS = 5
 RUNTIME_DIR = ".runtime"
-VENV_DIR = "venv"
+PACKAGE_DIR = "site-packages"
+RUNTIME_ENV = "LOCAL_WHISPER_RUNTIME_ROOT"
+RUNTIME_APP_FOLDER_NAME = "OfflineMeetingTranscriberRuntime"
 
 BOOTSTRAP_STEPS = [
     "Checking Python runtime",
@@ -258,31 +261,56 @@ def installer_source_root() -> Path:
     return source_root()
 
 
+def _path_contains(parent: Path, child: Path) -> bool:
+    try:
+        resolved_parent = parent.expanduser().resolve()
+        resolved_child = child.expanduser().resolve()
+    except OSError:
+        return False
+    return resolved_child == resolved_parent or resolved_parent in resolved_child.parents
+
+
+def is_onedrive_path(path: Path) -> bool:
+    for env_name in ("OneDrive", "OneDriveCommercial", "OneDriveConsumer"):
+        env_value = os.environ.get(env_name)
+        if env_value and _path_contains(Path(env_value), path):
+            return True
+    return any("onedrive" in part.lower() for part in path.expanduser().parts)
+
+
 def local_runtime_dir(root: Path) -> Path:
+    configured = os.environ.get(RUNTIME_ENV)
+    if configured:
+        return Path(configured).expanduser().resolve()
+    if is_onedrive_path(root):
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            return (Path(local_app_data) / RUNTIME_APP_FOLDER_NAME).resolve()
+        return (Path.home() / "AppData" / "Local" / RUNTIME_APP_FOLDER_NAME).resolve()
     return root / RUNTIME_DIR
 
 
-def local_venv_dir(root: Path) -> Path:
-    return local_runtime_dir(root) / VENV_DIR
+def local_package_dir(root: Path) -> Path:
+    return local_runtime_dir(root) / PACKAGE_DIR
 
 
-def local_venv_python(root: Path, prefer_windowed: bool = False) -> Path:
-    scripts = local_venv_dir(root) / "Scripts"
-    preferred = scripts / ("pythonw.exe" if prefer_windowed else "python.exe")
-    if preferred.exists():
-        return preferred
-    return scripts / "python.exe"
+def migrate_legacy_onedrive_runtime(root: Path) -> Path | None:
+    legacy_runtime = root / RUNTIME_DIR
+    target_runtime = local_runtime_dir(root)
+    if not is_onedrive_path(root) or target_runtime == legacy_runtime or not legacy_runtime.exists():
+        return None
+    if not target_runtime.exists():
+        target_runtime.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(legacy_runtime), str(target_runtime))
+        return target_runtime
 
-
-def running_in_local_venv(root: Path) -> bool:
-    if getattr(sys, "frozen", False):
-        return True
-    try:
-        executable = Path(sys.executable).resolve()
-        venv = local_venv_dir(root).resolve()
-        return executable == local_venv_python(root).resolve() or venv in executable.parents
-    except OSError:
-        return False
+    backup = target_runtime / "legacy-runtime"
+    suffix = 1
+    while backup.exists():
+        suffix += 1
+        backup = target_runtime / f"legacy-runtime-{suffix}"
+    shutil.move(str(legacy_runtime), str(backup))
+    return backup
 
 
 def app_source_dir(root: Path | None = None) -> Path:
@@ -312,8 +340,8 @@ def missing_runtime_imports(root: Path, required: Mapping[str, str] = REQUIRED_I
     if getattr(sys, "frozen", False):
         return missing_imports(required)
 
-    python_path = local_venv_python(root)
-    if not python_path.exists():
+    package_path = local_package_dir(root)
+    if not package_path.exists():
         return list(required.keys())
 
     probe = (
@@ -323,13 +351,17 @@ def missing_runtime_imports(root: Path, required: Mapping[str, str] = REQUIRED_I
         "print(json.dumps(missing)); "
         "sys.exit(1 if missing else 0)"
     )
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = str(package_path) if not existing_pythonpath else str(package_path) + os.pathsep + existing_pythonpath
     result = subprocess.run(
-        [str(python_path), "-c", probe],
+        [sys.executable, "-c", probe],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
         errors="replace",
+        env=env,
         check=False,
     )
     try:
@@ -340,6 +372,7 @@ def missing_runtime_imports(root: Path, required: Mapping[str, str] = REQUIRED_I
 
 
 def ensure_portable_layout(root: Path, template_root: Path | None = None) -> Path:
+    migrate_legacy_onedrive_runtime(root)
     local_runtime_dir(root).mkdir(parents=True, exist_ok=True)
     models = root / "models"
     for name in MODEL_DIRS:
@@ -463,20 +496,6 @@ def launch_gui(root: Path, splash=None, splash_status=None) -> int:
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
     os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
 
-    if not running_in_local_venv(root):
-        python_path = local_venv_python(root, prefer_windowed=True)
-        if python_path.exists():
-            update_startup_splash(splash, splash_status, "Switching to local app Python...")
-            close_startup_splash(splash)
-            script_path = app_source_dir(root) / "bootstrap_launcher.py"
-            env = os.environ.copy()
-            env["LOCAL_WHISPER_APP_ROOT"] = str(root)
-            env["LOCAL_WHISPER_SOURCE_ROOT"] = str(root)
-            env.setdefault("HF_HUB_OFFLINE", "1")
-            env.setdefault("TRANSFORMERS_OFFLINE", "1")
-            env.setdefault("HF_DATASETS_OFFLINE", "1")
-            return subprocess.call([str(python_path), str(script_path)], cwd=str(root), env=env)
-
     if splash is None:
         try:
             splash, splash_status = create_startup_splash()
@@ -486,6 +505,9 @@ def launch_gui(root: Path, splash=None, splash_status=None) -> int:
     update_startup_splash(splash, splash_status, "Checking local app files...")
 
     app_dir = str(app_source_dir())
+    package_dir = str(local_package_dir(root))
+    if package_dir not in sys.path:
+        sys.path.insert(0, package_dir)
     if app_dir not in sys.path:
         sys.path.insert(0, app_dir)
     try:
@@ -501,27 +523,20 @@ def launch_gui(root: Path, splash=None, splash_status=None) -> int:
 def run_pip_install(root: Path, on_event, package_root: Path | None = None) -> PipInstallResult:
     package_root = package_root or installer_source_root()
     requirements_path = resource_root(package_root) / "requirements.txt"
-    venv_path = local_venv_dir(root)
-    if not local_venv_python(root).exists():
-        venv_cmd = [sys.executable, "-m", "venv", str(venv_path)]
-        venv_command = subprocess.list2cmdline(venv_cmd)
-        on_event(PipProgressEvent("Creating local Python environment", venv_command, 0, venv_command))
-        venv_result = subprocess.run(
-            venv_cmd,
-            cwd=str(root),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-        )
-        if venv_result.returncode != 0:
-            recent = [line for line in venv_result.stdout.splitlines() if line.strip()][-25:]
-            return PipInstallResult(venv_result.returncode, venv_command, recent)
-
-    python_path = local_venv_python(root)
-    cmd = [str(python_path), "-m", "pip", "install", "--no-cache-dir", "-r", str(requirements_path)]
+    package_dir = local_package_dir(root)
+    package_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--no-cache-dir",
+        "--upgrade",
+        "--target",
+        str(package_dir),
+        "-r",
+        str(requirements_path),
+    ]
     command = subprocess.list2cmdline(cmd)
     on_event(PipProgressEvent("Running command", command, 0, command))
     process = subprocess.Popen(
@@ -610,7 +625,7 @@ def run_bootstrap() -> int:
     style.configure("Detail.Horizontal.TProgressbar", troughcolor="#e1e1e1", background="#4f9cff")
 
     step_states = {step: StepState.PENDING for step in BOOTSTRAP_STEPS}
-    spinner_frames = ["|", "/", "-", "\\"]
+    spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
     spinner_index = 0
     current_step = BOOTSTRAP_STEPS[0]
     detail_progress_value = tk.IntVar(value=0)
@@ -793,7 +808,7 @@ def run_bootstrap() -> int:
             elif state == StepState.ERROR:
                 label.config(text=f"× {step}", fg="#b00020")
             elif state == StepState.RUNNING:
-                label.config(text=f"{spinner_frames[spinner_index % len(spinner_frames)]} {step}", fg="#1a5fb4")
+                label.config(text=f"{spinner_frames[spinner_index % len(spinner_frames)]} {step}", fg="#1f6feb")
             else:
                 label.config(text=f"○ {step}", fg="#555555")
 
@@ -939,11 +954,14 @@ def run_bootstrap() -> int:
                 set_step(BOOTSTRAP_STEPS[3], StepState.RUNNING, "Installing missing packages", 0)
                 command = subprocess.list2cmdline(
                     [
-                        str(local_venv_python(root)),
+                        sys.executable,
                         "-m",
                         "pip",
                         "install",
                         "--no-cache-dir",
+                        "--upgrade",
+                        "--target",
+                        str(local_package_dir(root)),
                         "-r",
                         str(resource_root(package_root) / "requirements.txt"),
                     ]
