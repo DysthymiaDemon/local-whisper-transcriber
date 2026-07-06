@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import threading
 from typing import Any
+import warnings
 
 from app_config import load_portable_config
 from transcriber_engine import (
@@ -23,6 +24,17 @@ SAMPLE_RATE = PORTABLE_DEFAULTS.sample_rate
 CHUNK_SECONDS = PORTABLE_DEFAULTS.chunk_seconds
 OVERLAP_SECONDS = PORTABLE_DEFAULTS.overlap_seconds
 COMPUTE_TYPE = PORTABLE_DEFAULTS.compute_type
+
+
+DIARIZATION_IMPORT_WARNING = ""
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    try:
+        # Import before PySide6 to avoid a shiboken/six import-hook conflict
+        # seen on locked-down Windows Python installs.
+        import pyannote.audio  # noqa: F401
+    except Exception as exc:  # pragma: no cover - depends on local deps
+        DIARIZATION_IMPORT_WARNING = str(exc)
 
 
 try:
@@ -68,7 +80,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Offline Meeting Transcriber")
-        self.resize(1180, 780)
+        self.resize(1040, 720)
         self.engine: MeetingTranscriberEngine | None = None
         self.bridge = EngineSignalBridge()
         self.bridge.event.connect(self._handle_engine_event)
@@ -78,6 +90,8 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._load_devices()
         self._set_running(False)
+        if DIARIZATION_IMPORT_WARNING:
+            self._append_log(f"Diarization stack unavailable: {DIARIZATION_IMPORT_WARNING}")
 
     def _build_ui(self) -> None:
         root = QWidget()

@@ -15,6 +15,33 @@ Built for Windows 11 Enterprise laptops with no NVIDIA GPU and no runtime intern
 - Writes an updated transcript file continuously.
 - Runs without cloud APIs during runtime.
 
+## Double-Click Launch
+
+On this machine, double-click:
+
+```text
+Open Offline Meeting Transcriber.pyw
+```
+
+Behavior:
+
+- First launch opens a medium-sized setup window.
+- Setup auto-starts and shows a task list, spinner, command text, and progress bars.
+- Setup creates `config.json`, `models\`, and `transcripts\`.
+- Missing Python packages install with `pip --user`.
+- Important setup messages stay visible for 5 seconds before moving on.
+- When prerequisites finish, setup shows a 5-second launch countdown.
+- Model folder buttons open/prepare local model locations.
+- After setup is marked complete, future double-clicks open the GUI immediately.
+
+If models are still missing, the GUI can open, but recording cannot start until these folders contain local model files:
+
+```text
+models\faster-whisper
+models\pyannote-pipeline
+models\pyannote-embedding
+```
+
 ## Portable App Status
 
 The portable build bundles Python and Python package dependencies into:
@@ -104,6 +131,8 @@ Runtime must not download models. Pyannote `config.yaml` must reference local pa
 ## Source Files
 
 - `meeting_transcriber_gui.py`: PySide6 desktop GUI.
+- `bootstrap_launcher.py`: first-run setup and direct GUI launch.
+- `Open Offline Meeting Transcriber.pyw`: double-click launcher.
 - `transcriber_engine.py`: recorder, queues, transcription, diarization, speaker state, transcript writer.
 - `app_config.py`: portable app path/config handling.
 - `build_portable.ps1`: PyInstaller one-dir bundle build.
