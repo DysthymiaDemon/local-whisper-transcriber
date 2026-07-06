@@ -1,0 +1,7 @@
+faster-whisper==1.2.1
+pyannote.audio==4.0.7
+sounddevice==0.5.5
+PySide6==6.11.1
+numpy==2.4.2
+torch==2.11.0
+torchaudio==2.11.0
