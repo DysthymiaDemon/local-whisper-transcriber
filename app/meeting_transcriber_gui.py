@@ -65,7 +65,7 @@ try:
     )
 except ImportError as exc:  # pragma: no cover - depends on local GUI deps
     print(
-        "PySide6 is not installed. Install offline wheels from offline_setup.md, "
+        "PySide6 is not installed. Install offline wheels from docs/offline_setup.md, "
         "then run this file again.",
         file=sys.stderr,
     )

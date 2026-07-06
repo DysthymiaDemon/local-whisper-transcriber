@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 build/
 dist/
+OfflineMeetingTranscriber/
 models/
 transcripts/
 .setup_complete

@@ -7,6 +7,7 @@ from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 block_cipher = None
 project_root = Path.cwd()
+app_root = project_root / "app"
 datas = []
 binaries = []
 hiddenimports = []
@@ -29,8 +30,8 @@ hiddenimports += collect_submodules("pyannote")
 hiddenimports += collect_submodules("torch")
 
 a = Analysis(
-    ["bootstrap_launcher.py"],
-    pathex=[str(project_root)],
+    ["app/bootstrap_launcher.py"],
+    pathex=[str(app_root)],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,

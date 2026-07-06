@@ -24,7 +24,7 @@ Use same OS/Python architecture where possible.
 
 ```powershell
 mkdir wheelhouse
-py -3.12 -m pip download -r requirements.txt -d wheelhouse
+py -3.12 -m pip download -r .\resources\requirements.txt -d wheelhouse
 ```
 
 For CPU-only PyTorch wheels, use official CPU index if default PyPI resolver selects unsuitable wheels:
@@ -35,13 +35,13 @@ py -3.12 -m pip download torch==2.11.0 torchaudio==2.11.0 `
   -d wheelhouse
 ```
 
-Copy `wheelhouse`, `requirements.txt`, app files, and model folders to offline laptop.
+Copy `wheelhouse`, `resources`, `app`, launchers, and model folders to offline laptop.
 
 Install offline:
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
-python -m pip install --no-index --find-links .\wheelhouse -r requirements.txt
+python -m pip install --no-index --find-links .\wheelhouse -r .\resources\requirements.txt
 ```
 
 ## 3. Audio Driver Notes
@@ -80,10 +80,10 @@ For lower latency, try `Systran/faster-distil-small.en` if English-only. For bet
 Copy folder to offline laptop, example:
 
 ```text
-C:\Users\<you>\Apps\OfflineMeetingTranscriber\models\faster-whisper
+<install folder>\models\faster-whisper
 ```
 
-The first-run setup GUI creates this local app folder outside OneDrive.
+The first-run setup GUI creates this local install folder beside the standalone `.pyw`, or in the selected portable app folder.
 
 ## 5. Download Pyannote Models
 
@@ -114,8 +114,8 @@ If downloaded pipeline `config.yaml` references remote model IDs, edit it on con
 pipeline:
   name: pyannote.audio.pipelines.SpeakerDiarization
 params:
-  segmentation: C:/Users/<you>/Apps/OfflineMeetingTranscriber/models/pyannote-pipeline/segmentation
-  embedding: C:/Users/<you>/Apps/OfflineMeetingTranscriber/models/pyannote-embedding
+  segmentation: <install folder>/models/pyannote-pipeline/segmentation
+  embedding: <install folder>/models/pyannote-embedding
   clustering:
     method: centroid
 ```
@@ -123,7 +123,7 @@ params:
 Exact config keys vary by pyannote release. Open the downloaded `config.yaml`, find model references such as `pyannote/...` or `speechbrain/...`, download those folders, and replace each reference with local absolute path. Run this check on offline laptop:
 
 ```powershell
-python -c "from pyannote.audio import Pipeline; Pipeline.from_pretrained(r'C:\Users\<you>\Apps\OfflineMeetingTranscriber\models\pyannote-pipeline'); print('pyannote local load ok')"
+python -c "from pyannote.audio import Pipeline; Pipeline.from_pretrained(r'<install folder>\\models\\pyannote-pipeline'); print('pyannote local load ok')"
 ```
 
 No line in offline config should require Hugging Face repo lookup.
@@ -132,7 +132,7 @@ No line in offline config should require Hugging Face repo lookup.
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
-python meeting_transcriber_gui.py
+python .\app\meeting_transcriber_gui.py
 ```
 
 In GUI:

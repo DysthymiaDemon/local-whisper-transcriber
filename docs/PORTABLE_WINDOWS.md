@@ -37,14 +37,14 @@ Use same Windows architecture as target laptop. Python 3.12 64-bit recommended.
 ```powershell
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements-build.txt
-python -m PyInstaller --clean --noconfirm .\local_whisper_transcriber.spec
+python -m pip install -r .\resources\requirements-build.txt
+python -m PyInstaller --clean --noconfirm .\packaging\local_whisper_transcriber.spec
 ```
 
 Or use script:
 
 ```powershell
-.\build_portable.ps1 -Clean
+.\packaging\build_portable.ps1 -Clean
 ```
 
 ## Add Models
@@ -66,8 +66,8 @@ For reproducible corporate build machine:
 
 ```powershell
 mkdir wheelhouse
-py -3.12 -m pip download -r requirements-build.txt -d wheelhouse
-.\build_portable.ps1 -Clean -Wheelhouse .\wheelhouse
+py -3.12 -m pip download -r .\resources\requirements-build.txt -d wheelhouse
+.\packaging\build_portable.ps1 -Clean -Wheelhouse .\wheelhouse
 ```
 
 For CPU-only PyTorch wheels:

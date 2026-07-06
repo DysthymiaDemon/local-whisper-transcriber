@@ -13,12 +13,21 @@ from transcriber_engine import EngineConfig
 CONFIG_FILE_NAME = "config.json"
 APP_FOLDER_NAME = "OfflineMeetingTranscriber"
 ENV_APP_ROOT = "LOCAL_WHISPER_APP_ROOT"
+ENV_SOURCE_ROOT = "LOCAL_WHISPER_SOURCE_ROOT"
 
 
 def source_root() -> Path:
+    configured = os.environ.get(ENV_SOURCE_ROOT)
+    if configured:
+        return Path(configured).expanduser().resolve()
+
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
+
+    module_dir = Path(__file__).resolve().parent
+    if module_dir.name == "app":
+        return module_dir.parent
+    return module_dir
 
 
 def default_local_app_root() -> Path:

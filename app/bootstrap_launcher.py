@@ -107,6 +107,18 @@ def installer_source_root() -> Path:
     return source_root()
 
 
+def app_source_dir(root: Path | None = None) -> Path:
+    base = (root or installer_source_root()).resolve()
+    candidate = base / "app"
+    return candidate if candidate.is_dir() else base
+
+
+def resource_root(root: Path | None = None) -> Path:
+    base = (root or installer_source_root()).resolve()
+    candidate = base / "resources"
+    return candidate if candidate.is_dir() else base
+
+
 def missing_imports(required: Mapping[str, str] = REQUIRED_IMPORTS) -> list[str]:
     missing: list[str] = []
     for label, module_name in required.items():
@@ -126,7 +138,7 @@ def ensure_portable_layout(root: Path, template_root: Path | None = None) -> Pat
 
     config_path = root / "config.json"
     if not config_path.exists():
-        template_path = (template_root or root) / "config.template.json"
+        template_path = resource_root(template_root or root) / "config.template.json"
         if template_path.exists():
             config_path.write_text(template_path.read_text(encoding="utf-8"), encoding="utf-8")
         else:
@@ -165,9 +177,13 @@ def model_folder_status(root: Path) -> dict[str, BootstrapStatus]:
 def launch_gui(root: Path) -> int:
     os.chdir(root)
     os.environ["LOCAL_WHISPER_APP_ROOT"] = str(root)
+    os.environ["LOCAL_WHISPER_SOURCE_ROOT"] = str(installer_source_root())
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
     os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+    app_dir = str(app_source_dir())
+    if app_dir not in sys.path:
+        sys.path.insert(0, app_dir)
     from meeting_transcriber_gui import main
 
     return main()
@@ -175,7 +191,7 @@ def launch_gui(root: Path) -> int:
 
 def run_pip_install(root: Path, on_event, package_root: Path | None = None) -> int:
     package_root = package_root or installer_source_root()
-    requirements_path = package_root / "requirements.txt"
+    requirements_path = resource_root(package_root) / "requirements.txt"
     cmd = [sys.executable, "-m", "pip", "install", "--user", "-r", str(requirements_path)]
     on_event(PipProgressEvent("Running command", " ".join(cmd), 0, " ".join(cmd)))
     process = subprocess.Popen(
@@ -476,7 +492,7 @@ def run_bootstrap() -> int:
             if missing:
                 set_step(BOOTSTRAP_STEPS[2], StepState.WARNING, "Missing: " + ", ".join(missing), 100)
                 set_step(BOOTSTRAP_STEPS[3], StepState.RUNNING, "Installing missing packages", 0)
-                command = f"{sys.executable} -m pip install --user -r {package_root / 'requirements.txt'}"
+                command = f"{sys.executable} -m pip install --user -r {resource_root(package_root) / 'requirements.txt'}"
                 command_detail.set("Running command:\n" + command)
                 time.sleep(IMPORTANT_MESSAGE_SECONDS)
                 code = run_pip_install(root, update_from_pip, package_root)

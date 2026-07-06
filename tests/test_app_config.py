@@ -1,8 +1,11 @@
 import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 from app_config import ENV_APP_ROOT, default_local_app_root, default_portable_config, load_portable_config
 
