@@ -1,0 +1,13 @@
+{
+  "whisper_model_dir": "models/faster-whisper",
+  "pyannote_pipeline_dir": "models/pyannote-pipeline",
+  "pyannote_embedding_model_dir": "models/pyannote-embedding",
+  "output_file": "transcripts/meeting_transcript.txt",
+  "sample_rate": 16000,
+  "chunk_seconds": 8.0,
+  "overlap_seconds": 2.0,
+  "compute_type": "int8",
+  "speaker_match_threshold": 0.7,
+  "min_speaker_confidence": 0.5,
+  "min_overlap_ratio": 0.35
+}

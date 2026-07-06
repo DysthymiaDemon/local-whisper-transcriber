@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import sys
 import threading
-from pathlib import Path
 from typing import Any
 
+from app_config import load_portable_config
 from transcriber_engine import (
     EngineConfig,
     MeetingTranscriberEngine,
@@ -14,14 +14,15 @@ from transcriber_engine import (
 )
 
 
-WHISPER_MODEL_DIR = r"C:\models\faster-whisper-small"
-PYANNOTE_PIPELINE_DIR = r"C:\models\pyannote-speaker-diarization"
-PYANNOTE_EMBEDDING_MODEL_DIR = r"C:\models\pyannote-embedding"
-OUTPUT_FILE = "meeting_transcript.txt"
-SAMPLE_RATE = 16_000
-CHUNK_SECONDS = 8.0
-OVERLAP_SECONDS = 2.0
-COMPUTE_TYPE = "int8"
+PORTABLE_DEFAULTS = load_portable_config()
+WHISPER_MODEL_DIR = PORTABLE_DEFAULTS.whisper_model_dir
+PYANNOTE_PIPELINE_DIR = PORTABLE_DEFAULTS.pyannote_pipeline_dir
+PYANNOTE_EMBEDDING_MODEL_DIR = PORTABLE_DEFAULTS.pyannote_embedding_model_dir
+OUTPUT_FILE = PORTABLE_DEFAULTS.output_file
+SAMPLE_RATE = PORTABLE_DEFAULTS.sample_rate
+CHUNK_SECONDS = PORTABLE_DEFAULTS.chunk_seconds
+OVERLAP_SECONDS = PORTABLE_DEFAULTS.overlap_seconds
+COMPUTE_TYPE = PORTABLE_DEFAULTS.compute_type
 
 
 try:

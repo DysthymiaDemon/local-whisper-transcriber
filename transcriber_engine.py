@@ -61,9 +61,6 @@ class EngineConfig:
                 errors.append(f"{label} path is required.")
             elif not Path(raw_path).exists():
                 errors.append(f"{label} path does not exist: {raw_path}")
-        output_parent = Path(self.output_file).expanduser().resolve().parent
-        if not output_parent.exists():
-            errors.append(f"Output folder does not exist: {output_parent}")
         return errors
 
 
