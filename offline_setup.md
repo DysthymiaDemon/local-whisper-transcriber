@@ -6,12 +6,12 @@ Runtime is offline-only. `transcriber_engine.py` sets `HF_HUB_OFFLINE=1`, `TRANS
 
 ## 1. Prepare Python
 
-Use 64-bit Python 3.11 for best package compatibility with PyTorch, pyannote, faster-whisper, and PySide6.
+Use 64-bit Python 3.12. The source launcher targets Python 3.12, and the no-Python wrapper can install it with `winget` when policy allows.
 
 On offline laptop:
 
 ```powershell
-py -3.11 -m venv .venv
+py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 ```
@@ -24,13 +24,13 @@ Use same OS/Python architecture where possible.
 
 ```powershell
 mkdir wheelhouse
-py -3.11 -m pip download -r requirements.txt -d wheelhouse
+py -3.12 -m pip download -r requirements.txt -d wheelhouse
 ```
 
 For CPU-only PyTorch wheels, use official CPU index if default PyPI resolver selects unsuitable wheels:
 
 ```powershell
-py -3.11 -m pip download torch==2.11.0 torchaudio==2.11.0 `
+py -3.12 -m pip download torch==2.11.0 torchaudio==2.11.0 `
   --index-url https://download.pytorch.org/whl/cpu `
   -d wheelhouse
 ```
@@ -71,7 +71,7 @@ Recommended CPU start:
 ```powershell
 pip install huggingface_hub
 huggingface-cli download Systran/faster-whisper-small `
-  --local-dir models\faster-whisper-small `
+  --local-dir models\faster-whisper `
   --local-dir-use-symlinks False
 ```
 
@@ -80,10 +80,10 @@ For lower latency, try `Systran/faster-distil-small.en` if English-only. For bet
 Copy folder to offline laptop, example:
 
 ```text
-C:\models\faster-whisper-small
+C:\Users\<you>\Apps\OfflineMeetingTranscriber\models\faster-whisper
 ```
 
-Set `WHISPER_MODEL_DIR` in `meeting_transcriber_gui.py` or GUI settings to that folder.
+The first-run setup GUI creates this local app folder outside OneDrive.
 
 ## 5. Download Pyannote Models
 
@@ -94,7 +94,7 @@ Download community diarization pipeline:
 ```powershell
 pip install huggingface_hub
 huggingface-cli download pyannote/speaker-diarization-community-1 `
-  --local-dir models\pyannote-speaker-diarization `
+  --local-dir models\pyannote-pipeline `
   --local-dir-use-symlinks False `
   --token <HF_TOKEN>
 ```
@@ -114,8 +114,8 @@ If downloaded pipeline `config.yaml` references remote model IDs, edit it on con
 pipeline:
   name: pyannote.audio.pipelines.SpeakerDiarization
 params:
-  segmentation: C:/models/pyannote-speaker-diarization/segmentation
-  embedding: C:/models/pyannote-embedding
+  segmentation: C:/Users/<you>/Apps/OfflineMeetingTranscriber/models/pyannote-pipeline/segmentation
+  embedding: C:/Users/<you>/Apps/OfflineMeetingTranscriber/models/pyannote-embedding
   clustering:
     method: centroid
 ```
@@ -123,7 +123,7 @@ params:
 Exact config keys vary by pyannote release. Open the downloaded `config.yaml`, find model references such as `pyannote/...` or `speechbrain/...`, download those folders, and replace each reference with local absolute path. Run this check on offline laptop:
 
 ```powershell
-python -c "from pyannote.audio import Pipeline; Pipeline.from_pretrained(r'C:\models\pyannote-speaker-diarization'); print('pyannote local load ok')"
+python -c "from pyannote.audio import Pipeline; Pipeline.from_pretrained(r'C:\Users\<you>\Apps\OfflineMeetingTranscriber\models\pyannote-pipeline'); print('pyannote local load ok')"
 ```
 
 No line in offline config should require Hugging Face repo lookup.

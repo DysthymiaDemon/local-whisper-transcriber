@@ -29,7 +29,7 @@ hiddenimports += collect_submodules("pyannote")
 hiddenimports += collect_submodules("torch")
 
 a = Analysis(
-    ["meeting_transcriber_gui.py"],
+    ["bootstrap_launcher.py"],
     pathex=[str(project_root)],
     binaries=binaries,
     datas=datas,
@@ -55,7 +55,7 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    console=True,
+    console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,

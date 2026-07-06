@@ -1,5 +1,5 @@
 param(
-    [string]$Python = "py -3.11",
+    [string]$Python = "py -3.12",
     [string]$Wheelhouse = ".\wheelhouse",
     [switch]$SkipInstall,
     [switch]$Clean

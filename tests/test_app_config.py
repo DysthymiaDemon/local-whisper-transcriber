@@ -4,10 +4,24 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app_config import default_portable_config, load_portable_config
+from app_config import ENV_APP_ROOT, default_local_app_root, default_portable_config, load_portable_config
 
 
 class PortableConfigTests(unittest.TestCase):
+    def test_default_local_app_root_can_be_overridden(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = os.environ.get(ENV_APP_ROOT)
+            os.environ[ENV_APP_ROOT] = tmp
+            try:
+                root = default_local_app_root()
+            finally:
+                if previous is None:
+                    os.environ.pop(ENV_APP_ROOT, None)
+                else:
+                    os.environ[ENV_APP_ROOT] = previous
+
+        self.assertEqual(root, Path(tmp).resolve())
+
     def test_defaults_point_to_folders_inside_app_root(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

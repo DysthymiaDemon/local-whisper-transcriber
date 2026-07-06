@@ -27,7 +27,13 @@ Behavior:
 
 - First launch opens a medium-sized setup window.
 - Setup auto-starts and shows a task list, spinner, command text, and progress bars.
-- Setup creates `config.json`, `models\`, and `transcripts\`.
+- Setup creates runtime files outside OneDrive under:
+
+```text
+C:\Users\<you>\Apps\OfflineMeetingTranscriber
+```
+
+- Setup creates `config.json`, `models\`, and `transcripts\` in that local app folder.
 - Missing Python packages install with `pip --user`.
 - Important setup messages stay visible for 5 seconds before moving on.
 - When prerequisites finish, setup shows a 5-second launch countdown.
@@ -37,14 +43,22 @@ Behavior:
 If models are still missing, the GUI can open, but recording cannot start until these folders contain local model files:
 
 ```text
-models\faster-whisper
-models\pyannote-pipeline
-models\pyannote-embedding
+C:\Users\<you>\Apps\OfflineMeetingTranscriber\models\faster-whisper
+C:\Users\<you>\Apps\OfflineMeetingTranscriber\models\pyannote-pipeline
+C:\Users\<you>\Apps\OfflineMeetingTranscriber\models\pyannote-embedding
 ```
+
+For a Windows laptop that does not have Python 3.12 installed, use:
+
+```text
+Open Offline Meeting Transcriber.cmd
+```
+
+That wrapper checks for Python 3.12. If missing, it attempts a current-user install with `winget install Python.Python.3.12 --scope user`, then starts the same setup GUI. If corporate policy blocks `.cmd` files or `winget`, use the portable EXE build below.
 
 ## Portable App Status
 
-The portable build bundles Python and Python package dependencies into:
+The portable build is the true no-Python option. It bundles Python and Python package dependencies into:
 
 ```text
 dist\OfflineMeetingTranscriber\_internal
@@ -62,7 +76,7 @@ This keeps gated/licensed and large model files explicit.
 
 ## Target Layout
 
-Final folder to copy to a corporate laptop:
+Portable EXE folder to copy to a corporate laptop:
 
 ```text
 OfflineMeetingTranscriber/
@@ -91,7 +105,7 @@ No admin account needed if Windows policy allows unsigned local executables and 
 On an internet-connected Windows build machine:
 
 ```powershell
-py -3.11 -m venv .venv
+py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements-build.txt
 .\build_portable.ps1 -Clean
@@ -110,13 +124,25 @@ For fully air-gapped build steps, see [PORTABLE_WINDOWS.md](PORTABLE_WINDOWS.md)
 ## Run From Source
 
 ```powershell
-py -3.11 -m venv .venv
+py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
 python meeting_transcriber_gui.py
 ```
 
 Set model paths in GUI before pressing `Record`.
+
+Source runtime data defaults to:
+
+```text
+C:\Users\<you>\Apps\OfflineMeetingTranscriber
+```
+
+Override for testing or custom install folders:
+
+```powershell
+$env:LOCAL_WHISPER_APP_ROOT = "D:\Apps\OfflineMeetingTranscriber"
+```
 
 ## Model Requirements
 
@@ -143,15 +169,17 @@ Runtime must not download models. Pyannote `config.yaml` must reference local pa
 ## Test
 
 ```powershell
-python -B -m unittest discover -s tests -v
-python -B -m py_compile app_config.py transcriber_engine.py meeting_transcriber_gui.py tests\test_app_config.py tests\test_engine_core.py local_whisper_transcriber.spec
+py -3.12 -B -m unittest discover -s tests -v
+py -3.12 -B -m py_compile bootstrap_launcher.py app_config.py transcriber_engine.py meeting_transcriber_gui.py "Open Offline Meeting Transcriber.pyw" tests\test_bootstrap_launcher.py tests\test_app_config.py tests\test_engine_core.py local_whisper_transcriber.spec
 ```
 
-Expected current result: 13 tests pass.
+Expected current result: 23 tests pass.
 
 ## Corporate Laptop Notes
 
 - Windows microphone access must be enabled.
+- Source `.pyw` launch requires Python 3.12. `Open Offline Meeting Transcriber.cmd` can install it if `winget` is available. Portable EXE does not require system Python.
 - If endpoint security blocks unsigned EXEs, IT must allow-list or sign `OfflineMeetingTranscriber.exe`.
 - If diarization lags on CPU, increase chunk duration to 10-15 seconds or use smaller local models.
-- Transcript output defaults to `transcripts\meeting_transcript.txt`.
+- Transcript output defaults to `C:\Users\<you>\Apps\OfflineMeetingTranscriber\transcripts\meeting_transcript.txt` in source mode.
+- Avoid placing model folders under OneDrive. Large model files can trigger sync errors and corporate cloud policy warnings.

@@ -32,10 +32,10 @@ Let desktop apps access your microphone: On
 
 ## Build On Internet-Connected Windows Machine
 
-Use same Windows architecture as target laptop. Python 3.11 64-bit recommended.
+Use same Windows architecture as target laptop. Python 3.12 64-bit recommended.
 
 ```powershell
-py -3.11 -m venv .venv
+py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements-build.txt
 python -m PyInstaller --clean --noconfirm .\local_whisper_transcriber.spec
@@ -66,14 +66,14 @@ For reproducible corporate build machine:
 
 ```powershell
 mkdir wheelhouse
-py -3.11 -m pip download -r requirements-build.txt -d wheelhouse
+py -3.12 -m pip download -r requirements-build.txt -d wheelhouse
 .\build_portable.ps1 -Clean -Wheelhouse .\wheelhouse
 ```
 
 For CPU-only PyTorch wheels:
 
 ```powershell
-py -3.11 -m pip download torch==2.11.0 torchaudio==2.11.0 `
+py -3.12 -m pip download torch==2.11.0 torchaudio==2.11.0 `
   --index-url https://download.pytorch.org/whl/cpu `
   -d wheelhouse
 ```

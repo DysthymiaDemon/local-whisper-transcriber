@@ -55,6 +55,21 @@ class BootstrapLauncherTests(unittest.TestCase):
         self.assertEqual(config["whisper_model_dir"], "models/faster-whisper")
         self.assertEqual(config["output_file"], "transcripts/meeting_transcript.txt")
 
+    def test_ensure_portable_layout_uses_external_template_root(self):
+        with tempfile.TemporaryDirectory() as runtime_tmp, tempfile.TemporaryDirectory() as source_tmp:
+            runtime_root = Path(runtime_tmp)
+            source_root = Path(source_tmp)
+            (source_root / "config.template.json").write_text(
+                json.dumps({"chunk_seconds": 10, "output_file": "transcripts/custom.txt"}),
+                encoding="utf-8",
+            )
+
+            config_path = ensure_portable_layout(runtime_root, source_root)
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(config["chunk_seconds"], 10)
+        self.assertEqual(config["output_file"], "transcripts/custom.txt")
+
     def test_model_folder_status_requires_nonempty_model_dirs(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

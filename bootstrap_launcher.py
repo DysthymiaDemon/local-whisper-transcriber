@@ -13,6 +13,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Mapping
 
+from app_config import application_root, source_root
+
 
 REQUIRED_IMPORTS: dict[str, str] = {
     "PySide6": "PySide6",
@@ -97,8 +99,12 @@ class PipProgressParser:
         return PipProgressEvent("Running pip", stripped, None, line)
 
 
-def app_root() -> Path:
-    return Path(__file__).resolve().parent
+def runtime_root() -> Path:
+    return application_root()
+
+
+def installer_source_root() -> Path:
+    return source_root()
 
 
 def missing_imports(required: Mapping[str, str] = REQUIRED_IMPORTS) -> list[str]:
@@ -112,7 +118,7 @@ def missing_imports(required: Mapping[str, str] = REQUIRED_IMPORTS) -> list[str]
     return missing
 
 
-def ensure_portable_layout(root: Path) -> Path:
+def ensure_portable_layout(root: Path, template_root: Path | None = None) -> Path:
     models = root / "models"
     for name in MODEL_DIRS:
         (models / name).mkdir(parents=True, exist_ok=True)
@@ -120,7 +126,7 @@ def ensure_portable_layout(root: Path) -> Path:
 
     config_path = root / "config.json"
     if not config_path.exists():
-        template_path = root / "config.template.json"
+        template_path = (template_root or root) / "config.template.json"
         if template_path.exists():
             config_path.write_text(template_path.read_text(encoding="utf-8"), encoding="utf-8")
         else:
@@ -158,6 +164,7 @@ def model_folder_status(root: Path) -> dict[str, BootstrapStatus]:
 
 def launch_gui(root: Path) -> int:
     os.chdir(root)
+    os.environ["LOCAL_WHISPER_APP_ROOT"] = str(root)
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
     os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
@@ -166,12 +173,14 @@ def launch_gui(root: Path) -> int:
     return main()
 
 
-def run_pip_install(root: Path, on_event) -> int:
-    cmd = [sys.executable, "-m", "pip", "install", "--user", "-r", str(root / "requirements.txt")]
+def run_pip_install(root: Path, on_event, package_root: Path | None = None) -> int:
+    package_root = package_root or installer_source_root()
+    requirements_path = package_root / "requirements.txt"
+    cmd = [sys.executable, "-m", "pip", "install", "--user", "-r", str(requirements_path)]
     on_event(PipProgressEvent("Running command", " ".join(cmd), 0, " ".join(cmd)))
     process = subprocess.Popen(
         cmd,
-        cwd=str(root),
+        cwd=str(package_root),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -186,13 +195,14 @@ def run_pip_install(root: Path, on_event) -> int:
 
 
 def needs_setup(root: Path, required: Mapping[str, str] = REQUIRED_IMPORTS) -> bool:
-    ensure_portable_layout(root)
+    ensure_portable_layout(root, installer_source_root())
     return bool(missing_imports(required)) or not (root / SETUP_MARKER).exists()
 
 
 def run_bootstrap() -> int:
-    root = app_root()
-    ensure_portable_layout(root)
+    root = runtime_root()
+    package_root = installer_source_root()
+    ensure_portable_layout(root, package_root)
     if not needs_setup(root):
         return launch_gui(root)
 
@@ -458,7 +468,7 @@ def run_bootstrap() -> int:
             set_step(BOOTSTRAP_STEPS[0], StepState.DONE, "Python runtime ready", 100)
 
             important_message(BOOTSTRAP_STEPS[1], f"Preparing folders under:\n{root}")
-            ensure_portable_layout(root)
+            ensure_portable_layout(root, package_root)
             set_step(BOOTSTRAP_STEPS[1], StepState.DONE, "App folders ready", 100)
 
             important_message(BOOTSTRAP_STEPS[2], "Checking required Python packages...")
@@ -466,10 +476,10 @@ def run_bootstrap() -> int:
             if missing:
                 set_step(BOOTSTRAP_STEPS[2], StepState.WARNING, "Missing: " + ", ".join(missing), 100)
                 set_step(BOOTSTRAP_STEPS[3], StepState.RUNNING, "Installing missing packages", 0)
-                command = f"{sys.executable} -m pip install --user -r {root / 'requirements.txt'}"
+                command = f"{sys.executable} -m pip install --user -r {package_root / 'requirements.txt'}"
                 command_detail.set("Running command:\n" + command)
                 time.sleep(IMPORTANT_MESSAGE_SECONDS)
-                code = run_pip_install(root, update_from_pip)
+                code = run_pip_install(root, update_from_pip, package_root)
                 if code != 0:
                     set_step(BOOTSTRAP_STEPS[3], StepState.ERROR, f"pip failed with exit code {code}", 100)
                     return

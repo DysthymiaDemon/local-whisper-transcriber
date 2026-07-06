@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -10,12 +11,36 @@ from transcriber_engine import EngineConfig
 
 
 CONFIG_FILE_NAME = "config.json"
+APP_FOLDER_NAME = "OfflineMeetingTranscriber"
+ENV_APP_ROOT = "LOCAL_WHISPER_APP_ROOT"
+
+
+def source_root() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def default_local_app_root() -> Path:
+    configured = os.environ.get(ENV_APP_ROOT)
+    if configured:
+        return Path(configured).expanduser().resolve()
+
+    user_profile = os.environ.get("USERPROFILE")
+    if user_profile:
+        return (Path(user_profile) / "Apps" / APP_FOLDER_NAME).resolve()
+
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        return (Path(local_app_data) / APP_FOLDER_NAME).resolve()
+
+    return (Path.home() / "Apps" / APP_FOLDER_NAME).resolve()
 
 
 def application_root() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
+    return default_local_app_root()
 
 
 def default_portable_config(root: Path | None = None) -> EngineConfig:
