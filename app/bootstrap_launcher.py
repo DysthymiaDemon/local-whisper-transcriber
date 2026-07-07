@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+import ctypes
 from contextlib import contextmanager
 from collections import deque
 from dataclasses import dataclass
@@ -82,6 +83,10 @@ CA_BUNDLE_ENV = "LOCAL_WHISPER_CA_BUNDLE"
 TLS_CERT_ENV_VARS = ("REQUESTS_CA_BUNDLE", "SSL_CERT_FILE", "CURL_CA_BUNDLE")
 CA_BUNDLE_FILENAMES = ("company-ca.pem", "corporate-ca.pem", "ca-bundle.pem")
 WINDOWS_CA_BUNDLE_NAME = "windows-ca-bundle.pem"
+PIP_CPU_LIMIT_PERCENT = 25
+JobObjectCpuRateControlInformation = 15
+JOB_OBJECT_CPU_RATE_CONTROL_ENABLE = 0x1
+JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP = 0x4
 INSTALL_LOG_FILE_NAME = "install_log.txt"
 SETUP_PROGRESS_STYLE = "Setup.Horizontal.TProgressbar"
 DETAIL_PROGRESS_STYLE = "Detail.Horizontal.TProgressbar"
@@ -155,6 +160,13 @@ class ModelDownloadSpec:
     name: str
     repo_id: str
     target_subdir: str
+
+
+class JOBOBJECT_CPU_RATE_CONTROL_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("ControlFlags", ctypes.c_uint32),
+        ("CpuRate", ctypes.c_uint32),
+    ]
 
 
 DEFAULT_MODEL_DOWNLOADS = (
@@ -1304,6 +1316,70 @@ def launch_gui(root: Path, splash=None, splash_status=None) -> int:
     return main()
 
 
+def apply_windows_cpu_limit(
+    process: subprocess.Popen,
+    percent: int = PIP_CPU_LIMIT_PERCENT,
+    platform_name: str | None = None,
+    kernel32: Any | None = None,
+) -> bool:
+    platform_name = sys.platform if platform_name is None else platform_name
+    if platform_name != "win32":
+        return False
+
+    process_handle = getattr(process, "_handle", None)
+    if process_handle is None:
+        return False
+
+    kernel32 = kernel32 or ctypes.WinDLL("kernel32", use_last_error=True)
+    job_handle = None
+    try:
+        job_handle = kernel32.CreateJobObjectW(None, None)
+        if not job_handle:
+            return False
+        cpu_rate = max(1, min(100, int(percent))) * 100
+        info = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION(
+            JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
+            cpu_rate,
+        )
+        configured = kernel32.SetInformationJobObject(
+            job_handle,
+            JobObjectCpuRateControlInformation,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        )
+        if not configured:
+            kernel32.CloseHandle(job_handle)
+            return False
+        assigned = kernel32.AssignProcessToJobObject(job_handle, int(process_handle))
+        if not assigned:
+            kernel32.CloseHandle(job_handle)
+            return False
+        setattr(process, "_cpu_limit_job_handle", job_handle)
+        return True
+    except Exception:
+        if job_handle:
+            try:
+                kernel32.CloseHandle(job_handle)
+            except Exception:
+                pass
+        return False
+
+
+def close_windows_cpu_limit(process: subprocess.Popen, kernel32: Any | None = None) -> None:
+    job_handle = getattr(process, "_cpu_limit_job_handle", None)
+    if not job_handle:
+        return
+    try:
+        kernel32 = kernel32 or ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CloseHandle(job_handle)
+    except Exception:
+        pass
+    try:
+        delattr(process, "_cpu_limit_job_handle")
+    except Exception:
+        pass
+
+
 def run_pip_install(root: Path, on_event, package_root: Path | None = None) -> PipInstallResult:
     package_root = package_root or installer_source_root()
     requirements_path = resource_root(package_root) / "requirements.txt"
@@ -1334,14 +1410,22 @@ def run_pip_install(root: Path, on_event, package_root: Path | None = None) -> P
         encoding="utf-8",
         errors="replace",
     )
+    cpu_limited = apply_windows_cpu_limit(process)
+    if cpu_limited:
+        detail = f"pip CPU hard cap: {PIP_CPU_LIMIT_PERCENT}% of total CPU"
+        on_event(PipProgressEvent("CPU limit", detail, None, detail))
     assert process.stdout is not None
     parser = PipProgressParser()
     recent_output: deque[str] = deque(maxlen=25)
-    for line in iter_cli_progress_output(process.stdout):
-        stripped = line.rstrip()
-        recent_output.append(stripped)
-        on_event(parser.parse(stripped))
-    return PipInstallResult(process.wait(), command, list(recent_output))
+    try:
+        for line in iter_cli_progress_output(process.stdout):
+            stripped = line.rstrip()
+            recent_output.append(stripped)
+            on_event(parser.parse(stripped))
+        code = process.wait()
+    finally:
+        close_windows_cpu_limit(process)
+    return PipInstallResult(code, command, list(recent_output))
 
 
 def write_setup_error_log(

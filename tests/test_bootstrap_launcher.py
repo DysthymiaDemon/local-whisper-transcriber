@@ -1,4 +1,5 @@
 import io
+import ctypes
 import json
 import os
 import subprocess
@@ -261,6 +262,84 @@ class BootstrapLauncherTests(unittest.TestCase):
             self.assertIn("--target", captured["cmd"])
             self.assertIn(str(root / ".runtime" / "site-packages"), captured["cmd"])
             self.assertNotIn("venv", captured["cmd"])
+
+    def test_windows_cpu_limit_uses_job_object_hard_cap_at_25_percent(self):
+        calls = []
+
+        class FakeKernel32:
+            def CreateJobObjectW(self, security_attributes, name):
+                calls.append(("CreateJobObjectW", security_attributes, name))
+                return 1234
+
+            def SetInformationJobObject(self, job, info_class, info_ptr, info_size):
+                info = ctypes.cast(
+                    info_ptr,
+                    ctypes.POINTER(bootstrap_launcher_module.JOBOBJECT_CPU_RATE_CONTROL_INFORMATION),
+                ).contents
+                calls.append(("SetInformationJobObject", job, info_class, info.ControlFlags, info.CpuRate, info_size))
+                return 1
+
+            def AssignProcessToJobObject(self, job, process_handle):
+                calls.append(("AssignProcessToJobObject", job, process_handle))
+                return 1
+
+            def CloseHandle(self, handle):
+                calls.append(("CloseHandle", handle))
+                return 1
+
+        class FakeProcess:
+            _handle = 5678
+
+        applied = bootstrap_launcher_module.apply_windows_cpu_limit(
+            FakeProcess(),
+            percent=25,
+            platform_name="win32",
+            kernel32=FakeKernel32(),
+        )
+
+        self.assertTrue(applied)
+        self.assertIn(("CreateJobObjectW", None, None), calls)
+        self.assertIn(
+            (
+                "SetInformationJobObject",
+                1234,
+                bootstrap_launcher_module.JobObjectCpuRateControlInformation,
+                bootstrap_launcher_module.JOB_OBJECT_CPU_RATE_CONTROL_ENABLE
+                | bootstrap_launcher_module.JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
+                2500,
+                ctypes.sizeof(bootstrap_launcher_module.JOBOBJECT_CPU_RATE_CONTROL_INFORMATION),
+            ),
+            calls,
+        )
+        self.assertIn(("AssignProcessToJobObject", 1234, 5678), calls)
+        self.assertNotIn(("CloseHandle", 1234), calls)
+
+    def test_pip_install_applies_and_closes_cpu_limit_job(self):
+        from bootstrap_launcher import run_pip_install
+
+        with tempfile.TemporaryDirectory() as runtime_tmp, tempfile.TemporaryDirectory() as package_tmp:
+            root = Path(runtime_tmp)
+            package_root = Path(package_tmp)
+            resources = package_root / "resources"
+            resources.mkdir()
+            (resources / "requirements.txt").write_text("example-package==1.0\n", encoding="utf-8")
+            calls = []
+
+            class FakeProcess:
+                def __init__(self, cmd, **kwargs):
+                    self.stdout = iter(["Successfully installed example-package-1.0\n"])
+                    self._cpu_limit_job_handle = 1234
+
+                def wait(self):
+                    return 0
+
+            with patch("bootstrap_launcher.subprocess.Popen", FakeProcess):
+                with patch("bootstrap_launcher.apply_windows_cpu_limit", side_effect=lambda process: calls.append("apply") or True):
+                    with patch("bootstrap_launcher.close_windows_cpu_limit", side_effect=lambda process: calls.append("close")):
+                        result = run_pip_install(root, lambda event: None, package_root)
+
+            self.assertEqual(result.code, 0)
+            self.assertEqual(calls, ["apply", "close"])
 
     def test_ensure_portable_layout_uses_external_template_root(self):
         with tempfile.TemporaryDirectory() as runtime_tmp, tempfile.TemporaryDirectory() as source_tmp:
