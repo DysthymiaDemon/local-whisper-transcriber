@@ -13,6 +13,7 @@ from transcriber_engine import (
     TranscriptRow,
     format_timestamp,
     list_input_devices,
+    rms_to_meter_percent,
 )
 
 
@@ -259,7 +260,11 @@ class MainWindow(QMainWindow):
             return
         self.device_combo.addItem("Default input", None)
         for device in devices:
-            self.device_combo.addItem(f"{device['index']}: {device['name']}", device["index"])
+            rate = device.get("default_samplerate")
+            hostapi = device.get("hostapi")
+            suffix = f" - {hostapi}" if hostapi else ""
+            rate_text = f" ({int(rate)} Hz)" if rate else ""
+            self.device_combo.addItem(f"{device['index']}: {device['name']}{suffix}{rate_text}", device["index"])
 
     def _read_config(self) -> EngineConfig:
         return EngineConfig(
@@ -344,7 +349,8 @@ class MainWindow(QMainWindow):
             self.status_label.setText(str(payload.get("message", "")))
         elif event_type == "level":
             rms = float(payload.get("rms", 0.0))
-            self.level_meter.set_level(min(100, int(rms * 800)))
+            percent = payload.get("percent")
+            self.level_meter.set_level(int(percent) if percent is not None else rms_to_meter_percent(rms))
         elif event_type == "lag":
             self.lag_label.setText(str(payload.get("message", "")))
         elif event_type == "transcript":
@@ -409,6 +415,8 @@ class MainWindow(QMainWindow):
         self.pause_button.setEnabled(running)
         self.stop_button.setEnabled(running)
         self.pause_button.setText("Pause")
+        if not running:
+            self.level_meter.set_level(0)
         for widget in (
             self.device_combo,
             self.whisper_path,

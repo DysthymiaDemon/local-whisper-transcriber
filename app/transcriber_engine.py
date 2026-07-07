@@ -20,6 +20,55 @@ DIARIZATION_BACKEND_PYANNOTE = "pyannote"
 SPEECHBRAIN_CHECKPOINT_FILES = ("embedding_model.ckpt", "model.ckpt")
 LOCAL_DIARIZATION_MIN_SECONDS = 0.25
 LOCAL_DIARIZATION_TARGET_SECONDS = 1.0
+MIC_SILENCE_RMS_THRESHOLD = 0.0001
+
+
+def rms_to_meter_percent(rms: float) -> int:
+    if rms <= MIC_SILENCE_RMS_THRESHOLD:
+        return 0
+    return max(0, min(100, int(rms * 5000)))
+
+
+def microphone_health_message(block_count: int, peak_rms: float, chunk_count: int) -> str | None:
+    if block_count <= 0:
+        return (
+            "No microphone audio was received. Check Windows microphone permission, make sure the microphone is not "
+            "muted, or choose a different input device."
+        )
+    if peak_rms <= MIC_SILENCE_RMS_THRESHOLD:
+        return (
+            "Microphone input looks silent. Check Windows input volume/privacy settings, unmute the microphone, "
+            "or choose a different input device."
+        )
+    if chunk_count <= 0:
+        return "Audio was received, but no transcription chunk was produced. Record for longer or reduce chunk seconds."
+    return None
+
+
+def preferred_input_sample_rate(sd: Any, device: Optional[int], target_sample_rate: int) -> int:
+    try:
+        sd.check_input_settings(device=device, channels=1, samplerate=target_sample_rate, dtype="float32")
+        return int(target_sample_rate)
+    except Exception:
+        pass
+    try:
+        device_info = sd.query_devices(device, "input")
+        default_rate = int(float(device_info.get("default_samplerate", target_sample_rate)))
+        return default_rate if default_rate > 0 else int(target_sample_rate)
+    except Exception:
+        return int(target_sample_rate)
+
+
+def resample_audio(samples: Any, source_rate: int, target_rate: int) -> Any:
+    import numpy as np
+
+    audio = np.asarray(samples, dtype=np.float32).reshape(-1)
+    if source_rate == target_rate or audio.size == 0:
+        return audio.astype(np.float32, copy=False)
+    target_size = max(1, int(round(audio.size * (float(target_rate) / float(source_rate)))))
+    source_positions = np.linspace(0.0, 1.0, num=audio.size, endpoint=False)
+    target_positions = np.linspace(0.0, 1.0, num=target_size, endpoint=False)
+    return np.interp(target_positions, source_positions, audio).astype(np.float32)
 
 
 def _force_offline_mode() -> None:
@@ -496,6 +545,9 @@ class MeetingTranscriberEngine:
         self._diarization_queue: queue.Queue[AudioChunk | None] = queue.Queue(config.max_queue_chunks)
         self._pending_transcription_chunks: set[int] = set()
         self._pending_diarization_chunks: set[int] = set()
+        self._audio_block_count = 0
+        self._audio_peak_rms = 0.0
+        self._audio_chunk_count = 0
         self._state_lock = threading.RLock()
 
     def on_event(self, handler: EventHandler) -> None:
@@ -508,6 +560,10 @@ class MeetingTranscriberEngine:
             raise ValueError("\n".join(errors))
         self._stop_event.clear()
         self._pause_event.clear()
+        with self._state_lock:
+            self._audio_block_count = 0
+            self._audio_peak_rms = 0.0
+            self._audio_chunk_count = 0
         self._emit("status", {"message": "Loading models"})
 
         self._threads = [
@@ -526,6 +582,14 @@ class MeetingTranscriberEngine:
         for thread in self._threads:
             thread.join(timeout=30)
         self.writer.refresh(self.store.snapshot())
+        with self._state_lock:
+            diagnostic = microphone_health_message(
+                self._audio_block_count,
+                self._audio_peak_rms,
+                self._audio_chunk_count,
+            )
+        if diagnostic and not self.store.snapshot():
+            self._emit("error", {"message": diagnostic})
         self._emit("status", {"message": "Stopped"})
 
     def pause(self) -> None:
@@ -557,9 +621,10 @@ class MeetingTranscriberEngine:
             return
 
         block_buffer = InputBlockBuffer()
-        sample_rate = self.config.sample_rate
-        chunk_samples = int(self.config.chunk_seconds * sample_rate)
-        overlap_samples = int(self.config.overlap_seconds * sample_rate)
+        model_sample_rate = self.config.sample_rate
+        input_sample_rate = preferred_input_sample_rate(sd, self.config.input_device, model_sample_rate)
+        chunk_samples = int(self.config.chunk_seconds * input_sample_rate)
+        overlap_samples = int(self.config.overlap_seconds * input_sample_rate)
         keep_samples = max(0, overlap_samples)
         accumulated = np.empty((0,), dtype=np.float32)
         chunk_index = 0
@@ -573,12 +638,28 @@ class MeetingTranscriberEngine:
 
         try:
             with sd.InputStream(
-                samplerate=sample_rate,
+                samplerate=input_sample_rate,
                 channels=1,
                 dtype="float32",
                 device=self.config.input_device,
                 callback=callback,
             ):
+                try:
+                    device_info = sd.query_devices(self.config.input_device, "input")
+                    device_name = device_info.get("name", self.config.input_device) if isinstance(device_info, dict) else self.config.input_device
+                except Exception:
+                    device_name = self.config.input_device if self.config.input_device is not None else "default input"
+                self._emit("log", {"message": f"Microphone stream opened: {device_name}"})
+                if input_sample_rate != model_sample_rate:
+                    self._emit(
+                        "log",
+                        {
+                            "message": (
+                                f"Microphone sample rate: {input_sample_rate} Hz; "
+                                f"resampling to {model_sample_rate} Hz for Whisper"
+                            )
+                        },
+                    )
                 while not self._stop_event.is_set():
                     try:
                         block = block_buffer.pop(timeout=0.2)
@@ -586,24 +667,34 @@ class MeetingTranscriberEngine:
                         continue
                     mono = np.asarray(block, dtype=np.float32).reshape(-1)
                     level = float(np.sqrt(np.mean(np.square(mono)))) if mono.size else 0.0
-                    self._emit("level", {"rms": level})
+                    with self._state_lock:
+                        self._audio_block_count += 1
+                        self._audio_peak_rms = max(self._audio_peak_rms, level)
+                    self._emit("level", {"rms": level, "percent": rms_to_meter_percent(level)})
                     accumulated = np.concatenate([accumulated, mono])
                     while accumulated.size >= chunk_samples:
                         start_time = max(
                             0.0,
-                            ((chunk_index * (chunk_samples - keep_samples)) / sample_rate),
+                            ((chunk_index * (chunk_samples - keep_samples)) / input_sample_rate),
                         )
-                        samples = accumulated[:chunk_samples].copy()
+                        samples = resample_audio(accumulated[:chunk_samples].copy(), input_sample_rate, model_sample_rate)
+                        self._emit("log", {"message": f"Audio chunk {chunk_index} captured ({self.config.chunk_seconds:.1f}s)"})
                         self._raw_chunk_queue.put(
-                            AudioChunk(chunk_index, start_time, samples, sample_rate)
+                            AudioChunk(chunk_index, start_time, samples, model_sample_rate)
                         )
+                        with self._state_lock:
+                            self._audio_chunk_count += 1
                         chunk_index += 1
                         accumulated = accumulated[chunk_samples - keep_samples :]
-                if accumulated.size > sample_rate // 2:
-                    start_time = max(0.0, time.monotonic() - stream_start - (accumulated.size / sample_rate))
+                if accumulated.size > input_sample_rate // 2:
+                    start_time = max(0.0, time.monotonic() - stream_start - (accumulated.size / input_sample_rate))
+                    samples = resample_audio(accumulated.copy(), input_sample_rate, model_sample_rate)
+                    self._emit("log", {"message": f"Final audio chunk {chunk_index} captured"})
                     self._raw_chunk_queue.put(
-                        AudioChunk(chunk_index, start_time, accumulated.copy(), sample_rate, is_final=True)
+                        AudioChunk(chunk_index, start_time, samples, model_sample_rate, is_final=True)
                     )
+                    with self._state_lock:
+                        self._audio_chunk_count += 1
         except Exception as exc:  # pragma: no cover - environment-dependent
             self._emit("error", {"message": f"Recording failed: {exc}"})
         finally:
@@ -625,7 +716,9 @@ class MeetingTranscriberEngine:
 
     def _transcription_loop(self) -> None:
         try:
+            self._emit("log", {"message": "Loading Whisper model..."})
             model = self._load_whisper_model()
+            self._emit("log", {"message": "Whisper model ready"})
         except Exception as exc:  # pragma: no cover - environment-dependent
             self._emit("error", {"message": f"Whisper model load failed: {exc}"})
             return
@@ -635,6 +728,8 @@ class MeetingTranscriberEngine:
             if chunk is None:
                 return
             try:
+                self._emit("log", {"message": f"Transcribing chunk {chunk.index}..."})
+                segment_count = 0
                 segments, _info = model.transcribe(
                     chunk.samples,
                     language=self.config.language,
@@ -651,9 +746,12 @@ class MeetingTranscriberEngine:
                     if self.duplicate_suppressor.is_duplicate(start, text):
                         continue
                     row = self.store.add_transcript(chunk.index, start, end, text)
+                    segment_count += 1
                     self.writer.refresh(self.store.snapshot())
                     print(f"[{format_timestamp(row.start)}] {row.speaker_label}: {row.text}", flush=True)
                     self._emit("transcript", {"row": row})
+                if segment_count == 0:
+                    self._emit("log", {"message": f"No speech detected in chunk {chunk.index}"})
             except Exception as exc:  # pragma: no cover - environment-dependent
                 self._emit("error", {"message": f"Transcription failed for chunk {chunk.index}: {exc}"})
             finally:
@@ -662,7 +760,9 @@ class MeetingTranscriberEngine:
 
     def _diarization_loop(self) -> None:
         try:
+            self._emit("log", {"message": "Loading diarization model..."})
             diarizer = self._load_diarization_backend()
+            self._emit("log", {"message": "Diarization model ready"})
         except Exception as exc:  # pragma: no cover - environment-dependent
             self._emit("error", {"message": f"Diarization model load failed: {exc}"})
             return
@@ -872,12 +972,21 @@ def list_input_devices() -> list[dict[str, Any]]:
     except Exception:
         return []
     devices = []
+    try:
+        hostapis = sd.query_hostapis()
+    except Exception:
+        hostapis = []
     for index, device in enumerate(sd.query_devices()):
         if int(device.get("max_input_channels", 0)) > 0:
+            hostapi_index = int(device.get("hostapi", -1))
+            hostapi_name = ""
+            if 0 <= hostapi_index < len(hostapis):
+                hostapi_name = str(hostapis[hostapi_index].get("name", ""))
             devices.append(
                 {
                     "index": index,
                     "name": device.get("name", f"Input {index}"),
+                    "hostapi": hostapi_name,
                     "channels": device.get("max_input_channels", 0),
                     "default_samplerate": device.get("default_samplerate"),
                 }

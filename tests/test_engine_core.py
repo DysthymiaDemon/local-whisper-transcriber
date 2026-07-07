@@ -20,6 +20,10 @@ from transcriber_engine import (
     TranscriptStore,
     cluster_local_embeddings,
     extract_row_audio_window,
+    microphone_health_message,
+    preferred_input_sample_rate,
+    resample_audio,
+    rms_to_meter_percent,
 )
 
 
@@ -199,6 +203,73 @@ class InputBlockBufferTests(unittest.TestCase):
 
         queued = buffer.pop()
         self.assertEqual(queued[0][0], 0.1)
+
+
+class MicrophoneDiagnosticsTests(unittest.TestCase):
+    def test_rms_to_meter_percent_makes_real_microphone_levels_visible(self):
+        self.assertEqual(rms_to_meter_percent(0.0), 0)
+        self.assertEqual(rms_to_meter_percent(0.00001), 0)
+        self.assertGreaterEqual(rms_to_meter_percent(0.001), 5)
+        self.assertGreaterEqual(rms_to_meter_percent(0.01), 50)
+        self.assertEqual(rms_to_meter_percent(1.0), 100)
+
+    def test_microphone_health_reports_no_callbacks(self):
+        message = microphone_health_message(block_count=0, peak_rms=0.0, chunk_count=0)
+
+        self.assertIn("No microphone audio was received", message)
+        self.assertIn("microphone permission", message)
+
+    def test_microphone_health_reports_silent_input(self):
+        message = microphone_health_message(block_count=10, peak_rms=0.00002, chunk_count=0)
+
+        self.assertIn("Microphone input looks silent", message)
+        self.assertIn("choose a different input device", message)
+
+    def test_microphone_health_accepts_audible_input(self):
+        self.assertIsNone(microphone_health_message(block_count=10, peak_rms=0.01, chunk_count=1))
+
+    def test_engine_stop_emits_diagnostic_when_recording_was_silent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = MeetingTranscriberEngine(EngineConfig(output_file=os.path.join(tmp, "out.txt")))
+            events = []
+            engine.on_event(lambda event_type, payload: events.append((event_type, payload)))
+            engine._audio_block_count = 10
+            engine._audio_peak_rms = 0.00002
+            engine._audio_chunk_count = 0
+
+            engine.stop()
+
+        messages = [payload["message"] for event_type, payload in events if event_type == "error"]
+        self.assertTrue(any("Microphone input looks silent" in message for message in messages))
+
+    def test_preferred_input_sample_rate_uses_target_when_supported(self):
+        class FakeSoundDevice:
+            @staticmethod
+            def check_input_settings(device=None, channels=None, samplerate=None, dtype=None):
+                self.assertEqual(samplerate, 16000)
+
+        self.assertEqual(preferred_input_sample_rate(FakeSoundDevice, None, 16000), 16000)
+
+    def test_preferred_input_sample_rate_falls_back_to_device_default(self):
+        class FakeSoundDevice:
+            @staticmethod
+            def check_input_settings(device=None, channels=None, samplerate=None, dtype=None):
+                raise RuntimeError("unsupported")
+
+            @staticmethod
+            def query_devices(device=None, kind=None):
+                return {"default_samplerate": 48000}
+
+        self.assertEqual(preferred_input_sample_rate(FakeSoundDevice, 9, 16000), 48000)
+
+    def test_resample_audio_changes_length_for_model_sample_rate(self):
+        import numpy as np
+
+        source = np.ones(48000, dtype=np.float32)
+        resampled = resample_audio(source, 48000, 16000)
+
+        self.assertEqual(len(resampled), 16000)
+        self.assertEqual(resampled.dtype, np.float32)
 
 
 class LocalSpeakerModelLoadTests(unittest.TestCase):
