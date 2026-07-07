@@ -1,6 +1,7 @@
 import os
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from transcriber_engine import (
     DuplicateSuppressor,
     EngineConfig,
     InputBlockBuffer,
+    MeetingTranscriberEngine,
     SpeakerRegistry,
     TranscriptRow,
     TranscriptStore,
@@ -197,6 +199,60 @@ class InputBlockBufferTests(unittest.TestCase):
 
         queued = buffer.pop()
         self.assertEqual(queued[0][0], 0.1)
+
+
+class LocalSpeakerModelLoadTests(unittest.TestCase):
+    def test_local_speaker_model_uses_copy_strategy_to_avoid_windows_symlinks(self):
+        calls = {}
+        copy_strategy = object()
+
+        class FakeLocalStrategy:
+            COPY = copy_strategy
+
+        class FakeEncoderClassifier:
+            @staticmethod
+            def from_hparams(**kwargs):
+                calls["kwargs"] = kwargs
+                return "classifier"
+
+        fake_speechbrain = types.ModuleType("speechbrain")
+        fake_speechbrain.__path__ = []
+        fake_inference = types.ModuleType("speechbrain.inference")
+        fake_inference.__path__ = []
+        fake_speaker = types.ModuleType("speechbrain.inference.speaker")
+        fake_speaker.EncoderClassifier = FakeEncoderClassifier
+        fake_utils = types.ModuleType("speechbrain.utils")
+        fake_utils.__path__ = []
+        fake_fetching = types.ModuleType("speechbrain.utils.fetching")
+        fake_fetching.LocalStrategy = FakeLocalStrategy
+        fake_speechbrain.inference = fake_inference
+        fake_speechbrain.utils = fake_utils
+        fake_inference.speaker = fake_speaker
+        fake_utils.fetching = fake_fetching
+        fake_modules = {
+            "speechbrain": fake_speechbrain,
+            "speechbrain.inference": fake_inference,
+            "speechbrain.inference.speaker": fake_speaker,
+            "speechbrain.utils": fake_utils,
+            "speechbrain.utils.fetching": fake_fetching,
+        }
+        previous_modules = {name: sys.modules.get(name) for name in fake_modules}
+        try:
+            sys.modules.update(fake_modules)
+            config = EngineConfig(speaker_embedding_model_dir=r"C:\models\speechbrain-ecapa")
+            result = MeetingTranscriberEngine(config)._load_local_speaker_model()
+        finally:
+            for name, module in previous_modules.items():
+                if module is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = module
+
+        self.assertEqual(result, "classifier")
+        self.assertEqual(calls["kwargs"]["source"], r"C:\models\speechbrain-ecapa")
+        self.assertEqual(calls["kwargs"]["savedir"], r"C:\models\speechbrain-ecapa")
+        self.assertEqual(calls["kwargs"]["run_opts"], {"device": "cpu"})
+        self.assertIs(calls["kwargs"]["local_strategy"], copy_strategy)
 
 
 class EngineConfigTests(unittest.TestCase):

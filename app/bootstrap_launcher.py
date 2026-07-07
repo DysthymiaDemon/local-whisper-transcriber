@@ -12,9 +12,16 @@ import time
 from contextlib import contextmanager
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
+
+# pythonw.exe starts .pyw files without console streams; tqdm expects writable streams.
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w", encoding="utf-8")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w", encoding="utf-8")
 
 from app_config import append_error_log, application_root, error_log_root, source_root
 
@@ -69,9 +76,25 @@ RUNTIME_APP_FOLDER_NAME = "OfflineMeetingTranscriberRuntime"
 APP_PUBLISHER = "Ameen Khan"
 APP_VERSION = "local"
 HF_OFFLINE_ENV_VARS = ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE")
+HF_PROGRESS_ENV_VARS = ("HF_HUB_DISABLE_PROGRESS_BARS",)
 CA_BUNDLE_ENV = "LOCAL_WHISPER_CA_BUNDLE"
 TLS_CERT_ENV_VARS = ("REQUESTS_CA_BUNDLE", "SSL_CERT_FILE")
 CA_BUNDLE_FILENAMES = ("company-ca.pem", "corporate-ca.pem", "ca-bundle.pem")
+INSTALL_LOG_FILE_NAME = "install_log.txt"
+SETUP_PROGRESS_STYLE = "Setup.Horizontal.TProgressbar"
+DETAIL_PROGRESS_STYLE = "Detail.Horizontal.TProgressbar"
+COMPLETE_PROGRESS_STYLE = "Complete.Horizontal.TProgressbar"
+STEP_WEIGHTS = {
+    "Checking Python runtime": 2,
+    "Preparing app folders": 2,
+    "Checking Python packages": 3,
+    "Installing Python packages": 40,
+    "Downloading AI models": 50,
+    "Checking local model folders": 1,
+    "Finishing setup": 1,
+    "Launching transcriber": 1,
+}
+MODEL_DOWNLOAD_POLL_SECONDS = 0.25
 
 BOOTSTRAP_STEPS = [
     "Checking Python runtime",
@@ -194,6 +217,284 @@ def format_duration(seconds: float | None) -> str:
     return f"{remaining}s"
 
 
+def format_clock_duration(seconds: float | None) -> str:
+    seconds = max(0, int(seconds or 0))
+    minutes, remaining = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{remaining:02d}"
+    return f"{minutes}:{remaining:02d}"
+
+
+def format_bytes(value: int | float | None) -> str:
+    size = max(0.0, float(value or 0))
+    units = ("B", "KB", "MB", "GB", "TB")
+    index = 0
+    while size >= 1024 and index < len(units) - 1:
+        size /= 1024
+        index += 1
+    if index == 0:
+        return f"{int(size)} B"
+    if size >= 100 or size.is_integer():
+        return f"{int(size)} {units[index]}"
+    return f"{size:.1f} {units[index]}"
+
+
+def format_model_download_status(
+    filename: str,
+    downloaded_bytes: int,
+    total_bytes: int | None,
+    elapsed_seconds: float,
+) -> str:
+    current = format_bytes(downloaded_bytes)
+    elapsed = format_clock_duration(elapsed_seconds)
+    if total_bytes and total_bytes > 0:
+        return f"{filename} \u2022 {current} / {format_bytes(total_bytes)} \u2022 {elapsed} elapsed"
+    return f"{filename} \u2022 {current} downloaded \u2022 {elapsed} elapsed"
+
+
+def folder_size_bytes(folder: Path) -> int:
+    if not folder.exists():
+        return 0
+    total = 0
+    for path in folder.rglob("*"):
+        if path.is_file():
+            try:
+                total += path.stat().st_size
+            except OSError:
+                continue
+    return total
+
+
+def largest_file_name(folder: Path, fallback: str) -> str:
+    largest_name = fallback
+    largest_size = -1
+    if not folder.exists():
+        return largest_name
+    for path in folder.rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        if size > largest_size:
+            largest_size = size
+            largest_name = path.name
+    return largest_name
+
+
+def _metadata_size(value: Any) -> int | None:
+    if isinstance(value, Mapping):
+        size = value.get("size")
+    else:
+        size = getattr(value, "size", None)
+    return int(size) if isinstance(size, (int, float)) and size > 0 else None
+
+
+def model_info_total_size(info: Any) -> int | None:
+    total = 0
+    found = False
+    for sibling in getattr(info, "siblings", []) or []:
+        size = getattr(sibling, "size", None)
+        if not isinstance(size, (int, float)) or size <= 0:
+            size = _metadata_size(getattr(sibling, "lfs", None))
+        if isinstance(size, (int, float)) and size > 0:
+            total += int(size)
+            found = True
+    return total if found else None
+
+
+def fetch_model_repo_size(repo_id: str) -> int | None:
+    try:
+        from huggingface_hub import HfApi
+
+        info = HfApi().model_info(repo_id, files_metadata=True)
+    except Exception:
+        return None
+    return model_info_total_size(info)
+
+
+def estimate_model_download_sizes(specs: tuple[ModelDownloadSpec, ...] = DEFAULT_MODEL_DOWNLOADS) -> dict[str, int | None]:
+    return {spec.name: fetch_model_repo_size(spec.repo_id) for spec in specs}
+
+
+def total_known_size(sizes: Mapping[str, int | None]) -> int | None:
+    values = [size for size in sizes.values() if isinstance(size, int) and size > 0]
+    return sum(values) if values and len(values) == len(sizes) else None
+
+
+def weighted_overall_progress(states: Mapping[str, StepState], progress: Mapping[str, int]) -> int:
+    total_weight = sum(STEP_WEIGHTS.values())
+    weighted = 0.0
+    for step in BOOTSTRAP_STEPS:
+        weight = STEP_WEIGHTS[step]
+        state = states.get(step, StepState.PENDING)
+        if state in (StepState.DONE, StepState.WARNING):
+            step_progress = 100
+        elif state == StepState.RUNNING:
+            step_progress = max(0, min(100, int(progress.get(step, 0))))
+        elif int(progress.get(step, 0)) > 0:
+            step_progress = max(0, min(100, int(progress.get(step, 0))))
+        else:
+            step_progress = 0
+        weighted += weight * (step_progress / 100)
+    return max(0, min(100, int(weighted / total_weight * 100)))
+
+
+def install_log_path(root: Path | str | None = None) -> Path:
+    app_root = Path(root).expanduser().resolve() if root else application_root()
+    log_root = error_log_root(app_root)
+    log_root.mkdir(parents=True, exist_ok=True)
+    return log_root / INSTALL_LOG_FILE_NAME
+
+
+def _append_log_details(lines: list[str], details: Mapping[str, Any] | Iterable[str] | str | None) -> None:
+    if not details:
+        return
+    lines.append("details:")
+    if isinstance(details, Mapping):
+        for key, value in details.items():
+            if isinstance(value, (list, tuple)):
+                lines.append(f"  {key}:")
+                for item in value:
+                    lines.append(f"    {item}")
+            else:
+                lines.append(f"  {key}: {value}")
+    elif isinstance(details, str):
+        lines.append(details)
+    else:
+        for item in details:
+            lines.append(f"  {item}")
+
+
+def reset_install_log(root: Path | str | None = None, message: str = "Setup started") -> Path:
+    app_root = Path(root).expanduser().resolve() if root else application_root()
+    log_path = install_log_path(app_root)
+    lines = [
+        "=" * 72,
+        f"timestamp: {datetime.now().isoformat(timespec='seconds')}",
+        f"app_root: {app_root}",
+        f"message: {message}",
+        "",
+    ]
+    log_path.write_text("\n".join(lines), encoding="utf-8")
+    return log_path
+
+
+def append_install_log(
+    root: Path | str | None,
+    context: str,
+    message: str,
+    details: Mapping[str, Any] | Iterable[str] | str | None = None,
+) -> Path:
+    app_root = Path(root).expanduser().resolve() if root else application_root()
+    log_path = install_log_path(app_root)
+    lines = [
+        "-" * 72,
+        f"timestamp: {datetime.now().isoformat(timespec='seconds')}",
+        f"context: {context}",
+        f"message: {message}",
+    ]
+    _append_log_details(lines, details)
+    lines.append("")
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write("\n".join(lines))
+    return log_path
+
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_SIZE_UNIT_RE = re.compile(
+    r"(?P<current>\d+(?:\.\d+)?)\s*(?P<current_unit>[KMGTPE]?i?B|[KMGTPE]?B|[KMGTPE])?"
+    r"\s*/\s*"
+    r"(?P<total>\d+(?:\.\d+)?)\s*(?P<total_unit>[KMGTPE]?i?B|[KMGTPE]?B|[KMGTPE])",
+    re.IGNORECASE,
+)
+_UNIT_FACTORS = {
+    "": 1.0,
+    "B": 1.0,
+    "K": 1024.0,
+    "KB": 1024.0,
+    "KIB": 1024.0,
+    "M": 1024.0**2,
+    "MB": 1024.0**2,
+    "MIB": 1024.0**2,
+    "G": 1024.0**3,
+    "GB": 1024.0**3,
+    "GIB": 1024.0**3,
+    "T": 1024.0**4,
+    "TB": 1024.0**4,
+    "TIB": 1024.0**4,
+    "P": 1024.0**5,
+    "PB": 1024.0**5,
+    "PIB": 1024.0**5,
+    "E": 1024.0**6,
+    "EB": 1024.0**6,
+    "EIB": 1024.0**6,
+}
+
+
+def _clean_cli_progress_line(line: str) -> str:
+    return _ANSI_ESCAPE_RE.sub("", line).strip()
+
+
+def _unit_factor(unit: str | None, fallback: str | None = None) -> float:
+    normalized = (unit or fallback or "").upper()
+    return _UNIT_FACTORS.get(normalized, 1.0)
+
+
+def parse_cli_download_percent(line: str) -> int | None:
+    clean = _clean_cli_progress_line(line)
+    percent = re.search(r"(?<![\d.])(\d{1,3})\s*%", clean)
+    if percent:
+        return max(0, min(100, int(percent.group(1))))
+
+    size = _SIZE_UNIT_RE.search(clean)
+    if not size:
+        return None
+    total_unit = size.group("total_unit")
+    current_unit = size.group("current_unit") or total_unit
+    current = float(size.group("current")) * _unit_factor(current_unit, total_unit)
+    total = float(size.group("total")) * _unit_factor(total_unit)
+    if total <= 0:
+        return None
+    return max(0, min(100, int((current / total) * 100)))
+
+
+def cli_download_progress_event(line: str, phase: str, detail_prefix: str = "") -> PipProgressEvent | None:
+    clean = _clean_cli_progress_line(line)
+    if not clean:
+        return None
+    progress = parse_cli_download_percent(clean)
+    if progress is None:
+        return None
+    detail = clean
+    if detail_prefix and detail_prefix not in detail:
+        detail = f"{detail_prefix}: {detail}"
+    return PipProgressEvent(phase, detail, progress, line)
+
+
+def iter_cli_progress_output(stream) -> Iterable[str]:
+    if not hasattr(stream, "read"):
+        for line in stream:
+            yield line.rstrip("\r\n")
+        return
+
+    buffer: list[str] = []
+    while True:
+        char = stream.read(1)
+        if char == "":
+            break
+        if char in ("\r", "\n"):
+            if buffer:
+                yield "".join(buffer).rstrip()
+                buffer = []
+        else:
+            buffer.append(char)
+    if buffer:
+        yield "".join(buffer).rstrip()
+
+
 def build_step_tooltip(diagnostic: StepDiagnostic, now: float | None = None) -> str:
     current = time.time() if now is None else now
     elapsed_end = diagnostic.end_time if diagnostic.end_time is not None else current
@@ -231,6 +532,8 @@ class PipInstallProgressTracker:
             self.installing_started = True
             self.installing_message = event.raw_line.strip() or f"Installing collected packages: {event.detail}"
             self.progress = max(self.progress, 80)
+        elif event.progress_percent is not None:
+            self.progress = max(self.progress, event.progress_percent)
         else:
             cap = 92 if self.installing_started else 95
             self.progress = min(cap, max(self.progress + 3, 8 + self.event_count * 4))
@@ -257,6 +560,10 @@ class PipProgressParser:
         if not stripped:
             return PipProgressEvent("Running pip", "", None, line)
 
+        download_progress = cli_download_progress_event(stripped, "Downloading package")
+        if download_progress is not None:
+            return download_progress
+
         already = re.match(r"Requirement already satisfied:\s+(.+?)(?:\s+in\s+.+)?$", stripped)
         if already:
             return PipProgressEvent("Already installed", already.group(1), 100, line)
@@ -267,7 +574,7 @@ class PipProgressParser:
 
         downloading = re.match(r"Downloading\s+(.+)$", stripped)
         if downloading:
-            return PipProgressEvent("Downloading package", downloading.group(1), None, line)
+            return PipProgressEvent("Downloading package", downloading.group(1), 0, line)
 
         installing = re.match(r"Installing collected packages:\s+(.+)$", stripped)
         if installing:
@@ -579,10 +886,12 @@ def configure_download_tls(root: Path | None = None) -> None:
 
 @contextmanager
 def online_huggingface_download_env(root: Path | None = None):
-    previous = {name: os.environ.get(name) for name in HF_OFFLINE_ENV_VARS + TLS_CERT_ENV_VARS}
+    previous = {name: os.environ.get(name) for name in HF_OFFLINE_ENV_VARS + HF_PROGRESS_ENV_VARS + TLS_CERT_ENV_VARS}
     try:
         for name in HF_OFFLINE_ENV_VARS:
             os.environ.pop(name, None)
+        for name in HF_PROGRESS_ENV_VARS:
+            os.environ[name] = "1"
         configure_download_tls(root)
         yield
     finally:
@@ -591,6 +900,79 @@ def online_huggingface_download_env(root: Path | None = None):
                 os.environ.pop(name, None)
             else:
                 os.environ[name] = value
+
+
+class CliDownloadProgressStream:
+    def __init__(
+        self,
+        on_event: Callable[[PipProgressEvent], None],
+        phase: str,
+        detail_prefix: str = "",
+        wrapped=None,
+        progress_mapper: Callable[[PipProgressEvent], PipProgressEvent] | None = None,
+    ) -> None:
+        self.on_event = on_event
+        self.phase = phase
+        self.detail_prefix = detail_prefix
+        self.wrapped = wrapped
+        self.progress_mapper = progress_mapper
+        self.buffer: list[str] = []
+        self.encoding = getattr(wrapped, "encoding", "utf-8")
+        self.errors = getattr(wrapped, "errors", "replace")
+
+    def write(self, value: str) -> int:
+        if self.wrapped is not None:
+            self.wrapped.write(value)
+        for char in value:
+            if char in ("\r", "\n"):
+                self.emit_buffer()
+            else:
+                self.buffer.append(char)
+        return len(value)
+
+    def flush(self) -> None:
+        self.emit_buffer()
+        if self.wrapped is not None:
+            self.wrapped.flush()
+
+    def isatty(self) -> bool:
+        return True
+
+    def writable(self) -> bool:
+        return True
+
+    def emit_buffer(self) -> None:
+        if not self.buffer:
+            return
+        line = "".join(self.buffer).rstrip()
+        self.buffer = []
+        event = cli_download_progress_event(line, self.phase, self.detail_prefix)
+        if event is None:
+            return
+        if self.progress_mapper is not None:
+            event = self.progress_mapper(event)
+        self.on_event(event)
+
+
+@contextmanager
+def redirect_cli_download_progress(
+    on_event: Callable[[PipProgressEvent], None],
+    phase: str,
+    detail_prefix: str = "",
+    progress_mapper: Callable[[PipProgressEvent], PipProgressEvent] | None = None,
+):
+    previous_stdout = sys.stdout
+    previous_stderr = sys.stderr
+    stream = CliDownloadProgressStream(on_event, phase, detail_prefix, previous_stderr, progress_mapper)
+    try:
+        sys.stdout = CliDownloadProgressStream(on_event, phase, detail_prefix, previous_stdout, progress_mapper)
+        sys.stderr = stream
+        yield
+    finally:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        sys.stdout = previous_stdout
+        sys.stderr = previous_stderr
 
 
 def _model_folder_preview(folder: Path, limit: int = 12) -> str:
@@ -647,6 +1029,56 @@ def verify_downloaded_model(
     )
 
 
+def download_snapshot_with_progress(
+    spec: ModelDownloadSpec,
+    staging: Path,
+    total_bytes: int | None,
+    base_progress: int,
+    end_progress: int,
+    on_event,
+    downloader: Callable[..., str],
+) -> str:
+    result: dict[str, Any] = {}
+
+    def worker() -> None:
+        try:
+            result["path"] = downloader(
+                repo_id=spec.repo_id,
+                local_dir=str(staging),
+                local_files_only=False,
+                force_download=True,
+            )
+        except BaseException as exc:  # pragma: no cover - propagated below
+            result["error"] = exc
+
+    thread = threading.Thread(target=worker, name=f"download-{spec.name}", daemon=True)
+    started = time.time()
+    thread.start()
+
+    while thread.is_alive():
+        downloaded = folder_size_bytes(staging)
+        elapsed = time.time() - started
+        filename = largest_file_name(staging, spec.repo_id)
+        progress = None
+        if total_bytes and total_bytes > 0:
+            local_percent = max(0, min(100, int((min(downloaded, total_bytes) / total_bytes) * 100)))
+            progress = base_progress + int(((end_progress - base_progress) * local_percent) / 100)
+        detail = format_model_download_status(filename, downloaded, total_bytes, elapsed)
+        on_event(PipProgressEvent("Downloading model", detail, progress, detail))
+        thread.join(MODEL_DOWNLOAD_POLL_SECONDS)
+
+    thread.join()
+    if "error" in result:
+        raise result["error"]
+
+    downloaded = folder_size_bytes(staging)
+    elapsed = time.time() - started
+    filename = largest_file_name(staging, spec.repo_id)
+    detail = format_model_download_status(filename, downloaded, total_bytes, elapsed)
+    on_event(PipProgressEvent("Downloading model", detail, end_progress, detail))
+    return str(result.get("path", ""))
+
+
 def download_default_models(root: Path, on_event, downloader: Callable[..., str] | None = None) -> list[str]:
     package_path = local_package_dir(root)
     if package_path.exists() and str(package_path) not in sys.path:
@@ -677,18 +1109,30 @@ def download_default_models(root: Path, on_event, downloader: Callable[..., str]
         detail = f"{spec.repo_id} -> {target}"
         on_event(PipProgressEvent("Downloading model", detail, base_progress, detail))
         staging = prepare_model_download_staging_dir(root, spec)
+        end_progress = int((index / total) * 100)
+        total_bytes = fetch_model_repo_size(spec.repo_id)
+        if total_bytes:
+            size_detail = f"{spec.repo_id} download size: {format_bytes(total_bytes)}"
+            on_event(PipProgressEvent("Model size", size_detail, base_progress, size_detail))
+        else:
+            size_detail = f"{spec.repo_id} download size unavailable; showing elapsed time"
+            on_event(PipProgressEvent("Model size unavailable", size_detail, None, size_detail))
+
         with online_huggingface_download_env(root):
-            returned_path = downloader(
-                repo_id=spec.repo_id,
-                local_dir=str(staging),
-                local_files_only=False,
-                force_download=True,
+            returned_path = download_snapshot_with_progress(
+                spec,
+                staging,
+                total_bytes,
+                base_progress,
+                end_progress,
+                on_event,
+                downloader,
             )
         verify_downloaded_model(root, spec, staging, returned_path)
         copy_staged_model_to_target(staging, target)
         verify_downloaded_model(root, spec, target, returned_path)
         downloaded.append(spec.name)
-        on_event(PipProgressEvent("Model downloaded", detail, int((index / total) * 100), detail))
+        on_event(PipProgressEvent("Model downloaded", detail, end_progress, detail))
     return downloaded
 
 
@@ -795,6 +1239,8 @@ def run_pip_install(root: Path, on_event, package_root: Path | None = None) -> P
         "pip",
         "install",
         "--no-cache-dir",
+        "--progress-bar",
+        "on",
         "--upgrade",
         "--target",
         str(package_dir),
@@ -815,7 +1261,7 @@ def run_pip_install(root: Path, on_event, package_root: Path | None = None) -> P
     assert process.stdout is not None
     parser = PipProgressParser()
     recent_output: deque[str] = deque(maxlen=25)
-    for line in process.stdout:
+    for line in iter_cli_progress_output(process.stdout):
         stripped = line.rstrip()
         recent_output.append(stripped)
         on_event(parser.parse(stripped))
@@ -878,6 +1324,9 @@ def run_bootstrap() -> int:
     time.sleep(0.8)
     close_startup_splash(splash)
 
+    install_log_file = reset_install_log(root, setup_install_summary(package_root))
+    append_install_log(root, "Setup", "Installer opened", {"install_log": str(install_log_file)})
+
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
 
@@ -890,8 +1339,9 @@ def run_bootstrap() -> int:
 
     style = ttk.Style(window)
     style.theme_use("clam")
-    style.configure("Setup.Horizontal.TProgressbar", troughcolor="#e1e1e1", background="#2d6cdf")
-    style.configure("Detail.Horizontal.TProgressbar", troughcolor="#e1e1e1", background="#4f9cff")
+    style.configure(SETUP_PROGRESS_STYLE, troughcolor="#e1e1e1", background="#2d6cdf")
+    style.configure(DETAIL_PROGRESS_STYLE, troughcolor="#e1e1e1", background="#4f9cff")
+    style.configure(COMPLETE_PROGRESS_STYLE, troughcolor="#e1e1e1", background="#2e7d32")
 
     step_states = {step: StepState.PENDING for step in BOOTSTRAP_STEPS}
     spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
@@ -902,11 +1352,21 @@ def run_bootstrap() -> int:
     package_detail = tk.StringVar(value=setup_install_summary(package_root))
     command_detail = tk.StringVar(value="")
     eta_detail = tk.StringVar(value="")
+    install_path_detail = tk.StringVar(value=f"Install path: {root}")
+    model_size_summary = tk.StringVar(value="Estimated model download: estimating...")
     final_message_active = tk.BooleanVar(value=False)
     ui_thread = threading.current_thread()
     step_diagnostics = {step: StepDiagnostic(step) for step in BOOTSTRAP_STEPS}
+    step_progress_values = {step: 0 for step in BOOTSTRAP_STEPS}
     tooltip_refs = []
     pip_tracker: dict[str, PipInstallProgressTracker | None] = {"value": None}
+    install_button_ref: dict[str, Any] = {"value": None}
+
+    def log_install(context: str, message: str, details: Mapping[str, Any] | Iterable[str] | str | None = None) -> None:
+        try:
+            append_install_log(root, context, message, details)
+        except Exception:
+            pass
 
     title = tk.Label(
         window,
@@ -936,7 +1396,7 @@ def run_bootstrap() -> int:
         window,
         maximum=100,
         variable=overall_progress_value,
-        style="Setup.Horizontal.TProgressbar",
+        style=SETUP_PROGRESS_STYLE,
     )
     overall_bar.pack(fill="x", padx=24, pady=(0, 20))
 
@@ -1007,6 +1467,18 @@ def run_bootstrap() -> int:
     )
     version.pack(fill="x", padx=20, pady=(0, 10))
 
+    install_path_label = tk.Label(
+        install_frame,
+        textvariable=install_path_detail,
+        font=("Segoe UI", 9),
+        anchor="w",
+        bg="#ffffff",
+        fg="#333333",
+        wraplength=500,
+        justify="left",
+    )
+    install_path_label.pack(fill="x", padx=20, pady=(0, 8))
+
     models_title = tk.Label(
         install_frame,
         text="Models to install locally:",
@@ -1016,6 +1488,16 @@ def run_bootstrap() -> int:
         fg="#222222",
     )
     models_title.pack(fill="x", padx=20, pady=(0, 4))
+
+    model_size_label = tk.Label(
+        install_frame,
+        textvariable=model_size_summary,
+        font=("Segoe UI", 9),
+        anchor="w",
+        bg="#ffffff",
+        fg="#666666",
+    )
+    model_size_label.pack(fill="x", padx=20, pady=(0, 4))
 
     for item in setup_model_list():
         tk.Label(
@@ -1067,7 +1549,25 @@ def run_bootstrap() -> int:
         bg="#ffffff",
         fg="#333333",
     )
-    install_note.pack(fill="x", padx=20, pady=(8, 52))
+    install_note.pack(fill="x", padx=20, pady=(8, 8))
+
+    onedrive_warning_frame = tk.Frame(install_frame, bg="#fff4ce", highlightbackground="#d29922", highlightthickness=1)
+    onedrive_warning = tk.Label(
+        onedrive_warning_frame,
+        text=(
+            "This install path is under OneDrive. Models and runtime files can be large; "
+            "a local folder such as C:\\Dev avoids sync delays."
+        ),
+        font=("Segoe UI", 9),
+        anchor="w",
+        justify="left",
+        bg="#fff4ce",
+        fg="#5f3b00",
+        wraplength=480,
+    )
+    onedrive_warning.pack(fill="x", padx=10, pady=(8, 6))
+    onedrive_actions = tk.Frame(onedrive_warning_frame, bg="#fff4ce")
+    onedrive_actions.pack(fill="x", padx=10, pady=(0, 8))
 
     install_button_row = tk.Frame(install_frame, bg="#ffffff")
     install_button_row.place(relx=0, rely=1, relwidth=1, anchor="sw", y=-16)
@@ -1114,7 +1614,7 @@ def run_bootstrap() -> int:
         progress_frame,
         maximum=100,
         variable=detail_progress_value,
-        style="Detail.Horizontal.TProgressbar",
+        style=DETAIL_PROGRESS_STYLE,
     )
     detail_bar.pack(fill="x", padx=18, pady=(0, 12))
     detail_bar_mode = {"indeterminate": False}
@@ -1145,11 +1645,100 @@ def run_bootstrap() -> int:
     model_button_row = tk.Frame(progress_frame, bg="#ffffff")
     model_button_row.pack(fill="x", padx=18, pady=(0, 18))
 
+    details_button = tk.Button(button_row, text="Show details", width=14)
+    details_button.pack(side="left")
+
+    launch_now_button = tk.Button(button_row, text="Launch now", width=14, state="disabled")
+    launch_now_button.pack(side="right")
+
+    details_frame = tk.Frame(progress_frame, bg="#ffffff")
+    details_text = tk.Text(
+        details_frame,
+        height=7,
+        wrap="none",
+        font=("Cascadia Mono", 9),
+        bg="#ffffff",
+        fg="#333333",
+        relief="solid",
+        borderwidth=1,
+        highlightthickness=0,
+        padx=6,
+        pady=4,
+    )
+    details_scroll = ttk.Scrollbar(details_frame, orient="vertical", command=details_text.yview)
+    details_text.configure(yscrollcommand=details_scroll.set, state="disabled", cursor="arrow")
+    details_scroll.pack(side="right", fill="y")
+    details_text.pack(side="left", fill="both", expand=True)
+
+    error_frame = tk.Frame(detail_frame, bg="#ffffff")
+    error_title = tk.Label(
+        error_frame,
+        text="Setup needs attention",
+        font=("Segoe UI", 14, "bold"),
+        anchor="w",
+        bg="#ffffff",
+        fg="#b00020",
+    )
+    error_title.pack(fill="x", padx=18, pady=(18, 8))
+    error_message = tk.Label(
+        error_frame,
+        text="",
+        font=("Segoe UI", 10),
+        anchor="nw",
+        justify="left",
+        bg="#ffffff",
+        fg="#222222",
+        wraplength=500,
+    )
+    error_message.pack(fill="x", padx=18, pady=(0, 12))
+    error_detail_text = tk.Text(
+        error_frame,
+        height=9,
+        wrap="word",
+        font=("Cascadia Mono", 9),
+        bg="#ffffff",
+        fg="#333333",
+        relief="solid",
+        borderwidth=1,
+        highlightthickness=0,
+        padx=6,
+        pady=4,
+    )
+    error_detail_text.configure(state="disabled", cursor="arrow", takefocus=False)
+    error_detail_text.pack(fill="both", expand=True, padx=18, pady=(0, 12))
+    error_button_row = tk.Frame(error_frame, bg="#ffffff")
+    error_button_row.pack(fill="x", padx=18, pady=(0, 18))
+    retry_button = tk.Button(error_button_row, text="Retry this step", width=16)
+    retry_button.pack(side="left")
+    copy_details_button = tk.Button(error_button_row, text="Copy details", width=14)
+    copy_details_button.pack(side="left", padx=(8, 0))
+    open_error_log_button = tk.Button(error_button_row, text="Open error_log.txt", width=16)
+    open_error_log_button.pack(side="right")
+    error_state: dict[str, Any] = {"step": "", "details": "", "log_path": ""}
+
     def set_text(widget: tk.Text, value: str) -> None:
         widget.configure(state="normal")
         widget.delete("1.0", "end")
         widget.insert("1.0", value)
         widget.configure(state="disabled")
+
+    def append_details_log(line: str) -> None:
+        if not line:
+            return
+        details_text.configure(state="normal")
+        details_text.insert("end", line.rstrip() + "\n")
+        details_text.see("end")
+        details_text.configure(state="disabled")
+
+    def toggle_details_log() -> None:
+        if details_frame.winfo_ismapped():
+            details_frame.pack_forget()
+            details_button.config(text="Show details")
+        else:
+            details_frame.pack(fill="both", expand=False, padx=18, pady=(0, 12))
+            details_button.config(text="Hide details")
+
+    details_button.config(command=toggle_details_log)
 
     def set_detail_bar_indeterminate(active: bool) -> None:
         if active and not detail_bar_mode["indeterminate"]:
@@ -1187,9 +1776,138 @@ def run_bootstrap() -> int:
             raise result["error"]
         return result.get("value")
 
+    def set_install_button_enabled(enabled: bool) -> None:
+        button = install_button_ref.get("value")
+        if button is not None:
+            button.config(state="normal" if enabled else "disabled")
+
+    def refresh_onedrive_warning() -> None:
+        install_path_detail.set(f"Install path: {root}")
+        if is_onedrive_path(root):
+            if not onedrive_warning_frame.winfo_ismapped():
+                onedrive_warning_frame.pack(fill="x", padx=20, pady=(0, 44))
+            set_install_button_enabled(False)
+        else:
+            onedrive_warning_frame.pack_forget()
+            set_install_button_enabled(True)
+
+    def continue_onedrive_install() -> None:
+        onedrive_warning_frame.pack_forget()
+        set_install_button_enabled(True)
+
+    def choose_local_install_folder() -> None:
+        nonlocal root
+        selected = filedialog.askdirectory(title="Choose local install folder")
+        if not selected:
+            return
+        root = Path(selected).expanduser().resolve()
+        install_path_detail.set(f"Install path: {root}")
+        refresh_onedrive_warning()
+
+    tk.Button(onedrive_actions, text="Continue anyway", width=16, command=continue_onedrive_install).pack(side="left")
+    tk.Button(onedrive_actions, text="Choose local folder", width=18, command=choose_local_install_folder).pack(
+        side="left", padx=(8, 0)
+    )
+
+    def refresh_model_size_estimate() -> None:
+        with online_huggingface_download_env(root):
+            sizes = estimate_model_download_sizes(DEFAULT_MODEL_DOWNLOADS)
+        total = total_known_size(sizes)
+        if total:
+            message = f"Estimated model download: {format_bytes(total)}"
+        else:
+            known = [size for size in sizes.values() if isinstance(size, int) and size > 0]
+            message = (
+                f"Estimated model download: at least {format_bytes(sum(known))}"
+                if known
+                else "Estimated model download: unavailable"
+            )
+        run_on_ui(lambda: model_size_summary.set(message))
+
+    def start_model_size_estimate() -> None:
+        threading.Thread(target=refresh_model_size_estimate, name="model-size-estimate", daemon=True).start()
+
+    sensitive_install_phase = {"active": False}
+
+    def set_sensitive_install_phase(active: bool) -> None:
+        sensitive_install_phase["active"] = active
+
+    def short_error_cause(message: str) -> str:
+        for line in message.splitlines():
+            cleaned = line.strip()
+            if cleaned:
+                return cleaned
+        return "Setup failed. See details below."
+
+    def copy_error_details() -> None:
+        window.clipboard_clear()
+        window.clipboard_append(error_state.get("details", ""))
+
+    def open_error_log_file() -> None:
+        log_path = str(error_state.get("log_path", ""))
+        if log_path and Path(log_path).is_file():
+            os.startfile(log_path)
+        else:
+            messagebox.showwarning("Error log not found", "error_log.txt was not found for this failure.")
+
+    def show_progress_pane() -> None:
+        error_frame.pack_forget()
+        progress_frame.pack(fill="both", expand=True)
+
+    def show_error_card(step: str, message: str, log_path: Path | str = "", details: str = "") -> None:
+        detail_text = details or message
+        if log_path:
+            detail_text = f"{detail_text}\n\nError details saved to {log_path}"
+        error_state.update({"step": step, "details": detail_text, "log_path": str(log_path)})
+
+        def apply() -> None:
+            progress_frame.pack_forget()
+            error_message.config(text=short_error_cause(message))
+            set_text(error_detail_text, detail_text)
+            error_frame.pack(fill="both", expand=True)
+            retry_button.config(state="normal")
+            copy_details_button.config(state="normal")
+            open_error_log_button.config(state="normal" if log_path else "disabled")
+            window.update_idletasks()
+
+        run_on_ui(apply)
+
+    def retry_failed_step() -> None:
+        step = str(error_state.get("step") or current_step)
+
+        def reset_failed_steps() -> None:
+            try:
+                start_index = BOOTSTRAP_STEPS.index(step)
+            except ValueError:
+                start_index = 0
+            for reset_step in BOOTSTRAP_STEPS[start_index:]:
+                step_states[reset_step] = StepState.PENDING
+                step_progress_values[reset_step] = 0
+            show_progress_pane()
+            set_detail_bar_indeterminate(False)
+            detail_progress_value.set(0)
+            eta_detail.set("")
+            render_steps()
+
+        run_on_ui(reset_failed_steps)
+        threading.Thread(target=lambda: run_setup_flow(step), name="setup-retry", daemon=True).start()
+
+    def on_close_setup() -> None:
+        if sensitive_install_phase["active"]:
+            if not messagebox.askyesno(
+                "Setup still running",
+                "Package or model install is in progress. Closing now can leave a half-installed setup.\n\nClose anyway?",
+            ):
+                return
+        window.destroy()
+
+    retry_button.config(command=retry_failed_step)
+    copy_details_button.config(command=copy_error_details)
+    open_error_log_button.config(command=open_error_log_file)
+    window.protocol("WM_DELETE_WINDOW", on_close_setup)
+
     def render_steps() -> None:
-        done_count = sum(1 for state in step_states.values() if state in (StepState.DONE, StepState.WARNING))
-        overall_progress_value.set(int(done_count / len(BOOTSTRAP_STEPS) * 100))
+        overall_progress_value.set(weighted_overall_progress(step_states, step_progress_values))
         for step, label in task_labels.items():
             state = step_states[step]
             if state == StepState.DONE:
@@ -1212,6 +1930,11 @@ def run_bootstrap() -> int:
 
     def set_step(step: str, state: StepState, detail: str = "", progress: int | None = None) -> None:
         nonlocal current_step
+        log_details = {"state": state.value}
+        if progress is not None:
+            log_details["progress_percent"] = progress
+        log_install(step, detail or step, log_details)
+
         def apply() -> None:
             nonlocal current_step
             current_step = step
@@ -1227,12 +1950,16 @@ def run_bootstrap() -> int:
             if state == StepState.ERROR:
                 diagnostic.error = detail
             detail_title.config(text=step)
+            append_details_log(f"{step}: {state.value}" + (f" - {detail}" if detail else ""))
             if detail:
                 package_detail.set(detail)
                 set_text(package_text, detail)
             if progress is not None:
                 set_detail_bar_indeterminate(False)
                 detail_progress_value.set(progress)
+                step_progress_values[step] = progress
+            elif state == StepState.DONE:
+                step_progress_values[step] = 100
             render_steps()
             window.update_idletasks()
 
@@ -1270,8 +1997,19 @@ def run_bootstrap() -> int:
         set_text(package_text, detail)
 
     def update_from_pip(event: PipProgressEvent) -> None:
+        log_install(
+            BOOTSTRAP_STEPS[3],
+            event.phase,
+            {
+                "detail": event.detail,
+                "progress_percent": event.progress_percent,
+                "raw_line": event.raw_line,
+            },
+        )
+
         def apply_event() -> None:
             set_command_text(event.phase)
+            append_details_log(event.raw_line or event.detail or event.phase)
             if event.detail:
                 package_detail.set(event.detail)
                 set_text(package_text, event.detail)
@@ -1287,6 +2025,7 @@ def run_bootstrap() -> int:
                 else:
                     set_detail_bar_indeterminate(False)
                     detail_progress_value.set(progress)
+                    step_progress_values[BOOTSTRAP_STEPS[3]] = progress
             if event.progress_percent is not None:
                 if event.progress_percent == 100:
                     set_detail_bar_indeterminate(False)
@@ -1294,13 +2033,25 @@ def run_bootstrap() -> int:
                 elif not (tracker is not None and tracker.installing_started):
                     current_progress = progress if progress is not None else detail_progress_value.get()
                     detail_progress_value.set(max(current_progress, event.progress_percent))
+                step_progress_values[BOOTSTRAP_STEPS[3]] = detail_progress_value.get()
             render_steps()
 
         window.after(0, apply_event)
 
     def update_from_model_download(event: PipProgressEvent) -> None:
+        log_install(
+            BOOTSTRAP_STEPS[4],
+            event.phase,
+            {
+                "detail": event.detail,
+                "progress_percent": event.progress_percent,
+                "raw_line": event.raw_line,
+            },
+        )
+
         def apply_event() -> None:
             set_command_text(event.phase)
+            append_details_log(event.raw_line or event.detail or event.phase)
             if event.detail:
                 package_detail.set(event.detail)
                 set_text(package_text, event.detail)
@@ -1309,6 +2060,9 @@ def run_bootstrap() -> int:
             if event.progress_percent is not None:
                 set_detail_bar_indeterminate(False)
                 detail_progress_value.set(event.progress_percent)
+                step_progress_values[BOOTSTRAP_STEPS[4]] = event.progress_percent
+            else:
+                set_detail_bar_indeterminate(True)
             render_steps()
 
         window.after(0, apply_event)
@@ -1316,26 +2070,43 @@ def run_bootstrap() -> int:
     def finish_with_launch_countdown() -> None:
         final_message_active.set(True)
         step_states[BOOTSTRAP_STEPS[-1]] = StepState.RUNNING
+        log_install(BOOTSTRAP_STEPS[-1], "Launch countdown started", {"delay_seconds": IMPORTANT_MESSAGE_SECONDS})
+        launch_now_button.config(state="normal")
         render_steps()
 
         remaining = {"seconds": IMPORTANT_MESSAGE_SECONDS}
+        launched = {"value": False}
+
+        def launch_now() -> None:
+            if launched["value"]:
+                return
+            launched["value"] = True
+            step_states[BOOTSTRAP_STEPS[-1]] = StepState.DONE
+            (root / SETUP_MARKER).write_text("complete\n", encoding="utf-8")
+            window.destroy()
+            raise SystemExit(launch_gui(root))
+
+        launch_now_button.config(command=launch_now)
 
         def countdown() -> None:
+            if launched["value"]:
+                return
             seconds = remaining["seconds"]
             detail_title.config(text="Prerequisites setup done")
             command_detail.set("")
             set_text(command_text, "")
             eta_detail.set("")
             set_detail_bar_indeterminate(False)
-            detail = f"Launching transcriber in {seconds} seconds..."
+            detail = f"Launching in {seconds}..."
             package_detail.set(detail)
             set_text(package_text, detail)
+            overall_bar.configure(style=COMPLETE_PROGRESS_STYLE)
+            detail_bar.configure(style=COMPLETE_PROGRESS_STYLE)
+            overall_progress_value.set(100)
             detail_progress_value.set(100)
             if seconds <= 0:
-                step_states[BOOTSTRAP_STEPS[-1]] = StepState.DONE
-                (root / SETUP_MARKER).write_text("complete\n", encoding="utf-8")
-                window.destroy()
-                raise SystemExit(launch_gui(root))
+                launch_now()
+                return
             remaining["seconds"] -= 1
             window.after(1000, countdown)
 
@@ -1354,117 +2125,144 @@ def run_bootstrap() -> int:
             )
         finish_with_launch_countdown()
 
-    def run_setup_flow() -> None:
+    def run_setup_flow(start_step: str = BOOTSTRAP_STEPS[0]) -> None:
         try:
-            important_message(BOOTSTRAP_STEPS[0], f"Using Python: {sys.executable}")
-            set_step(BOOTSTRAP_STEPS[0], StepState.DONE, "Python runtime ready", 100)
+            try:
+                start_index = BOOTSTRAP_STEPS.index(start_step)
+            except ValueError:
+                start_index = 0
 
-            important_message(BOOTSTRAP_STEPS[1], f"Preparing folders under:\n{root}")
-            ensure_portable_layout(root, package_root)
-            set_step(BOOTSTRAP_STEPS[1], StepState.DONE, "App folders ready", 100)
+            if start_index <= 0:
+                important_message(BOOTSTRAP_STEPS[0], f"Using Python: {sys.executable}")
+                set_step(BOOTSTRAP_STEPS[0], StepState.DONE, "Python runtime ready", 100)
 
-            important_message(BOOTSTRAP_STEPS[2], "Checking required Python packages...")
-            missing = missing_runtime_imports(root)
-            if missing:
-                set_step(BOOTSTRAP_STEPS[2], StepState.WARNING, "Missing: " + ", ".join(missing), 100)
-                set_step(BOOTSTRAP_STEPS[3], StepState.RUNNING, "Installing missing packages", 0)
-                command = subprocess.list2cmdline(
-                    [
-                        sys.executable,
-                        "-m",
-                        "pip",
-                        "install",
-                        "--no-cache-dir",
-                        "--upgrade",
-                        "--target",
-                        str(local_package_dir(root)),
-                        "-r",
-                        str(resource_root(package_root) / "requirements.txt"),
-                    ]
-                )
-                def show_command() -> None:
-                    set_command_text("Running command:\n" + command)
-                    step_diagnostics[BOOTSTRAP_STEPS[3]].command = command
+            if start_index <= 1:
+                important_message(BOOTSTRAP_STEPS[1], f"Preparing folders under:\n{root}")
+                ensure_portable_layout(root, package_root)
+                set_step(BOOTSTRAP_STEPS[1], StepState.DONE, "App folders ready", 100)
 
-                run_on_ui(show_command)
-                time.sleep(IMPORTANT_MESSAGE_SECONDS)
-                pip_tracker["value"] = PipInstallProgressTracker()
-                result = run_pip_install(root, update_from_pip, package_root)
-                if result.code != 0:
+            if start_index <= 3:
+                if start_index <= 2:
+                    important_message(BOOTSTRAP_STEPS[2], "Checking required Python packages...")
+                missing = missing_runtime_imports(root)
+                if missing:
+                    set_step(BOOTSTRAP_STEPS[2], StepState.WARNING, "Missing: " + ", ".join(missing), 100)
+                    set_step(BOOTSTRAP_STEPS[3], StepState.RUNNING, "Installing missing packages", 0)
+                    command = subprocess.list2cmdline(
+                        [
+                            sys.executable,
+                            "-m",
+                            "pip",
+                            "install",
+                            "--no-cache-dir",
+                            "--progress-bar",
+                            "on",
+                            "--upgrade",
+                            "--target",
+                            str(local_package_dir(root)),
+                            "-r",
+                            str(resource_root(package_root) / "requirements.txt"),
+                        ]
+                    )
+
+                    def show_command() -> None:
+                        set_command_text("Running command:\n" + command)
+                        step_diagnostics[BOOTSTRAP_STEPS[3]].command = command
+
+                    log_install(BOOTSTRAP_STEPS[3], "Running pip command", {"command": command})
+                    run_on_ui(show_command)
+                    time.sleep(IMPORTANT_MESSAGE_SECONDS)
+                    pip_tracker["value"] = PipInstallProgressTracker()
+                    set_sensitive_install_phase(True)
+                    try:
+                        result = run_pip_install(root, update_from_pip, package_root)
+                    finally:
+                        set_sensitive_install_phase(False)
+                    if result.code != 0:
+                        log_path = write_setup_error_log(
+                            root,
+                            BOOTSTRAP_STEPS[3],
+                            f"pip failed with exit code {result.code}",
+                            result.command,
+                            result.recent_output,
+                        )
+                        step_diagnostics[BOOTSTRAP_STEPS[3]].command = result.command
+                        recent = "\n".join(result.recent_output[-8:])
+                        step_diagnostics[BOOTSTRAP_STEPS[3]].last_output = recent
+                        message = f"pip failed with exit code {result.code}"
+                        set_step(
+                            BOOTSTRAP_STEPS[3],
+                            StepState.ERROR,
+                            f"{message}\nError details saved to {log_path}",
+                            100,
+                        )
+                        show_error_card(BOOTSTRAP_STEPS[3], message, log_path, recent)
+                        return
+                    set_step(BOOTSTRAP_STEPS[3], StepState.DONE, "Python packages installed", 100)
+                else:
+                    set_step(BOOTSTRAP_STEPS[2], StepState.DONE, "Python packages ready", 100)
+                    set_step(BOOTSTRAP_STEPS[3], StepState.DONE, "No install needed", 100)
+
+            if start_index <= 4:
+                important_message(BOOTSTRAP_STEPS[4], "Downloading default local AI models...")
+                set_step(BOOTSTRAP_STEPS[4], StepState.RUNNING, "Downloading default models", 0)
+                try:
+                    set_sensitive_install_phase(True)
+                    downloaded = download_default_models(root, update_from_model_download)
+                except Exception as exc:
                     log_path = write_setup_error_log(
                         root,
-                        BOOTSTRAP_STEPS[3],
-                        f"pip failed with exit code {result.code}",
-                        result.command,
-                        result.recent_output,
+                        BOOTSTRAP_STEPS[4],
+                        f"Model download failed: {exc}",
+                        "",
+                        [str(exc)],
                     )
-                    step_diagnostics[BOOTSTRAP_STEPS[3]].command = result.command
-                    step_diagnostics[BOOTSTRAP_STEPS[3]].last_output = "\n".join(result.recent_output[-3:])
+                    message = f"Model download failed:\n{exc}"
                     set_step(
-                        BOOTSTRAP_STEPS[3],
+                        BOOTSTRAP_STEPS[4],
                         StepState.ERROR,
-                        f"pip failed with exit code {result.code}\nError details saved to {log_path}",
+                        f"{message}\nError details saved to {log_path}",
                         100,
                     )
+                    show_error_card(BOOTSTRAP_STEPS[4], message, log_path, str(exc))
                     return
-                set_step(BOOTSTRAP_STEPS[3], StepState.DONE, "Python packages installed", 100)
-            else:
-                set_step(BOOTSTRAP_STEPS[2], StepState.DONE, "Python packages ready", 100)
-                set_step(BOOTSTRAP_STEPS[3], StepState.DONE, "No install needed", 100)
+                finally:
+                    set_sensitive_install_phase(False)
+                model_detail = "Downloaded: " + ", ".join(downloaded) if downloaded else "Default models already present"
+                set_step(BOOTSTRAP_STEPS[4], StepState.DONE, model_detail, 100)
 
-            important_message(BOOTSTRAP_STEPS[4], "Downloading default local AI models...")
-            set_step(BOOTSTRAP_STEPS[4], StepState.RUNNING, "Downloading default models", 0)
-            try:
-                downloaded = download_default_models(root, update_from_model_download)
-            except Exception as exc:
-                log_path = write_setup_error_log(
-                    root,
-                    BOOTSTRAP_STEPS[4],
-                    f"Model download failed: {exc}",
-                    "",
-                    [str(exc)],
-                )
-                set_step(
-                    BOOTSTRAP_STEPS[4],
-                    StepState.ERROR,
-                    f"Model download failed:\n{exc}\nError details saved to {log_path}",
-                    100,
-                )
-                return
-            model_detail = "Downloaded: " + ", ".join(downloaded) if downloaded else "Default models already present"
-            set_step(BOOTSTRAP_STEPS[4], StepState.DONE, model_detail, 100)
-
-            important_message(BOOTSTRAP_STEPS[5], "Checking local AI model folders...")
-            models = model_folder_status(root)
-            missing_models = [name for name, value in models.items() if value == BootstrapStatus.MISSING]
-            if missing_models:
-                message = missing_model_setup_message(missing_models)
-                log_path = write_setup_error_log(
-                    root,
-                    BOOTSTRAP_STEPS[5],
-                    "Required model files missing after download",
-                    "",
-                    missing_models,
-                )
-                set_step(
-                    BOOTSTRAP_STEPS[5],
-                    StepState.ERROR,
-                    f"{message}\n\nError details saved to {log_path}",
-                    100,
-                )
-                return
-            else:
+            if start_index <= 5:
+                important_message(BOOTSTRAP_STEPS[5], "Checking local AI model folders...")
+                models = model_folder_status(root)
+                missing_models = [name for name, value in models.items() if value == BootstrapStatus.MISSING]
+                if missing_models:
+                    message = missing_model_setup_message(missing_models)
+                    log_path = write_setup_error_log(
+                        root,
+                        BOOTSTRAP_STEPS[5],
+                        "Required model files missing after download",
+                        "",
+                        missing_models,
+                    )
+                    set_step(
+                        BOOTSTRAP_STEPS[5],
+                        StepState.ERROR,
+                        f"{message}\n\nError details saved to {log_path}",
+                        100,
+                    )
+                    show_error_card(BOOTSTRAP_STEPS[5], message, log_path, "\n".join(missing_models))
+                    return
                 set_step(BOOTSTRAP_STEPS[5], StepState.DONE, "Model folders ready", 100)
 
-            important_message(BOOTSTRAP_STEPS[6], "Saving setup state and preparing launch...")
-            set_step(BOOTSTRAP_STEPS[6], StepState.DONE, "Setup complete", 100)
+            if start_index <= 6:
+                important_message(BOOTSTRAP_STEPS[6], "Saving setup state and preparing launch...")
+                set_step(BOOTSTRAP_STEPS[6], StepState.DONE, "Setup complete", 100)
             window.after(0, finish_with_launch_countdown)
         except Exception as exc:
             log_path = write_setup_error_log(root, current_step, f"Setup failed: {exc}")
-            window.after(
-                0,
-                lambda: set_step(current_step, StepState.ERROR, f"Setup failed:\n{exc}\nError details saved to {log_path}", 100),
-            )
+            message = f"Setup failed:\n{exc}"
+            window.after(0, lambda: set_step(current_step, StepState.ERROR, f"{message}\nError details saved to {log_path}", 100))
+            show_error_card(current_step, message, log_path, str(exc))
 
     def start_flow() -> None:
         for child in install_button_row.winfo_children():
@@ -1473,26 +2271,34 @@ def run_bootstrap() -> int:
         progress_frame.pack(fill="both", expand=True)
         set_text(command_text, "")
         set_text(package_text, "")
+        overall_bar.configure(style=SETUP_PROGRESS_STYLE)
+        detail_bar.configure(style=DETAIL_PROGRESS_STYLE)
         detail_progress_value.set(0)
         eta_detail.set("")
         set_detail_bar_indeterminate(False)
         render_steps()
         for child in button_row.winfo_children():
-            child.config(state="disabled")
+            if child is details_button:
+                child.config(state="normal")
+            else:
+                child.config(state="disabled")
         for child in model_button_row.winfo_children():
             child.config(state="disabled")
-        threading.Thread(target=run_setup_flow, daemon=True).start()
+        threading.Thread(target=run_setup_flow, name="setup-flow", daemon=True).start()
 
-    cancel_button = tk.Button(install_button_row, text="Cancel", width=14, command=window.destroy)
+    cancel_button = tk.Button(install_button_row, text="Cancel", width=14, command=on_close_setup)
     cancel_button.pack(side="right", padx=(0, 20))
     install_button = tk.Button(install_button_row, text="Install", width=14, command=start_flow)
     install_button.pack(side="right", padx=(0, 8))
+    install_button_ref["value"] = install_button
+    refresh_onedrive_warning()
 
     set_text(command_text, command_detail.get())
     set_text(package_text, "")
 
     render_steps()
     tick_spinner()
+    window.after(100, start_model_size_estimate)
     window.mainloop()
     return 0
 

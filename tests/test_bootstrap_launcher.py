@@ -1,7 +1,10 @@
+import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -9,6 +12,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
+import bootstrap_launcher as bootstrap_launcher_module
 from bootstrap_launcher import (
     APP_PUBLISHER,
     BOOTSTRAP_STEPS,
@@ -44,6 +48,35 @@ from bootstrap_launcher import (
 
 
 class BootstrapLauncherTests(unittest.TestCase):
+    def test_import_replaces_missing_pythonw_streams(self):
+        script = (
+            "import sys\n"
+            "from pathlib import Path\n"
+            "sys.path.insert(0, str(Path.cwd() / 'app'))\n"
+            "sys.stdout = None\n"
+            "sys.stderr = None\n"
+            "import bootstrap_launcher\n"
+            "if sys.stdout is None or sys.stderr is None:\n"
+            "    sys.__stdout__.write('streams still None')\n"
+            "    raise SystemExit(2)\n"
+            "if not callable(getattr(sys.stdout, 'write', None)):\n"
+            "    sys.__stdout__.write('stdout cannot write')\n"
+            "    raise SystemExit(3)\n"
+            "if not callable(getattr(sys.stderr, 'write', None)):\n"
+            "    sys.__stdout__.write('stderr cannot write')\n"
+            "    raise SystemExit(4)\n"
+        )
+
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=Path(__file__).resolve().parents[1],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_missing_imports_reports_unavailable_modules(self):
         result = missing_imports(
             {
@@ -401,6 +434,22 @@ class BootstrapLauncherTests(unittest.TestCase):
         self.assertTrue(all(all(value is None for value in item.values()) for item in seen_env))
         self.assertEqual(restored, {name: "1" for name in HF_OFFLINE_ENV_VARS})
 
+    def test_online_download_env_disables_huggingface_progress_bars_and_restores_previous_value(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("HF_HUB_DISABLE_PROGRESS_BARS", None)
+
+                with online_huggingface_download_env(Path(tmp)):
+                    self.assertEqual(os.environ["HF_HUB_DISABLE_PROGRESS_BARS"], "1")
+
+                self.assertNotIn("HF_HUB_DISABLE_PROGRESS_BARS", os.environ)
+
+            with patch.dict(os.environ, {"HF_HUB_DISABLE_PROGRESS_BARS": "0"}, clear=False):
+                with online_huggingface_download_env(Path(tmp)):
+                    self.assertEqual(os.environ["HF_HUB_DISABLE_PROGRESS_BARS"], "1")
+
+                self.assertEqual(os.environ["HF_HUB_DISABLE_PROGRESS_BARS"], "0")
+
     def test_online_download_env_uses_ca_bundle_beside_launcher_when_present(self):
         with tempfile.TemporaryDirectory() as tmp:
             launcher_root = Path(tmp)
@@ -512,6 +561,117 @@ class BootstrapLauncherTests(unittest.TestCase):
         self.assertEqual(installed_one.phase, "Install complete")
         self.assertEqual(installed_one.progress_percent, 100)
 
+    def test_pip_progress_parser_reads_cli_download_bar_percent(self):
+        parser = PipProgressParser()
+
+        event = parser.parse("  42%|####2     | 42.0/100.0 MB [00:02<00:03, 19.3MB/s]")
+
+        self.assertEqual(event.phase, "Downloading package")
+        self.assertEqual(event.progress_percent, 42)
+        self.assertIn("42.0/100.0 MB", event.detail)
+
+    def test_run_pip_install_emits_carriage_return_download_progress(self):
+        from bootstrap_launcher import run_pip_install
+
+        with tempfile.TemporaryDirectory() as runtime_tmp, tempfile.TemporaryDirectory() as package_tmp:
+            root = Path(runtime_tmp)
+            package_root = Path(package_tmp)
+            resources = package_root / "resources"
+            resources.mkdir()
+            (resources / "requirements.txt").write_text("example-package==1.0\n", encoding="utf-8")
+            events = []
+
+            class FakeProcess:
+                def __init__(self, cmd, **kwargs):
+                    self.stdout = io.StringIO(
+                        "Downloading example-package-1.0.whl (100 MB)\n"
+                        "  25%|##5       | 25.0/100.0 MB [00:01<00:03, 25.0MB/s]\r"
+                        " 100%|##########| 100.0/100.0 MB [00:04<00:00, 25.0MB/s]\n"
+                        "Successfully installed example-package-1.0\n"
+                    )
+
+                def wait(self):
+                    return 0
+
+            with patch("bootstrap_launcher.subprocess.Popen", FakeProcess):
+                result = run_pip_install(root, events.append, package_root)
+
+            self.assertEqual(result.code, 0)
+            self.assertIn(25, [event.progress_percent for event in events])
+            self.assertIn(100, [event.progress_percent for event in events])
+
+    def test_model_downloader_reports_polled_staging_byte_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ensure_portable_layout(root)
+            events = []
+
+            def fake_download(**kwargs):
+                target = Path(kwargs["local_dir"])
+                if kwargs["repo_id"] == "Systran/faster-whisper-small":
+                    for size in (25, 50, 100):
+                        (target / "model.bin").write_bytes(b"x" * size)
+                        time.sleep(0.35)
+                else:
+                    (target / "hyperparams.yaml").write_text("speaker", encoding="utf-8")
+                    for size in (25, 50, 100):
+                        (target / "embedding_model.ckpt").write_bytes(b"x" * size)
+                        time.sleep(0.35)
+                return str(target)
+
+            with patch.object(bootstrap_launcher_module, "fetch_model_repo_size", return_value=100, create=True):
+                download_default_models(root, events.append, downloader=fake_download)
+
+            progress_values = [
+                event.progress_percent
+                for event in events
+                if event.phase == "Downloading model" and event.progress_percent not in (None, 0, 50, 100)
+            ]
+            self.assertTrue(progress_values)
+            self.assertTrue(any(" / " in event.detail and "elapsed" in event.detail for event in events))
+
+    def test_model_download_formatting_and_manifest_size_helpers(self):
+        sibling = types.SimpleNamespace(rfilename="model.bin", size=463 * 1024 * 1024)
+        lfs_sibling = types.SimpleNamespace(rfilename="weights.bin", lfs={"size": 37 * 1024 * 1024})
+        info = types.SimpleNamespace(siblings=[sibling, lfs_sibling])
+
+        total = bootstrap_launcher_module.model_info_total_size(info)
+        detail = bootstrap_launcher_module.format_model_download_status(
+            "model.bin",
+            downloaded_bytes=89 * 1024 * 1024,
+            total_bytes=463 * 1024 * 1024,
+            elapsed_seconds=47,
+        )
+
+        self.assertEqual(total, 500 * 1024 * 1024)
+        self.assertEqual(bootstrap_launcher_module.format_bytes(463 * 1024 * 1024), "463 MB")
+        self.assertEqual(detail, "model.bin \u2022 89 MB / 463 MB \u2022 0:47 elapsed")
+
+    def test_folder_size_bytes_sums_nested_files_and_ignores_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            nested = root / "nested"
+            nested.mkdir()
+            (root / "a.bin").write_bytes(b"a" * 7)
+            (nested / "b.bin").write_bytes(b"b" * 11)
+
+            self.assertEqual(bootstrap_launcher_module.folder_size_bytes(root), 18)
+            self.assertEqual(bootstrap_launcher_module.folder_size_bytes(root / "missing"), 0)
+
+    def test_weighted_overall_progress_uses_expected_step_durations(self):
+        states = {step: StepState.PENDING for step in BOOTSTRAP_STEPS}
+        for step in BOOTSTRAP_STEPS[:3]:
+            states[step] = StepState.DONE
+
+        progress = {step: 0 for step in BOOTSTRAP_STEPS}
+        progress[BOOTSTRAP_STEPS[3]] = 50
+
+        self.assertEqual(bootstrap_launcher_module.weighted_overall_progress(states, progress), 27)
+
+        states[BOOTSTRAP_STEPS[3]] = StepState.DONE
+        progress[BOOTSTRAP_STEPS[4]] = 50
+        self.assertEqual(bootstrap_launcher_module.weighted_overall_progress(states, progress), 72)
+
     def test_pip_progress_parser_counts_already_satisfied(self):
         parser = PipProgressParser()
 
@@ -572,6 +732,49 @@ class BootstrapLauncherTests(unittest.TestCase):
         self.assertLess(progress, 100)
         self.assertIn("Installing collected packages: torch, torchaudio", detail)
         self.assertNotIn("ETA ~1s", detail)
+
+    def test_install_log_records_setup_events(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "OfflineMeetingTranscriber"
+            root.mkdir()
+            log_root = Path(tmp) / "logs"
+            with patch.dict(os.environ, {"LOCAL_WHISPER_LOG_ROOT": str(log_root)}, clear=False):
+                self.assertTrue(hasattr(bootstrap_launcher_module, "reset_install_log"))
+                self.assertTrue(hasattr(bootstrap_launcher_module, "append_install_log"))
+
+                log_path = bootstrap_launcher_module.reset_install_log(root, "Installing test build")
+                bootstrap_launcher_module.append_install_log(
+                    root,
+                    "Downloading AI models",
+                    "model.bin: 50%",
+                    {"progress_percent": 50, "raw_line": "model.bin:  50%"},
+                )
+                content = log_path.read_text(encoding="utf-8")
+
+        self.assertEqual(log_path, log_root / "install_log.txt")
+        self.assertIn("Installing test build", content)
+        self.assertIn("context: Downloading AI models", content)
+        self.assertIn("progress_percent: 50", content)
+        self.assertIn("model.bin:  50%", content)
+
+    def test_setup_switches_progressbars_to_green_during_launch_countdown(self):
+        source = (Path(__file__).resolve().parents[1] / "app" / "bootstrap_launcher.py").read_text(encoding="utf-8")
+
+        self.assertIn("COMPLETE_PROGRESS_STYLE", source)
+        self.assertIn('style.configure(COMPLETE_PROGRESS_STYLE', source)
+        self.assertIn("overall_bar.configure(style=COMPLETE_PROGRESS_STYLE)", source)
+        self.assertIn("detail_bar.configure(style=COMPLETE_PROGRESS_STYLE)", source)
+        self.assertIn("overall_progress_value.set(100)", source)
+
+    def test_setup_source_contains_error_card_details_expander_and_close_guard(self):
+        source = (Path(__file__).resolve().parents[1] / "app" / "bootstrap_launcher.py").read_text(encoding="utf-8")
+
+        self.assertIn('text="Retry this step"', source)
+        self.assertIn('text="Copy details"', source)
+        self.assertIn('text="Open error_log.txt"', source)
+        self.assertIn('text="Show details"', source)
+        self.assertIn('text="Launch now"', source)
+        self.assertIn("messagebox.askyesno", source)
 
     def test_write_setup_error_log_records_command_and_recent_output(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -742,10 +742,12 @@ class MeetingTranscriberEngine:
             from speechbrain.inference.speaker import EncoderClassifier
         except ImportError:  # pragma: no cover - speechbrain older import path
             from speechbrain.pretrained import EncoderClassifier
+        from speechbrain.utils.fetching import LocalStrategy
 
         return EncoderClassifier.from_hparams(
             source=self.config.speaker_embedding_model_dir,
             savedir=self.config.speaker_embedding_model_dir,
+            local_strategy=LocalStrategy.COPY,
             run_opts={"device": "cpu"},
         )
 
