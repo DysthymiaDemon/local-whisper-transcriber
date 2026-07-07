@@ -1,5 +1,8 @@
 {
   "whisper_model_dir": "models/faster-whisper",
+  "diarization_backend": "local-ecapa",
+  "speaker_embedding_model_dir": "models/speechbrain-ecapa",
+  "speaker_cluster_distance_threshold": 0.55,
   "pyannote_pipeline_dir": "models/pyannote-pipeline",
   "pyannote_embedding_model_dir": "models/pyannote-embedding",
   "output_file": "transcripts/meeting_transcript.txt",

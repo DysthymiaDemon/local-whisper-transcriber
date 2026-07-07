@@ -5,6 +5,7 @@ __pycache__/
 .runtime/
 build/
 dist/
+Test Folder for App/
 OfflineMeetingTranscriber/
 models/
 transcripts/

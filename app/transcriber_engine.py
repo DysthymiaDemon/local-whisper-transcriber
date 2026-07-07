@@ -15,6 +15,11 @@ from typing import Any, Callable, Iterable, Optional
 
 UNKNOWN_SPEAKER_LABEL = "Speaker ?"
 EMBEDDING_WEIGHT_FILES = ("pytorch_model.bin", "model.safetensors")
+DIARIZATION_BACKEND_LOCAL_ECAPA = "local-ecapa"
+DIARIZATION_BACKEND_PYANNOTE = "pyannote"
+SPEECHBRAIN_CHECKPOINT_FILES = ("embedding_model.ckpt", "model.ckpt")
+LOCAL_DIARIZATION_MIN_SECONDS = 0.25
+LOCAL_DIARIZATION_TARGET_SECONDS = 1.0
 
 
 def _force_offline_mode() -> None:
@@ -23,12 +28,12 @@ def _force_offline_mode() -> None:
     os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
 
 
-_force_offline_mode()
-
-
 @dataclass(frozen=True)
 class EngineConfig:
     whisper_model_dir: str = r"C:\models\faster-whisper-small"
+    diarization_backend: str = DIARIZATION_BACKEND_LOCAL_ECAPA
+    speaker_embedding_model_dir: str = r"C:\models\speechbrain-ecapa"
+    speaker_cluster_distance_threshold: float = 0.55
     pyannote_pipeline_dir: str = r"C:\models\pyannote-speaker-diarization"
     pyannote_embedding_model_dir: str = r"C:\models\pyannote-embedding"
     output_file: str = "meeting_transcript.txt"
@@ -60,26 +65,47 @@ class EngineConfig:
                 f"{whisper_path}. Copy a CTranslate2 faster-whisper model folder into this path."
             )
 
-        pipeline_path = self._validate_folder("Pyannote pipeline", self.pyannote_pipeline_dir, errors)
-        if pipeline_path and not (pipeline_path / "config.yaml").is_file():
-            errors.append(
-                "Pyannote pipeline is incomplete: expected config.yaml in "
-                f"{pipeline_path}. Copy the local pyannote pipeline folder into this path."
+        if self.diarization_backend == DIARIZATION_BACKEND_LOCAL_ECAPA:
+            speaker_path = self._validate_folder(
+                "Speaker embedding model", self.speaker_embedding_model_dir, errors
             )
-
-        embedding_path = self._validate_folder("Pyannote embedding model", self.pyannote_embedding_model_dir, errors)
-        if embedding_path:
-            missing_embedding_files: list[str] = []
-            if not (embedding_path / "config.yaml").is_file():
-                missing_embedding_files.append("config.yaml")
-            if not any((embedding_path / name).is_file() for name in EMBEDDING_WEIGHT_FILES):
-                missing_embedding_files.append("pytorch_model.bin or model.safetensors")
-            if missing_embedding_files:
+            if speaker_path:
+                missing_speaker_files: list[str] = []
+                if not (speaker_path / "hyperparams.yaml").is_file():
+                    missing_speaker_files.append("hyperparams.yaml")
+                if not any((speaker_path / name).is_file() for name in SPEECHBRAIN_CHECKPOINT_FILES):
+                    missing_speaker_files.append("embedding_model.ckpt")
+                if missing_speaker_files:
+                    errors.append(
+                        "Speaker embedding model is incomplete: expected "
+                        + ", ".join(missing_speaker_files)
+                        + f" in {speaker_path}. Copy or download the SpeechBrain ECAPA model folder into this path."
+                    )
+        elif self.diarization_backend == DIARIZATION_BACKEND_PYANNOTE:
+            pipeline_path = self._validate_folder("Pyannote pipeline", self.pyannote_pipeline_dir, errors)
+            if pipeline_path and not (pipeline_path / "config.yaml").is_file():
                 errors.append(
-                    "Pyannote embedding model is incomplete: expected "
-                    + ", ".join(missing_embedding_files)
-                    + f" in {embedding_path}. Copy the local pyannote embedding model folder into this path."
+                    "Pyannote pipeline is incomplete: expected config.yaml in "
+                    f"{pipeline_path}. Copy the local pyannote pipeline folder into this path."
                 )
+
+            embedding_path = self._validate_folder("Pyannote embedding model", self.pyannote_embedding_model_dir, errors)
+            if embedding_path:
+                missing_embedding_files: list[str] = []
+                if not (embedding_path / "config.yaml").is_file():
+                    missing_embedding_files.append("config.yaml")
+                if not any((embedding_path / name).is_file() for name in EMBEDDING_WEIGHT_FILES):
+                    missing_embedding_files.append("pytorch_model.bin or model.safetensors")
+                if missing_embedding_files:
+                    errors.append(
+                        "Pyannote embedding model is incomplete: expected "
+                        + ", ".join(missing_embedding_files)
+                        + f" in {embedding_path}. Copy the local pyannote embedding model folder into this path."
+                    )
+        else:
+            errors.append(
+                "Diarization backend must be local-ecapa or pyannote."
+            )
         return errors
 
     @staticmethod
@@ -178,6 +204,77 @@ def _normalize_embedding(embedding: Iterable[float] | None) -> Optional[list[flo
     if norm == 0.0:
         return None
     return [value / norm for value in values]
+
+
+def cluster_local_embeddings(embeddings: list[list[float]], distance_threshold: float = 0.55) -> list[int]:
+    if not embeddings:
+        return []
+    if len(embeddings) == 1:
+        return [0]
+    try:
+        from sklearn.cluster import AgglomerativeClustering
+
+        try:
+            clustering = AgglomerativeClustering(
+                n_clusters=None,
+                metric="cosine",
+                linkage="average",
+                distance_threshold=distance_threshold,
+            )
+        except TypeError:
+            clustering = AgglomerativeClustering(
+                n_clusters=None,
+                affinity="cosine",
+                linkage="average",
+                distance_threshold=distance_threshold,
+            )
+        return [int(label) for label in clustering.fit_predict(embeddings)]
+    except Exception:
+        labels: list[int] = []
+        centroids: list[list[float]] = []
+        for embedding in embeddings:
+            normalized = _normalize_embedding(embedding)
+            if normalized is None:
+                labels.append(-1)
+                continue
+            best_index = -1
+            best_distance = 2.0
+            for index, centroid in enumerate(centroids):
+                distance = 1.0 - cosine_similarity(normalized, centroid)
+                if distance < best_distance:
+                    best_distance = distance
+                    best_index = index
+            if best_index >= 0 and best_distance <= distance_threshold:
+                labels.append(best_index)
+            else:
+                centroids.append(normalized)
+                labels.append(len(centroids) - 1)
+        return labels
+
+
+def extract_row_audio_window(chunk: AudioChunk, row: TranscriptRow, target_seconds: float = LOCAL_DIARIZATION_TARGET_SECONDS) -> Any:
+    import numpy as np
+
+    samples = np.asarray(chunk.samples, dtype=np.float32).reshape(-1)
+    sample_rate = chunk.sample_rate
+    relative_start = max(0.0, row.start - chunk.start_time)
+    relative_end = max(relative_start, row.end - chunk.start_time)
+    duration = relative_end - relative_start
+    if duration < target_seconds:
+        midpoint = (relative_start + relative_end) / 2.0
+        relative_start = midpoint - (target_seconds / 2.0)
+        relative_end = midpoint + (target_seconds / 2.0)
+
+    start_sample = math.floor(relative_start * sample_rate)
+    end_sample = math.ceil(relative_end * sample_rate)
+    left_pad = max(0, -start_sample)
+    right_pad = max(0, end_sample - samples.size)
+    start_sample = max(0, start_sample)
+    end_sample = min(samples.size, end_sample)
+    window = samples[start_sample:end_sample]
+    if left_pad or right_pad:
+        window = np.pad(window, (left_pad, right_pad))
+    return window.astype(np.float32, copy=False)
 
 
 class SpeakerRegistry:
@@ -405,6 +502,7 @@ class MeetingTranscriberEngine:
         self._event_handlers.append(handler)
 
     def start(self) -> None:
+        _force_offline_mode()
         errors = self.config.validate()
         if errors:
             raise ValueError("\n".join(errors))
@@ -564,9 +662,9 @@ class MeetingTranscriberEngine:
 
     def _diarization_loop(self) -> None:
         try:
-            pipeline, embedding_inference = self._load_pyannote_models()
+            diarizer = self._load_diarization_backend()
         except Exception as exc:  # pragma: no cover - environment-dependent
-            self._emit("error", {"message": f"Pyannote model load failed: {exc}"})
+            self._emit("error", {"message": f"Diarization model load failed: {exc}"})
             return
 
         while True:
@@ -574,7 +672,7 @@ class MeetingTranscriberEngine:
             if chunk is None:
                 return
             try:
-                turns = self._run_diarization(chunk, pipeline, embedding_inference)
+                turns = self._run_diarization_backend(chunk, diarizer)
                 updated_rows = self.store.apply_diarization(chunk.index, turns)
                 if updated_rows:
                     self.writer.refresh(self.store.snapshot())
@@ -594,6 +692,7 @@ class MeetingTranscriberEngine:
                 self._emit("lag", {"message": self.lag_status()})
 
     def _load_whisper_model(self) -> Any:
+        _force_offline_mode()
         from faster_whisper import WhisperModel
 
         if not Path(self.config.whisper_model_dir).exists():
@@ -612,7 +711,21 @@ class MeetingTranscriberEngine:
                 compute_type=self.config.compute_type,
             )
 
+    def _load_diarization_backend(self) -> Any:
+        if self.config.diarization_backend == DIARIZATION_BACKEND_LOCAL_ECAPA:
+            return self._load_local_speaker_model()
+        if self.config.diarization_backend == DIARIZATION_BACKEND_PYANNOTE:
+            return self._load_pyannote_models()
+        raise ValueError(f"Unsupported diarization backend: {self.config.diarization_backend}")
+
+    def _run_diarization_backend(self, chunk: AudioChunk, diarizer: Any) -> list[DiarizationTurn]:
+        if self.config.diarization_backend == DIARIZATION_BACKEND_LOCAL_ECAPA:
+            return self._run_local_ecapa_diarization(chunk, diarizer)
+        pipeline, embedding_inference = diarizer
+        return self._run_pyannote_diarization(chunk, pipeline, embedding_inference)
+
     def _load_pyannote_models(self) -> tuple[Any, Any]:
+        _force_offline_mode()
         import torch
         from pyannote.audio import Inference, Model, Pipeline
 
@@ -623,7 +736,83 @@ class MeetingTranscriberEngine:
         embedding_inference = Inference(embedding_model, window="whole")
         return pipeline, embedding_inference
 
-    def _run_diarization(self, chunk: AudioChunk, pipeline: Any, embedding_inference: Any) -> list[DiarizationTurn]:
+    def _load_local_speaker_model(self) -> Any:
+        _force_offline_mode()
+        try:
+            from speechbrain.inference.speaker import EncoderClassifier
+        except ImportError:  # pragma: no cover - speechbrain older import path
+            from speechbrain.pretrained import EncoderClassifier
+
+        return EncoderClassifier.from_hparams(
+            source=self.config.speaker_embedding_model_dir,
+            savedir=self.config.speaker_embedding_model_dir,
+            run_opts={"device": "cpu"},
+        )
+
+    def _run_local_ecapa_diarization(self, chunk: AudioChunk, classifier: Any) -> list[DiarizationTurn]:
+        rows = self._wait_for_chunk_transcript_rows(chunk.index)
+        if not rows:
+            return []
+
+        embeddings: list[list[float]] = []
+        row_indexes: list[int] = []
+        for index, row in enumerate(rows):
+            if (row.end - row.start) < LOCAL_DIARIZATION_MIN_SECONDS:
+                continue
+            audio_window = extract_row_audio_window(chunk, row)
+            embedding = self._extract_speechbrain_embedding(classifier, audio_window)
+            if embedding is None:
+                continue
+            embeddings.append(embedding)
+            row_indexes.append(index)
+
+        labels = cluster_local_embeddings(embeddings, self.config.speaker_cluster_distance_threshold)
+        turns: list[DiarizationTurn] = []
+        label_by_row = {row_index: labels[index] for index, row_index in enumerate(row_indexes)}
+        embedding_by_row = {row_index: embeddings[index] for index, row_index in enumerate(row_indexes)}
+        for index, row in enumerate(rows):
+            local_label = label_by_row.get(index)
+            embedding = embedding_by_row.get(index)
+            turns.append(
+                DiarizationTurn(
+                    start=row.start,
+                    end=row.end,
+                    local_label=f"local_{local_label}" if local_label is not None and local_label >= 0 else "unknown",
+                    embedding=embedding,
+                    confidence=1.0 if embedding is not None else 0.0,
+                )
+            )
+        return turns
+
+    def _wait_for_chunk_transcript_rows(self, chunk_index: int) -> list[TranscriptRow]:
+        deadline = time.monotonic() + max(30.0, self.config.chunk_seconds * 4.0)
+        while True:
+            rows = [row for row in self.store.snapshot() if row.chunk_index == chunk_index]
+            with self._state_lock:
+                transcription_pending = chunk_index in self._pending_transcription_chunks
+            if rows or not transcription_pending or time.monotonic() >= deadline:
+                return rows
+            time.sleep(0.05)
+
+    @staticmethod
+    def _extract_speechbrain_embedding(classifier: Any, audio_window: Any) -> Optional[list[float]]:
+        try:
+            import numpy as np
+            import torch
+
+            waveform = torch.from_numpy(np.asarray(audio_window, dtype=np.float32)).float().unsqueeze(0)
+            with torch.no_grad():
+                result = classifier.encode_batch(waveform)
+            if hasattr(result, "detach"):
+                result = result.detach().cpu().numpy()
+            values = result.tolist() if hasattr(result, "tolist") else list(result)
+            while values and isinstance(values[0], list):
+                values = values[0]
+            return [float(value) for value in values]
+        except Exception:
+            return None
+
+    def _run_pyannote_diarization(self, chunk: AudioChunk, pipeline: Any, embedding_inference: Any) -> list[DiarizationTurn]:
         import numpy as np
         import torch
         from pyannote.core import Segment

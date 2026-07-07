@@ -95,7 +95,7 @@ def write_payload_file(root: Path, rel_path: str, encoded: str, expected_sha: st
 
 
 def ensure_runtime_folders(root: Path) -> None:
-    for model in ("faster-whisper", "pyannote-pipeline", "pyannote-embedding"):
+    for model in ("faster-whisper", "speechbrain-ecapa", "pyannote-pipeline", "pyannote-embedding"):
         (root / "models" / model).mkdir(parents=True, exist_ok=True)
     (root / "transcripts").mkdir(parents=True, exist_ok=True)
     config_path = root / "config.json"
@@ -135,9 +135,7 @@ def main(argv: list[str] | None = None) -> int:
 
     os.environ["LOCAL_WHISPER_APP_ROOT"] = str(install_root)
     os.environ["LOCAL_WHISPER_SOURCE_ROOT"] = str(install_root)
-    os.environ.setdefault("HF_HUB_OFFLINE", "1")
-    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-    os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+    os.environ["LOCAL_WHISPER_LOG_ROOT"] = str(launcher_path.parent)
 
     app_dir = str(install_root / "app")
     if app_dir not in sys.path:

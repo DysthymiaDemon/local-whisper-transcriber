@@ -2,7 +2,7 @@
 
 Target machine: HP EliteBook 830 G10, Intel Core i5-1345U, 32GB RAM, Intel Iris Xe, no CUDA.
 
-Runtime is offline-only. `transcriber_engine.py` sets `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`, and `HF_DATASETS_OFFLINE=1`; model paths must point to local folders.
+First setup can use internet to download Python packages and the default public models. Runtime recording is offline-only. `transcriber_engine.py` sets `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`, and `HF_DATASETS_OFFLINE=1`; model paths must point to local folders.
 
 ## 1. Prepare Python
 
@@ -62,9 +62,14 @@ Test devices:
 python -c "import sounddevice as sd; print(sd.query_devices())"
 ```
 
-## 4. Download Faster-Whisper Model
+## 4. Download Default Models
 
-Use CTranslate2/faster-whisper model folders, not OpenAI `.pt` files.
+The normal first-run setup downloads these automatically when internet is available:
+
+- `Systran/faster-whisper-small` into `models\faster-whisper`
+- `speechbrain/spkrec-ecapa-voxceleb` into `models\speechbrain-ecapa`
+
+For air-gapped setup, download them on an internet-connected Windows machine and copy the folders to the laptop. Use CTranslate2/faster-whisper model folders, not OpenAI `.pt` files.
 
 Recommended CPU start:
 
@@ -72,6 +77,9 @@ Recommended CPU start:
 pip install huggingface_hub
 huggingface-cli download Systran/faster-whisper-small `
   --local-dir models\faster-whisper `
+  --local-dir-use-symlinks False
+huggingface-cli download speechbrain/spkrec-ecapa-voxceleb `
+  --local-dir models\speechbrain-ecapa `
   --local-dir-use-symlinks False
 ```
 
@@ -81,13 +89,14 @@ Copy folder to offline laptop, example:
 
 ```text
 <install folder>\models\faster-whisper
+<install folder>\models\speechbrain-ecapa
 ```
 
 The first-run setup GUI creates this local install folder beside the standalone `.pyw`, or in the selected portable app folder.
 
-## 5. Download Pyannote Models
+## 5. Optional Advanced Pyannote Models
 
-Pyannote models may be gated. Accept model terms and use Hugging Face token only on internet-connected machine. Do not copy token to offline laptop.
+Default setup does not need pyannote, pyannote model terms, or a Hugging Face token. Pyannote remains an optional advanced backend and requires installing `pyannote.audio` separately into the app runtime or source environment. Pyannote models may be gated; accept model terms and use a Hugging Face token only on the internet-connected machine. Do not copy token to offline laptop.
 
 Download community diarization pipeline:
 
@@ -139,8 +148,9 @@ In GUI:
 
 - Select microphone.
 - Set local Whisper folder.
-- Set local pyannote pipeline folder.
-- Set local pyannote embedding folder.
+- Keep diarization backend as `Local ECAPA` for one-touch default mode.
+- Set local SpeechBrain speaker model folder if needed.
+- Use `Pyannote advanced` only if local pyannote folders are already prepared.
 - Choose output `.txt`.
 - Press `Record`.
 
@@ -159,8 +169,10 @@ GUI app also prints live transcript lines to console:
 
 `Whisper model path does not exist`: set GUI path to local CTranslate2 model folder containing model files.
 
-`Pyannote model load failed`: config still points to remote repo or missing local model file.
+`Speaker embedding model path does not exist`: run first setup with internet or copy `speechbrain/spkrec-ecapa-voxceleb` into `models\speechbrain-ecapa`.
+
+`Pyannote model load failed`: only applies to optional advanced mode. Config still points to a remote repo or missing local pyannote model file.
 
 No microphone level: confirm Windows microphone privacy settings and correct input device.
 
-Very slow diarization: increase chunk size to 10-15 seconds or use smaller pyannote pipeline if available locally.
+Very slow diarization: increase chunk size to 10-15 seconds. Default ECAPA diarization is lighter than pyannote, but still CPU-bound.

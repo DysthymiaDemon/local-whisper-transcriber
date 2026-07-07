@@ -9,39 +9,52 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from collections import deque
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Any, Callable, Mapping
 
-from app_config import append_error_log, application_root, source_root
+from app_config import append_error_log, application_root, error_log_root, source_root
 
 
 REQUIRED_IMPORTS: dict[str, str] = {
     "PySide6": "PySide6",
     "sounddevice": "sounddevice",
     "faster-whisper": "faster_whisper",
-    "pyannote.audio": "pyannote.audio",
+    "speechbrain": "speechbrain",
+    "scikit-learn": "sklearn",
+    "huggingface_hub": "huggingface_hub",
+    "truststore": "truststore",
     "torch": "torch",
 }
 
-MODEL_DIRS = ("faster-whisper", "pyannote-pipeline", "pyannote-embedding")
+DEFAULT_MODEL_DIRS = ("faster-whisper", "speechbrain-ecapa")
+OPTIONAL_MODEL_DIRS = ("pyannote-pipeline", "pyannote-embedding")
+MODEL_DIRS = DEFAULT_MODEL_DIRS + OPTIONAL_MODEL_DIRS
 MODEL_GUIDES: dict[str, str] = {
     "faster-whisper": (
-        "Copy a CTranslate2 faster-whisper model here.\n\n"
+        "Default setup downloads Systran/faster-whisper-small here.\n\n"
         "Required file:\n"
         "- model.bin\n\n"
         "Example source model: Systran/faster-whisper-small\n"
     ),
+    "speechbrain-ecapa": (
+        "Default setup downloads the non-gated SpeechBrain ECAPA speaker model here.\n\n"
+        "Required files:\n"
+        "- hyperparams.yaml\n"
+        "- embedding_model.ckpt or model.ckpt\n\n"
+        "Example source model: speechbrain/spkrec-ecapa-voxceleb\n"
+    ),
     "pyannote-pipeline": (
-        "Copy the local pyannote diarization pipeline here.\n\n"
+        "Optional advanced backend only. Copy the local pyannote diarization pipeline here.\n\n"
         "Required file:\n"
         "- config.yaml\n\n"
         "The config.yaml must reference local model paths only.\n"
     ),
     "pyannote-embedding": (
-        "Copy the local pyannote embedding model here.\n\n"
+        "Optional advanced backend only. Copy the local pyannote embedding model here.\n\n"
         "Required files:\n"
         "- config.yaml\n"
         "- pytorch_model.bin or model.safetensors\n"
@@ -53,12 +66,19 @@ RUNTIME_DIR = ".runtime"
 PACKAGE_DIR = "site-packages"
 RUNTIME_ENV = "LOCAL_WHISPER_RUNTIME_ROOT"
 RUNTIME_APP_FOLDER_NAME = "OfflineMeetingTranscriberRuntime"
+APP_PUBLISHER = "Ameen Khan"
+APP_VERSION = "local"
+HF_OFFLINE_ENV_VARS = ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE")
+CA_BUNDLE_ENV = "LOCAL_WHISPER_CA_BUNDLE"
+TLS_CERT_ENV_VARS = ("REQUESTS_CA_BUNDLE", "SSL_CERT_FILE")
+CA_BUNDLE_FILENAMES = ("company-ca.pem", "corporate-ca.pem", "ca-bundle.pem")
 
 BOOTSTRAP_STEPS = [
     "Checking Python runtime",
     "Preparing app folders",
     "Checking Python packages",
     "Installing Python packages",
+    "Downloading AI models",
     "Checking local model folders",
     "Finishing setup",
     "Launching transcriber",
@@ -105,6 +125,62 @@ class PipInstallResult:
     recent_output: list[str]
 
 
+@dataclass(frozen=True)
+class ModelDownloadSpec:
+    name: str
+    repo_id: str
+    target_subdir: str
+
+
+DEFAULT_MODEL_DOWNLOADS = (
+    ModelDownloadSpec(
+        name="faster-whisper",
+        repo_id="Systran/faster-whisper-small",
+        target_subdir="models/faster-whisper",
+    ),
+    ModelDownloadSpec(
+        name="speechbrain-ecapa",
+        repo_id="speechbrain/spkrec-ecapa-voxceleb",
+        target_subdir="models/speechbrain-ecapa",
+    ),
+)
+
+
+def setup_install_summary(package_root: Path | None = None) -> str:
+    package_lines = "\n".join(f"- {package}" for package in setup_package_list(package_root))
+    model_lines = "\n".join(f"- {model}" for model in setup_model_list())
+    return (
+        "Install Offline Meeting Transcriber?\n"
+        "Local Windows App\n"
+        f"Publisher: {APP_PUBLISHER}\n"
+        f"Version: {APP_VERSION}\n\n"
+        "Models to install locally:\n"
+        f"{model_lines}\n\n"
+        "Python packages to install locally:\n"
+        f"{package_lines}\n\n"
+        "Install location:\n"
+        "- App files, config, models, transcripts: folder beside this launcher\n"
+        "- Python dependencies: app runtime folder"
+    )
+
+
+def setup_model_list() -> list[str]:
+    return [f"{spec.repo_id} -> {spec.target_subdir.replace('/', os.sep)}" for spec in DEFAULT_MODEL_DOWNLOADS]
+
+
+def setup_package_list(package_root: Path | None = None) -> list[str]:
+    package_root = package_root or installer_source_root()
+    requirements_path = resource_root(package_root) / "requirements.txt"
+    if not requirements_path.exists():
+        return ["Python package requirements"]
+    packages: list[str] = []
+    for raw_line in requirements_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if line and not line.startswith("#"):
+            packages.append(line)
+    return packages or ["Python package requirements"]
+
+
 def format_duration(seconds: float | None) -> str:
     if seconds is None:
         return "0s"
@@ -143,6 +219,8 @@ class PipInstallProgressTracker:
         self.start_time = time.time() if start_time is None else start_time
         self.event_count = 0
         self.progress = 0
+        self.installing_started = False
+        self.installing_message = ""
 
     def record(self, event: PipProgressEvent, now: float | None = None) -> tuple[int, str]:
         self.event_count += 1
@@ -150,13 +228,18 @@ class PipInstallProgressTracker:
         if event.progress_percent == 100:
             self.progress = 100
         elif event.progress_percent == 0:
-            self.progress = max(self.progress, 20)
+            self.installing_started = True
+            self.installing_message = event.raw_line.strip() or f"Installing collected packages: {event.detail}"
+            self.progress = max(self.progress, 80)
         else:
-            self.progress = min(95, max(self.progress + 3, 8 + self.event_count * 4))
+            cap = 92 if self.installing_started else 95
+            self.progress = min(cap, max(self.progress + 3, 8 + self.event_count * 4))
 
         elapsed = current - self.start_time
         if self.progress >= 100:
             eta = "ETA complete"
+        elif self.installing_started:
+            eta = self.installing_message or "Installing collected packages..."
         elif self.event_count < 3 or self.progress < 10:
             eta = "ETA estimating..."
         else:
@@ -393,6 +476,9 @@ def ensure_portable_layout(root: Path, template_root: Path | None = None) -> Pat
                 json.dumps(
                     {
                         "whisper_model_dir": "models/faster-whisper",
+                        "diarization_backend": "local-ecapa",
+                        "speaker_embedding_model_dir": "models/speechbrain-ecapa",
+                        "speaker_cluster_distance_threshold": 0.55,
                         "pyannote_pipeline_dir": "models/pyannote-pipeline",
                         "pyannote_embedding_model_dir": "models/pyannote-embedding",
                         "output_file": "transcripts/meeting_transcript.txt",
@@ -412,20 +498,198 @@ def ensure_portable_layout(root: Path, template_root: Path | None = None) -> Pat
     return config_path
 
 
-def model_folder_status(root: Path) -> dict[str, BootstrapStatus]:
+def _model_folder_ready(root: Path, name: str) -> bool:
+    return _model_folder_ready_at(root / "models" / name, name)
+
+
+def _model_folder_ready_at(folder: Path, name: str) -> bool:
+    if name == "faster-whisper":
+        return (folder / "model.bin").is_file()
+    if name == "speechbrain-ecapa":
+        return (folder / "hyperparams.yaml").is_file() and any(
+            (folder / filename).is_file() for filename in ("embedding_model.ckpt", "model.ckpt")
+        )
+    if name == "pyannote-pipeline":
+        return (folder / "config.yaml").is_file()
+    if name == "pyannote-embedding":
+        return (folder / "config.yaml").is_file() and any(
+            (folder / filename).is_file() for filename in ("pytorch_model.bin", "model.safetensors")
+        )
+    return False
+
+
+def model_folder_status(root: Path, include_optional: bool = False) -> dict[str, BootstrapStatus]:
     status: dict[str, BootstrapStatus] = {}
-    for name in MODEL_DIRS:
-        folder = root / "models" / name
-        if name == "faster-whisper":
-            ready = (folder / "model.bin").is_file()
-        elif name == "pyannote-pipeline":
-            ready = (folder / "config.yaml").is_file()
-        else:
-            ready = (folder / "config.yaml").is_file() and any(
-                (folder / filename).is_file() for filename in ("pytorch_model.bin", "model.safetensors")
-            )
+    model_names = MODEL_DIRS if include_optional else DEFAULT_MODEL_DIRS
+    for name in model_names:
+        ready = _model_folder_ready(root, name)
         status[name] = BootstrapStatus.READY if ready else BootstrapStatus.MISSING
     return status
+
+
+def missing_model_setup_message(missing_models: list[str]) -> str:
+    joined = "\n".join(missing_models)
+    return (
+        "Setup stopped because required local AI model files are missing after download.\n\n"
+        "Missing model folders:\n"
+        f"{joined}\n\n"
+        "Recording cannot start until these model folders contain the expected files."
+    )
+
+
+def find_local_ca_bundle(root: Path | None = None) -> Path | None:
+    configured = os.environ.get(CA_BUNDLE_ENV)
+    if configured:
+        candidate = Path(configured).expanduser()
+        return candidate.resolve() if candidate.is_file() else None
+
+    roots: list[Path] = []
+    if root is not None:
+        roots.extend([error_log_root(root), root, root.parent])
+    else:
+        roots.append(error_log_root())
+
+    seen: set[Path] = set()
+    for base in roots:
+        resolved_base = base.expanduser().resolve()
+        if resolved_base in seen:
+            continue
+        seen.add(resolved_base)
+        for filename in CA_BUNDLE_FILENAMES:
+            candidate = resolved_base / filename
+            if candidate.is_file():
+                return candidate.resolve()
+    return None
+
+
+def configure_download_tls(root: Path | None = None) -> None:
+    try:
+        import truststore
+
+        truststore.inject_into_ssl()
+    except Exception:
+        pass
+
+    bundle = find_local_ca_bundle(root)
+    if bundle is None:
+        return
+    for name in TLS_CERT_ENV_VARS:
+        os.environ.setdefault(name, str(bundle))
+
+
+@contextmanager
+def online_huggingface_download_env(root: Path | None = None):
+    previous = {name: os.environ.get(name) for name in HF_OFFLINE_ENV_VARS + TLS_CERT_ENV_VARS}
+    try:
+        for name in HF_OFFLINE_ENV_VARS:
+            os.environ.pop(name, None)
+        configure_download_tls(root)
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def _model_folder_preview(folder: Path, limit: int = 12) -> str:
+    if not folder.exists():
+        return "<folder does not exist>"
+    entries = []
+    for item in sorted(folder.iterdir(), key=lambda path: path.name.lower()):
+        suffix = "/" if item.is_dir() else ""
+        entries.append(f"{item.name}{suffix}")
+        if len(entries) >= limit:
+            break
+    return ", ".join(entries) if entries else "<empty>"
+
+
+def model_download_staging_dir(root: Path, spec: ModelDownloadSpec) -> Path:
+    runtime_root = local_runtime_dir(root).resolve()
+    staging = (runtime_root / "model-downloads" / spec.name).resolve()
+    if not staging.is_relative_to(runtime_root):
+        raise RuntimeError(f"Unsafe model download staging path: {staging}")
+    return staging
+
+
+def prepare_model_download_staging_dir(root: Path, spec: ModelDownloadSpec) -> Path:
+    staging = model_download_staging_dir(root, spec)
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True, exist_ok=True)
+    return staging
+
+
+def copy_staged_model_to_target(staging: Path, target: Path) -> None:
+    target.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(staging, target, dirs_exist_ok=True, ignore=shutil.ignore_patterns(".cache"))
+
+
+def verify_downloaded_model(
+    root: Path,
+    spec: ModelDownloadSpec,
+    staging: Path | None = None,
+    returned_path: str | list[Any] | None = None,
+) -> None:
+    folder = staging or root / spec.target_subdir
+    if _model_folder_ready_at(folder, spec.name):
+        return
+    target = root / spec.target_subdir
+    raise RuntimeError(
+        "Model download did not produce expected files for "
+        f"{spec.repo_id}.\n"
+        f"Staging folder: {folder}\n"
+        f"Final target folder: {target}\n"
+        f"snapshot_download returned: {returned_path}\n"
+        f"Staging top-level files: {_model_folder_preview(folder)}\n"
+        f"Final target top-level files: {_model_folder_preview(target)}"
+    )
+
+
+def download_default_models(root: Path, on_event, downloader: Callable[..., str] | None = None) -> list[str]:
+    package_path = local_package_dir(root)
+    if package_path.exists() and str(package_path) not in sys.path:
+        sys.path.insert(0, str(package_path))
+    if downloader is None:
+        with online_huggingface_download_env(root):
+            from huggingface_hub import snapshot_download
+
+        downloader = snapshot_download
+
+    downloaded: list[str] = []
+    total = len(DEFAULT_MODEL_DOWNLOADS)
+    for index, spec in enumerate(DEFAULT_MODEL_DOWNLOADS, start=1):
+        target = root / spec.target_subdir
+        target.mkdir(parents=True, exist_ok=True)
+        base_progress = int(((index - 1) / total) * 100)
+        if _model_folder_ready(root, spec.name):
+            on_event(
+                PipProgressEvent(
+                    "Model ready",
+                    f"{spec.repo_id} already exists in {target}",
+                    int((index / total) * 100),
+                    f"skip {spec.repo_id}",
+                )
+            )
+            continue
+
+        detail = f"{spec.repo_id} -> {target}"
+        on_event(PipProgressEvent("Downloading model", detail, base_progress, detail))
+        staging = prepare_model_download_staging_dir(root, spec)
+        with online_huggingface_download_env(root):
+            returned_path = downloader(
+                repo_id=spec.repo_id,
+                local_dir=str(staging),
+                local_files_only=False,
+                force_download=True,
+            )
+        verify_downloaded_model(root, spec, staging, returned_path)
+        copy_staged_model_to_target(staging, target)
+        verify_downloaded_model(root, spec, target, returned_path)
+        downloaded.append(spec.name)
+        on_event(PipProgressEvent("Model downloaded", detail, int((index / total) * 100), detail))
+    return downloaded
 
 
 def create_startup_splash():
@@ -578,7 +842,8 @@ def write_setup_error_log(
 
 def needs_setup(root: Path, required: Mapping[str, str] = REQUIRED_IMPORTS) -> bool:
     ensure_portable_layout(root, installer_source_root())
-    return bool(missing_runtime_imports(root, required)) or not (root / SETUP_MARKER).exists()
+    models_missing = any(value == BootstrapStatus.MISSING for value in model_folder_status(root).values())
+    return bool(missing_runtime_imports(root, required)) or models_missing or not (root / SETUP_MARKER).exists()
 
 
 def run_bootstrap() -> int:
@@ -596,14 +861,18 @@ def run_bootstrap() -> int:
     ensure_portable_layout(root, package_root)
     update_startup_splash(splash, splash_status, "Checking Python packages...")
     missing_packages = missing_runtime_imports(root)
+    update_startup_splash(splash, splash_status, "Checking default AI models...")
+    models_missing = any(value == BootstrapStatus.MISSING for value in model_folder_status(root).values())
     update_startup_splash(splash, splash_status, "Checking first-time setup status...")
     setup_missing = not (root / SETUP_MARKER).exists()
-    if not missing_packages and not setup_missing:
+    if not missing_packages and not models_missing and not setup_missing:
         update_startup_splash(splash, splash_status, "Dependencies ready.")
         return launch_gui(root, splash, splash_status)
 
     if missing_packages:
         update_startup_splash(splash, splash_status, "Dependencies missing. Opening first-time setup...")
+    elif models_missing:
+        update_startup_splash(splash, splash_status, "Default AI models missing. Opening setup...")
     else:
         update_startup_splash(splash, splash_status, "First-time setup required. Opening installer...")
     time.sleep(0.8)
@@ -630,7 +899,7 @@ def run_bootstrap() -> int:
     current_step = BOOTSTRAP_STEPS[0]
     detail_progress_value = tk.IntVar(value=0)
     overall_progress_value = tk.IntVar(value=0)
-    package_detail = tk.StringVar(value="Waiting to start")
+    package_detail = tk.StringVar(value=setup_install_summary(package_root))
     command_detail = tk.StringVar(value="")
     eta_detail = tk.StringVar(value="")
     final_message_active = tk.BooleanVar(value=False)
@@ -695,8 +964,118 @@ def run_bootstrap() -> int:
         task_labels[step] = row
         tooltip_refs.append(ToolTip(row, lambda name=step: build_step_tooltip(step_diagnostics[name])))
 
+    install_frame = tk.Frame(detail_frame, bg="#ffffff")
+    install_frame.pack(fill="both", expand=True)
+
+    install_title = tk.Label(
+        install_frame,
+        text="Install Offline Meeting Transcriber?",
+        font=("Segoe UI", 16, "bold"),
+        anchor="w",
+        bg="#ffffff",
+        fg="#1f1f1f",
+    )
+    install_title.pack(fill="x", padx=20, pady=(14, 4))
+
+    app_type = tk.Label(
+        install_frame,
+        text="Local Windows App",
+        font=("Segoe UI", 10),
+        anchor="w",
+        bg="#ffffff",
+        fg="#0969da",
+    )
+    app_type.pack(fill="x", padx=20)
+
+    publisher = tk.Label(
+        install_frame,
+        text=f"Publisher: {APP_PUBLISHER}",
+        font=("Segoe UI", 10),
+        anchor="w",
+        bg="#ffffff",
+        fg="#333333",
+    )
+    publisher.pack(fill="x", padx=20)
+
+    version = tk.Label(
+        install_frame,
+        text=f"Version: {APP_VERSION}",
+        font=("Segoe UI", 10),
+        anchor="w",
+        bg="#ffffff",
+        fg="#333333",
+    )
+    version.pack(fill="x", padx=20, pady=(0, 10))
+
+    models_title = tk.Label(
+        install_frame,
+        text="Models to install locally:",
+        font=("Segoe UI", 10),
+        anchor="w",
+        bg="#ffffff",
+        fg="#222222",
+    )
+    models_title.pack(fill="x", padx=20, pady=(0, 4))
+
+    for item in setup_model_list():
+        tk.Label(
+            install_frame,
+            text=f"- {item}",
+            font=("Segoe UI", 10),
+            anchor="w",
+            bg="#ffffff",
+            fg="#666666",
+        ).pack(fill="x", padx=28)
+
+    packages_title = tk.Label(
+        install_frame,
+        text="Python packages to install locally:",
+        font=("Segoe UI", 10),
+        anchor="w",
+        bg="#ffffff",
+        fg="#222222",
+    )
+    packages_title.pack(fill="x", padx=20, pady=(10, 4))
+
+    packages_box = tk.Frame(install_frame, bg="#ffffff")
+    packages_box.pack(fill="x", padx=20)
+    package_list = tk.Text(
+        packages_box,
+        height=4,
+        wrap="none",
+        font=("Cascadia Mono", 9),
+        bg="#ffffff",
+        fg="#555555",
+        relief="solid",
+        borderwidth=1,
+        highlightthickness=0,
+        padx=6,
+        pady=4,
+    )
+    package_scroll = ttk.Scrollbar(packages_box, orient="vertical", command=package_list.yview)
+    package_list.configure(yscrollcommand=package_scroll.set)
+    package_scroll.pack(side="right", fill="y")
+    package_list.pack(side="left", fill="both", expand=True)
+    package_list.insert("1.0", "\n".join(f"- {package}" for package in setup_package_list(package_root)))
+    package_list.configure(state="disabled", cursor="arrow", takefocus=False)
+
+    install_note = tk.Label(
+        install_frame,
+        text="Internet required for first setup downloads. Runtime stays local/offline.",
+        font=("Segoe UI", 10),
+        anchor="w",
+        bg="#ffffff",
+        fg="#333333",
+    )
+    install_note.pack(fill="x", padx=20, pady=(8, 52))
+
+    install_button_row = tk.Frame(install_frame, bg="#ffffff")
+    install_button_row.place(relx=0, rely=1, relwidth=1, anchor="sw", y=-16)
+
+    progress_frame = tk.Frame(detail_frame, bg="#ffffff")
+
     detail_title = tk.Label(
-        detail_frame,
+        progress_frame,
         text="Preparing setup",
         font=("Segoe UI", 14, "bold"),
         anchor="w",
@@ -723,7 +1102,7 @@ def run_bootstrap() -> int:
         return widget
 
     command_text = readonly_text(
-        detail_frame,
+        progress_frame,
         height=4,
         font=("Cascadia Mono", 9),
         foreground="#505050",
@@ -732,15 +1111,16 @@ def run_bootstrap() -> int:
     command_text.pack(fill="x", padx=18, pady=(0, 10))
 
     detail_bar = ttk.Progressbar(
-        detail_frame,
+        progress_frame,
         maximum=100,
         variable=detail_progress_value,
         style="Detail.Horizontal.TProgressbar",
     )
     detail_bar.pack(fill="x", padx=18, pady=(0, 12))
+    detail_bar_mode = {"indeterminate": False}
 
     eta_label = tk.Label(
-        detail_frame,
+        progress_frame,
         textvariable=eta_detail,
         font=("Segoe UI", 9),
         anchor="w",
@@ -751,7 +1131,7 @@ def run_bootstrap() -> int:
     eta_label.pack(fill="x", padx=18, pady=(0, 8))
 
     package_text = readonly_text(
-        detail_frame,
+        progress_frame,
         height=7,
         font=("Segoe UI", 10),
         foreground="#222222",
@@ -759,10 +1139,10 @@ def run_bootstrap() -> int:
     )
     package_text.pack(fill="both", expand=True, padx=18, pady=(0, 14))
 
-    button_row = tk.Frame(detail_frame, bg="#ffffff")
+    button_row = tk.Frame(progress_frame, bg="#ffffff")
     button_row.pack(fill="x", padx=18, pady=(0, 6))
 
-    model_button_row = tk.Frame(detail_frame, bg="#ffffff")
+    model_button_row = tk.Frame(progress_frame, bg="#ffffff")
     model_button_row.pack(fill="x", padx=18, pady=(0, 18))
 
     def set_text(widget: tk.Text, value: str) -> None:
@@ -770,6 +1150,17 @@ def run_bootstrap() -> int:
         widget.delete("1.0", "end")
         widget.insert("1.0", value)
         widget.configure(state="disabled")
+
+    def set_detail_bar_indeterminate(active: bool) -> None:
+        if active and not detail_bar_mode["indeterminate"]:
+            detail_bar.stop()
+            detail_bar.configure(mode="indeterminate")
+            detail_bar.start(12)
+            detail_bar_mode["indeterminate"] = True
+        elif not active and detail_bar_mode["indeterminate"]:
+            detail_bar.stop()
+            detail_bar.configure(mode="determinate")
+            detail_bar_mode["indeterminate"] = False
 
     def set_command_text(value: str) -> None:
         command_detail.set(value)
@@ -840,6 +1231,7 @@ def run_bootstrap() -> int:
                 package_detail.set(detail)
                 set_text(package_text, detail)
             if progress is not None:
+                set_detail_bar_indeterminate(False)
                 detail_progress_value.set(progress)
             render_steps()
             window.update_idletasks()
@@ -890,10 +1282,33 @@ def run_bootstrap() -> int:
             if tracker is not None:
                 progress, eta = tracker.record(event)
                 eta_detail.set(eta)
-                detail_progress_value.set(progress)
+                if tracker.installing_started and event.progress_percent != 100:
+                    set_detail_bar_indeterminate(True)
+                else:
+                    set_detail_bar_indeterminate(False)
+                    detail_progress_value.set(progress)
             if event.progress_percent is not None:
-                current_progress = progress if progress is not None else detail_progress_value.get()
-                detail_progress_value.set(max(current_progress, event.progress_percent))
+                if event.progress_percent == 100:
+                    set_detail_bar_indeterminate(False)
+                    detail_progress_value.set(100)
+                elif not (tracker is not None and tracker.installing_started):
+                    current_progress = progress if progress is not None else detail_progress_value.get()
+                    detail_progress_value.set(max(current_progress, event.progress_percent))
+            render_steps()
+
+        window.after(0, apply_event)
+
+    def update_from_model_download(event: PipProgressEvent) -> None:
+        def apply_event() -> None:
+            set_command_text(event.phase)
+            if event.detail:
+                package_detail.set(event.detail)
+                set_text(package_text, event.detail)
+                step_diagnostics[BOOTSTRAP_STEPS[4]].detail = event.detail
+            step_diagnostics[BOOTSTRAP_STEPS[4]].last_output = event.raw_line or event.detail or event.phase
+            if event.progress_percent is not None:
+                set_detail_bar_indeterminate(False)
+                detail_progress_value.set(event.progress_percent)
             render_steps()
 
         window.after(0, apply_event)
@@ -911,6 +1326,7 @@ def run_bootstrap() -> int:
             command_detail.set("")
             set_text(command_text, "")
             eta_detail.set("")
+            set_detail_bar_indeterminate(False)
             detail = f"Launching transcriber in {seconds} seconds..."
             package_detail.set(detail)
             set_text(package_text, detail)
@@ -996,21 +1412,52 @@ def run_bootstrap() -> int:
                 set_step(BOOTSTRAP_STEPS[2], StepState.DONE, "Python packages ready", 100)
                 set_step(BOOTSTRAP_STEPS[3], StepState.DONE, "No install needed", 100)
 
-            important_message(BOOTSTRAP_STEPS[4], "Checking local AI model folders...")
+            important_message(BOOTSTRAP_STEPS[4], "Downloading default local AI models...")
+            set_step(BOOTSTRAP_STEPS[4], StepState.RUNNING, "Downloading default models", 0)
+            try:
+                downloaded = download_default_models(root, update_from_model_download)
+            except Exception as exc:
+                log_path = write_setup_error_log(
+                    root,
+                    BOOTSTRAP_STEPS[4],
+                    f"Model download failed: {exc}",
+                    "",
+                    [str(exc)],
+                )
+                set_step(
+                    BOOTSTRAP_STEPS[4],
+                    StepState.ERROR,
+                    f"Model download failed:\n{exc}\nError details saved to {log_path}",
+                    100,
+                )
+                return
+            model_detail = "Downloaded: " + ", ".join(downloaded) if downloaded else "Default models already present"
+            set_step(BOOTSTRAP_STEPS[4], StepState.DONE, model_detail, 100)
+
+            important_message(BOOTSTRAP_STEPS[5], "Checking local AI model folders...")
             models = model_folder_status(root)
             missing_models = [name for name, value in models.items() if value == BootstrapStatus.MISSING]
             if missing_models:
+                message = missing_model_setup_message(missing_models)
+                log_path = write_setup_error_log(
+                    root,
+                    BOOTSTRAP_STEPS[5],
+                    "Required model files missing after download",
+                    "",
+                    missing_models,
+                )
                 set_step(
-                    BOOTSTRAP_STEPS[4],
-                    StepState.WARNING,
-                    "Model folders still need files:\n" + "\n".join(missing_models),
+                    BOOTSTRAP_STEPS[5],
+                    StepState.ERROR,
+                    f"{message}\n\nError details saved to {log_path}",
                     100,
                 )
+                return
             else:
-                set_step(BOOTSTRAP_STEPS[4], StepState.DONE, "Model folders ready", 100)
+                set_step(BOOTSTRAP_STEPS[5], StepState.DONE, "Model folders ready", 100)
 
-            important_message(BOOTSTRAP_STEPS[5], "Saving setup state and preparing launch...")
-            set_step(BOOTSTRAP_STEPS[5], StepState.DONE, "Setup complete", 100)
+            important_message(BOOTSTRAP_STEPS[6], "Saving setup state and preparing launch...")
+            set_step(BOOTSTRAP_STEPS[6], StepState.DONE, "Setup complete", 100)
             window.after(0, finish_with_launch_countdown)
         except Exception as exc:
             log_path = write_setup_error_log(root, current_step, f"Setup failed: {exc}")
@@ -1020,27 +1467,32 @@ def run_bootstrap() -> int:
             )
 
     def start_flow() -> None:
+        for child in install_button_row.winfo_children():
+            child.config(state="disabled")
+        install_frame.pack_forget()
+        progress_frame.pack(fill="both", expand=True)
+        set_text(command_text, "")
+        set_text(package_text, "")
+        detail_progress_value.set(0)
+        eta_detail.set("")
+        set_detail_bar_indeterminate(False)
+        render_steps()
         for child in button_row.winfo_children():
             child.config(state="disabled")
         for child in model_button_row.winfo_children():
             child.config(state="disabled")
         threading.Thread(target=run_setup_flow, daemon=True).start()
 
-    install_button = tk.Button(button_row, text="Start setup", command=start_flow)
-    install_button.pack(side="left", padx=(0, 8))
-    tk.Button(button_row, text="Open model folder", command=open_model_folder).pack(side="left", padx=(0, 8))
-    tk.Button(button_row, text="Launch GUI", command=launch_if_ready).pack(side="right")
-    for model in MODEL_DIRS:
-        tk.Button(model_button_row, text=f"Set {model}", command=lambda name=model: choose_model_folder(name)).pack(
-            side="left", padx=(0, 8)
-        )
+    cancel_button = tk.Button(install_button_row, text="Cancel", width=14, command=window.destroy)
+    cancel_button.pack(side="right", padx=(0, 20))
+    install_button = tk.Button(install_button_row, text="Install", width=14, command=start_flow)
+    install_button.pack(side="right", padx=(0, 8))
 
     set_text(command_text, command_detail.get())
-    set_text(package_text, package_detail.get())
+    set_text(package_text, "")
 
     render_steps()
     tick_spinner()
-    window.after(400, start_flow)
     window.mainloop()
     return 0
 

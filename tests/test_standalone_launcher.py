@@ -41,6 +41,26 @@ class StandaloneLauncherTests(unittest.TestCase):
 
         self.assertEqual(actual, expected)
 
+    def test_launcher_sets_log_root_to_copied_file_folder(self):
+        content = LAUNCHER_PATH.read_text(encoding="utf-8")
+
+        self.assertIn('os.environ["LOCAL_WHISPER_LOG_ROOT"] = str(launcher_path.parent)', content)
+
+    def test_launcher_does_not_force_huggingface_offline_before_bootstrap(self):
+        content = LAUNCHER_PATH.read_text(encoding="utf-8")
+        before_import = content.split("from bootstrap_launcher import run_bootstrap", maxsplit=1)[0]
+
+        self.assertNotIn("HF_HUB_OFFLINE", before_import)
+        self.assertNotIn("TRANSFORMERS_OFFLINE", before_import)
+        self.assertNotIn("HF_DATASETS_OFFLINE", before_import)
+
+    def test_runtime_launch_still_forces_huggingface_offline(self):
+        content = (PROJECT_ROOT / "app" / "bootstrap_launcher.py").read_text(encoding="utf-8")
+
+        self.assertIn('os.environ.setdefault("HF_HUB_OFFLINE", "1")', content)
+        self.assertIn('os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")', content)
+        self.assertIn('os.environ.setdefault("HF_DATASETS_OFFLINE", "1")', content)
+
     def test_init_only_extracts_beside_copied_launcher(self):
         with tempfile.TemporaryDirectory() as tmp:
             folder = Path(tmp)
@@ -62,6 +82,7 @@ class StandaloneLauncherTests(unittest.TestCase):
             self.assertTrue((app_root / "resources" / "requirements.txt").is_file())
             self.assertTrue((app_root / "config.json").is_file())
             self.assertTrue((app_root / "models" / "faster-whisper").is_dir())
+            self.assertTrue((app_root / "models" / "speechbrain-ecapa").is_dir())
             self.assertTrue((app_root / "transcripts").is_dir())
 
     def test_init_only_uses_current_folder_when_named_like_app(self):

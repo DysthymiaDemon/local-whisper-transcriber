@@ -16,6 +16,7 @@ ERROR_LOG_FILE_NAME = "error_log.txt"
 APP_FOLDER_NAME = "OfflineMeetingTranscriber"
 ENV_APP_ROOT = "LOCAL_WHISPER_APP_ROOT"
 ENV_SOURCE_ROOT = "LOCAL_WHISPER_SOURCE_ROOT"
+ENV_LOG_ROOT = "LOCAL_WHISPER_LOG_ROOT"
 
 
 def source_root() -> Path:
@@ -54,11 +55,23 @@ def application_root() -> Path:
     return default_local_app_root()
 
 
+def error_log_root(app_root: Path | None = None) -> Path:
+    configured = os.environ.get(ENV_LOG_ROOT)
+    if configured:
+        return Path(configured).expanduser().resolve()
+    if app_root is not None and app_root.name.lower() == APP_FOLDER_NAME.lower():
+        return app_root.parent.resolve()
+    return application_root()
+
+
 def default_portable_config(root: Path | None = None) -> EngineConfig:
     app_root = (root or application_root()).resolve()
     models_root = app_root / "models"
     return EngineConfig(
         whisper_model_dir=str(models_root / "faster-whisper"),
+        diarization_backend="local-ecapa",
+        speaker_embedding_model_dir=str(models_root / "speechbrain-ecapa"),
+        speaker_cluster_distance_threshold=0.55,
         pyannote_pipeline_dir=str(models_root / "pyannote-pipeline"),
         pyannote_embedding_model_dir=str(models_root / "pyannote-embedding"),
         output_file=str(app_root / "transcripts" / "meeting_transcript.txt"),
@@ -81,6 +94,7 @@ def load_portable_config(root: Path | None = None) -> EngineConfig:
     overrides: dict[str, Any] = {key: value for key, value in raw.items() if key in allowed}
     for key in (
         "whisper_model_dir",
+        "speaker_embedding_model_dir",
         "pyannote_pipeline_dir",
         "pyannote_embedding_model_dir",
         "output_file",
@@ -98,8 +112,9 @@ def append_error_log(
     details: Mapping[str, Any] | Iterable[str] | str | None = None,
 ) -> Path:
     app_root = Path(root).expanduser().resolve() if root else application_root()
-    app_root.mkdir(parents=True, exist_ok=True)
-    log_path = app_root / ERROR_LOG_FILE_NAME
+    log_root = error_log_root(app_root)
+    log_root.mkdir(parents=True, exist_ok=True)
+    log_path = log_root / ERROR_LOG_FILE_NAME
 
     lines = [
         "=" * 72,

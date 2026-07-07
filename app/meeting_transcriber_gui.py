@@ -3,10 +3,11 @@ from __future__ import annotations
 import sys
 import threading
 from typing import Any
-import warnings
 
 from app_config import append_error_log, application_root, load_portable_config
 from transcriber_engine import (
+    DIARIZATION_BACKEND_LOCAL_ECAPA,
+    DIARIZATION_BACKEND_PYANNOTE,
     EngineConfig,
     MeetingTranscriberEngine,
     TranscriptRow,
@@ -17,6 +18,8 @@ from transcriber_engine import (
 
 PORTABLE_DEFAULTS = load_portable_config()
 WHISPER_MODEL_DIR = PORTABLE_DEFAULTS.whisper_model_dir
+DIARIZATION_BACKEND = PORTABLE_DEFAULTS.diarization_backend
+SPEAKER_EMBEDDING_MODEL_DIR = PORTABLE_DEFAULTS.speaker_embedding_model_dir
 PYANNOTE_PIPELINE_DIR = PORTABLE_DEFAULTS.pyannote_pipeline_dir
 PYANNOTE_EMBEDDING_MODEL_DIR = PORTABLE_DEFAULTS.pyannote_embedding_model_dir
 OUTPUT_FILE = PORTABLE_DEFAULTS.output_file
@@ -24,17 +27,6 @@ SAMPLE_RATE = PORTABLE_DEFAULTS.sample_rate
 CHUNK_SECONDS = PORTABLE_DEFAULTS.chunk_seconds
 OVERLAP_SECONDS = PORTABLE_DEFAULTS.overlap_seconds
 COMPUTE_TYPE = PORTABLE_DEFAULTS.compute_type
-
-
-DIARIZATION_IMPORT_WARNING = ""
-with warnings.catch_warnings():
-    warnings.simplefilter("ignore")
-    try:
-        # Import before PySide6 to avoid a shiboken/six import-hook conflict
-        # seen on locked-down Windows Python installs.
-        import pyannote.audio  # noqa: F401
-    except Exception as exc:  # pragma: no cover - depends on local deps
-        DIARIZATION_IMPORT_WARNING = str(exc)
 
 
 try:
@@ -132,8 +124,6 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._load_devices()
         self._set_running(False)
-        if DIARIZATION_IMPORT_WARNING:
-            self._append_log(f"Diarization stack unavailable: {DIARIZATION_IMPORT_WARNING}")
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -187,6 +177,12 @@ class MainWindow(QMainWindow):
         settings_layout = QFormLayout(settings)
         self.device_combo = QComboBox()
         self.whisper_path = QLineEdit(WHISPER_MODEL_DIR)
+        self.backend_combo = QComboBox()
+        self.backend_combo.addItem("Local ECAPA (one-touch default)", DIARIZATION_BACKEND_LOCAL_ECAPA)
+        self.backend_combo.addItem("Pyannote advanced", DIARIZATION_BACKEND_PYANNOTE)
+        backend_index = self.backend_combo.findData(DIARIZATION_BACKEND)
+        self.backend_combo.setCurrentIndex(max(0, backend_index))
+        self.speaker_model_path = QLineEdit(SPEAKER_EMBEDDING_MODEL_DIR)
         self.pyannote_path = QLineEdit(PYANNOTE_PIPELINE_DIR)
         self.embedding_path = QLineEdit(PYANNOTE_EMBEDDING_MODEL_DIR)
         self.output_path = QLineEdit(OUTPUT_FILE)
@@ -199,11 +195,19 @@ class MainWindow(QMainWindow):
 
         settings_layout.addRow("Microphone", self.device_combo)
         settings_layout.addRow("Whisper", self._path_row(self.whisper_path, folder=True))
-        settings_layout.addRow("Pyannote", self._path_row(self.pyannote_path, folder=True))
-        settings_layout.addRow("Embedding", self._path_row(self.embedding_path, folder=True))
+        settings_layout.addRow("Diarization", self.backend_combo)
+        settings_layout.addRow("Speaker model", self._path_row(self.speaker_model_path, folder=True))
+        self.pyannote_label = QLabel("Pyannote")
+        self.pyannote_row = self._path_row(self.pyannote_path, folder=True)
+        self.pyannote_embedding_label = QLabel("Pyannote embedding")
+        self.pyannote_embedding_row = self._path_row(self.embedding_path, folder=True)
+        settings_layout.addRow(self.pyannote_label, self.pyannote_row)
+        settings_layout.addRow(self.pyannote_embedding_label, self.pyannote_embedding_row)
         settings_layout.addRow("Output", self._path_row(self.output_path, folder=False))
         settings_layout.addRow("Chunk seconds", self.chunk_seconds)
         settings_layout.addRow("Overlap seconds", self.overlap_seconds)
+        self.backend_combo.currentIndexChanged.connect(self._toggle_backend_fields)
+        self._toggle_backend_fields()
         top.addWidget(settings, 1, 1)
 
         speakers = QGroupBox("Speakers")
@@ -260,6 +264,9 @@ class MainWindow(QMainWindow):
     def _read_config(self) -> EngineConfig:
         return EngineConfig(
             whisper_model_dir=self.whisper_path.text().strip(),
+            diarization_backend=str(self.backend_combo.currentData() or DIARIZATION_BACKEND_LOCAL_ECAPA),
+            speaker_embedding_model_dir=self.speaker_model_path.text().strip(),
+            speaker_cluster_distance_threshold=PORTABLE_DEFAULTS.speaker_cluster_distance_threshold,
             pyannote_pipeline_dir=self.pyannote_path.text().strip(),
             pyannote_embedding_model_dir=self.embedding_path.text().strip(),
             output_file=self.output_path.text().strip(),
@@ -269,6 +276,16 @@ class MainWindow(QMainWindow):
             compute_type=COMPUTE_TYPE,
             input_device=self.device_combo.currentData(),
         )
+
+    def _toggle_backend_fields(self) -> None:
+        pyannote_selected = self.backend_combo.currentData() == DIARIZATION_BACKEND_PYANNOTE
+        for widget in (
+            self.pyannote_label,
+            self.pyannote_row,
+            self.pyannote_embedding_label,
+            self.pyannote_embedding_row,
+        ):
+            widget.setVisible(pyannote_selected)
 
     def _start_recording(self) -> None:
         config = self._read_config()
@@ -395,6 +412,8 @@ class MainWindow(QMainWindow):
         for widget in (
             self.device_combo,
             self.whisper_path,
+            self.backend_combo,
+            self.speaker_model_path,
             self.pyannote_path,
             self.embedding_path,
             self.output_path,

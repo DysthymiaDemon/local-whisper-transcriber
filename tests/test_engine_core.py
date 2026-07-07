@@ -8,12 +8,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 from transcriber_engine import (
     AtomicTranscriptWriter,
+    AudioChunk,
     DiarizationTurn,
     DuplicateSuppressor,
     EngineConfig,
     InputBlockBuffer,
     SpeakerRegistry,
+    TranscriptRow,
     TranscriptStore,
+    cluster_local_embeddings,
+    extract_row_audio_window,
 )
 
 
@@ -128,6 +132,42 @@ class DuplicateSuppressorTests(unittest.TestCase):
         self.assertFalse(suppressor.is_duplicate(13.1, "Confirm the deadline."))
 
 
+class LocalDiarizationHelperTests(unittest.TestCase):
+    def test_cluster_local_embeddings_groups_similar_vectors(self):
+        labels = cluster_local_embeddings(
+            [
+                [1.0, 0.0, 0.0],
+                [0.98, 0.02, 0.0],
+                [0.0, 1.0, 0.0],
+            ],
+            distance_threshold=0.20,
+        )
+
+        self.assertEqual(labels[0], labels[1])
+        self.assertNotEqual(labels[0], labels[2])
+
+    def test_short_transcript_segment_is_padded_for_embedding(self):
+        import numpy as np
+
+        chunk = AudioChunk(
+            index=1,
+            start_time=0.0,
+            samples=np.ones(16000, dtype=np.float32),
+            sample_rate=16000,
+        )
+        row = TranscriptRow(
+            id="row_1",
+            chunk_index=1,
+            start=0.10,
+            end=0.20,
+            text="Yes.",
+        )
+
+        window = extract_row_audio_window(chunk, row, target_seconds=1.0)
+
+        self.assertEqual(len(window), 16000)
+
+
 class AtomicTranscriptWriterTests(unittest.TestCase):
     def test_refresh_writes_latest_labels_atomically(self):
         registry = SpeakerRegistry()
@@ -164,39 +204,54 @@ class EngineConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             config = EngineConfig(
                 whisper_model_dir=os.path.join(tmp, "missing-whisper"),
-                pyannote_pipeline_dir=os.path.join(tmp, "missing-pipeline"),
-                pyannote_embedding_model_dir=os.path.join(tmp, "missing-embedding"),
+                speaker_embedding_model_dir=os.path.join(tmp, "missing-speaker"),
                 output_file=os.path.join(tmp, "out.txt"),
             )
 
             errors = config.validate()
 
         self.assertIn("Whisper model path does not exist", "\n".join(errors))
-        self.assertIn("Pyannote pipeline path does not exist", "\n".join(errors))
-        self.assertIn("Pyannote embedding model path does not exist", "\n".join(errors))
+        self.assertIn("Speaker embedding model path does not exist", "\n".join(errors))
+        self.assertNotIn("Pyannote pipeline path does not exist", "\n".join(errors))
 
     def test_empty_model_folders_return_incomplete_validation_errors(self):
         with tempfile.TemporaryDirectory() as tmp:
             whisper = os.path.join(tmp, "whisper")
-            pipeline = os.path.join(tmp, "pipeline")
-            embedding = os.path.join(tmp, "embedding")
+            speaker = os.path.join(tmp, "speaker")
             os.mkdir(whisper)
-            os.mkdir(pipeline)
-            os.mkdir(embedding)
+            os.mkdir(speaker)
             config = EngineConfig(
                 whisper_model_dir=whisper,
-                pyannote_pipeline_dir=pipeline,
-                pyannote_embedding_model_dir=embedding,
+                speaker_embedding_model_dir=speaker,
                 output_file=os.path.join(tmp, "out.txt"),
             )
 
             errors = "\n".join(config.validate())
 
         self.assertIn("Whisper model is incomplete: expected model.bin", errors)
-        self.assertIn("Pyannote pipeline is incomplete: expected config.yaml", errors)
-        self.assertIn("Pyannote embedding model is incomplete", errors)
+        self.assertIn("Speaker embedding model is incomplete", errors)
+        self.assertNotIn("Pyannote", errors)
 
     def test_minimal_required_model_files_pass_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            whisper = os.path.join(tmp, "whisper")
+            speaker = os.path.join(tmp, "speaker")
+            os.mkdir(whisper)
+            os.mkdir(speaker)
+            open(os.path.join(whisper, "model.bin"), "wb").close()
+            open(os.path.join(speaker, "hyperparams.yaml"), "w", encoding="utf-8").close()
+            open(os.path.join(speaker, "embedding_model.ckpt"), "wb").close()
+            config = EngineConfig(
+                whisper_model_dir=whisper,
+                speaker_embedding_model_dir=speaker,
+                output_file=os.path.join(tmp, "out.txt"),
+            )
+
+            errors = config.validate()
+
+        self.assertEqual(errors, [])
+
+    def test_pyannote_backend_validates_pyannote_model_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             whisper = os.path.join(tmp, "whisper")
             pipeline = os.path.join(tmp, "pipeline")
@@ -209,6 +264,7 @@ class EngineConfigTests(unittest.TestCase):
             open(os.path.join(embedding, "config.yaml"), "w", encoding="utf-8").close()
             open(os.path.join(embedding, "pytorch_model.bin"), "wb").close()
             config = EngineConfig(
+                diarization_backend="pyannote",
                 whisper_model_dir=whisper,
                 pyannote_pipeline_dir=pipeline,
                 pyannote_embedding_model_dir=embedding,

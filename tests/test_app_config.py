@@ -7,7 +7,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
-from app_config import ENV_APP_ROOT, append_error_log, default_local_app_root, default_portable_config, load_portable_config
+from app_config import (
+    ENV_APP_ROOT,
+    ENV_LOG_ROOT,
+    append_error_log,
+    default_local_app_root,
+    default_portable_config,
+    load_portable_config,
+)
 
 
 class PortableConfigTests(unittest.TestCase):
@@ -26,6 +33,44 @@ class PortableConfigTests(unittest.TestCase):
         self.assertIn("message: Missing model files", content)
         self.assertIn("model.bin missing", content)
         self.assertIn("python -m pip", content)
+
+    def test_append_error_log_uses_launcher_folder_when_configured(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            launcher_root = Path(tmp)
+            app_root = launcher_root / "OfflineMeetingTranscriber"
+            app_root.mkdir()
+            previous = os.environ.get(ENV_LOG_ROOT)
+            os.environ[ENV_LOG_ROOT] = str(launcher_root)
+            try:
+                log_path = append_error_log(app_root, "Setup failed", "pip failed")
+            finally:
+                if previous is None:
+                    os.environ.pop(ENV_LOG_ROOT, None)
+                else:
+                    os.environ[ENV_LOG_ROOT] = previous
+            content = log_path.read_text(encoding="utf-8")
+
+        self.assertEqual(log_path, launcher_root / "error_log.txt")
+        self.assertIn(f"app_root: {app_root.resolve()}", content)
+        self.assertFalse((app_root / "error_log.txt").exists())
+
+    def test_append_error_log_uses_parent_for_portable_app_root_without_env(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            launcher_root = Path(tmp)
+            app_root = launcher_root / "OfflineMeetingTranscriber"
+            app_root.mkdir()
+            previous = os.environ.get(ENV_LOG_ROOT)
+            os.environ.pop(ENV_LOG_ROOT, None)
+            try:
+                log_path = append_error_log(app_root, "Configuration error", "Missing models")
+            finally:
+                if previous is not None:
+                    os.environ[ENV_LOG_ROOT] = previous
+            content = log_path.read_text(encoding="utf-8")
+
+        self.assertEqual(log_path, launcher_root / "error_log.txt")
+        self.assertIn("context: Configuration error", content)
+        self.assertFalse((app_root / "error_log.txt").exists())
 
     def test_default_local_app_root_can_be_overridden(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -48,6 +93,8 @@ class PortableConfigTests(unittest.TestCase):
             config = default_portable_config(root)
 
         self.assertEqual(config.whisper_model_dir, os.path.join(tmp, "models", "faster-whisper"))
+        self.assertEqual(config.diarization_backend, "local-ecapa")
+        self.assertEqual(config.speaker_embedding_model_dir, os.path.join(tmp, "models", "speechbrain-ecapa"))
         self.assertEqual(config.pyannote_pipeline_dir, os.path.join(tmp, "models", "pyannote-pipeline"))
         self.assertEqual(config.pyannote_embedding_model_dir, os.path.join(tmp, "models", "pyannote-embedding"))
         self.assertEqual(config.output_file, os.path.join(tmp, "transcripts", "meeting_transcript.txt"))
@@ -80,6 +127,7 @@ class PortableConfigTests(unittest.TestCase):
                 json.dumps(
                     {
                         "whisper_model_dir": "custom/whisper",
+                        "speaker_embedding_model_dir": "custom/speaker",
                         "pyannote_pipeline_dir": "custom/pipeline",
                         "pyannote_embedding_model_dir": "custom/embedding",
                         "output_file": "custom-output/transcript.txt",
@@ -91,6 +139,7 @@ class PortableConfigTests(unittest.TestCase):
             config = load_portable_config(root)
 
         self.assertEqual(config.whisper_model_dir, os.path.join(tmp, "custom", "whisper"))
+        self.assertEqual(config.speaker_embedding_model_dir, os.path.join(tmp, "custom", "speaker"))
         self.assertEqual(config.pyannote_pipeline_dir, os.path.join(tmp, "custom", "pipeline"))
         self.assertEqual(config.pyannote_embedding_model_dir, os.path.join(tmp, "custom", "embedding"))
         self.assertEqual(config.output_file, os.path.join(tmp, "custom-output", "transcript.txt"))
