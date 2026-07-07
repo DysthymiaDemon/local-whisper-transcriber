@@ -470,12 +470,15 @@ class BootstrapLauncherTests(unittest.TestCase):
             ):
                 os.environ.pop("REQUESTS_CA_BUNDLE", None)
                 os.environ.pop("SSL_CERT_FILE", None)
+                os.environ.pop("CURL_CA_BUNDLE", None)
                 with online_huggingface_download_env(app_root):
                     self.assertIsNone(os.environ.get("HF_HUB_OFFLINE"))
                     self.assertEqual(os.environ["REQUESTS_CA_BUNDLE"], str(bundle.resolve()))
                     self.assertEqual(os.environ["SSL_CERT_FILE"], str(bundle.resolve()))
+                    self.assertEqual(os.environ["CURL_CA_BUNDLE"], str(bundle.resolve()))
                 self.assertNotIn("REQUESTS_CA_BUNDLE", os.environ)
                 self.assertNotIn("SSL_CERT_FILE", os.environ)
+                self.assertNotIn("CURL_CA_BUNDLE", os.environ)
 
     def test_online_download_env_preserves_existing_ca_bundle(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -497,6 +500,114 @@ class BootstrapLauncherTests(unittest.TestCase):
                 with online_huggingface_download_env(app_root):
                     self.assertEqual(os.environ["REQUESTS_CA_BUNDLE"], str(existing))
                     self.assertEqual(os.environ["SSL_CERT_FILE"], str(existing))
+
+    def test_online_download_env_prefers_local_whisper_ca_bundle_over_generated_bundle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            explicit = Path(tmp) / "explicit.pem"
+            explicit.write_text("explicit", encoding="utf-8")
+            root = Path(tmp) / "OfflineMeetingTranscriber"
+            root.mkdir()
+
+            with patch.dict(os.environ, {CA_BUNDLE_ENV: str(explicit)}, clear=False):
+                for name in ("REQUESTS_CA_BUNDLE", "SSL_CERT_FILE", "CURL_CA_BUNDLE"):
+                    os.environ.pop(name, None)
+                with patch.object(bootstrap_launcher_module, "ensure_windows_ca_bundle") as generated:
+                    with online_huggingface_download_env(root):
+                        self.assertEqual(os.environ["REQUESTS_CA_BUNDLE"], str(explicit.resolve()))
+                        self.assertEqual(os.environ["SSL_CERT_FILE"], str(explicit.resolve()))
+                        self.assertEqual(os.environ["CURL_CA_BUNDLE"], str(explicit.resolve()))
+                    generated.assert_not_called()
+
+    def test_build_windows_ca_bundle_appends_windows_certs_to_certifi_pem(self):
+        der_one = b"root-cert"
+        der_two = b"ca-cert"
+        calls = []
+
+        def fake_enum_certificates(store_name):
+            calls.append(store_name)
+            if store_name == "ROOT":
+                return [(der_one, "x509_asn", True), (b"ignored", "pkcs_7_asn", True)]
+            if store_name == "CA":
+                return [(der_two, "x509_asn", True), (der_one, "x509_asn", True)]
+            return []
+
+        def fake_der_to_pem(cert_bytes):
+            return f"-----BEGIN CERTIFICATE-----\n{cert_bytes.decode('ascii')}\n-----END CERTIFICATE-----\n"
+
+        pem = bootstrap_launcher_module.build_windows_ca_bundle_pem(
+            "CERTIFI\n",
+            enum_certificates=fake_enum_certificates,
+            der_to_pem=fake_der_to_pem,
+        )
+
+        self.assertEqual(calls, ["ROOT", "CA"])
+        self.assertTrue(pem.startswith("CERTIFI\n"))
+        self.assertIn("root-cert", pem)
+        self.assertIn("ca-cert", pem)
+        self.assertEqual(pem.count("root-cert"), 1)
+        self.assertNotIn("ignored", pem)
+
+    def test_online_download_env_generates_windows_bundle_when_no_user_bundle_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            certifi_bundle = root / "certifi.pem"
+            certifi_bundle.write_text("CERTIFI\n", encoding="utf-8")
+
+            with patch.dict(os.environ, {}, clear=False):
+                for name in ("REQUESTS_CA_BUNDLE", "SSL_CERT_FILE", "CURL_CA_BUNDLE", "LOCAL_WHISPER_CA_BUNDLE"):
+                    os.environ.pop(name, None)
+
+                with patch.object(bootstrap_launcher_module, "read_certifi_bundle_pem", return_value="CERTIFI\n"):
+                    with patch.object(
+                        bootstrap_launcher_module,
+                        "build_windows_ca_bundle_pem",
+                        return_value="CERTIFI\nWINDOWS\n",
+                    ):
+                        with online_huggingface_download_env(root):
+                            bundle = local_runtime_dir(root) / "windows-ca-bundle.pem"
+                            self.assertEqual(os.environ["REQUESTS_CA_BUNDLE"], str(bundle))
+                            self.assertEqual(os.environ["SSL_CERT_FILE"], str(bundle))
+                            self.assertEqual(os.environ["CURL_CA_BUNDLE"], str(bundle))
+                            self.assertIn("WINDOWS", bundle.read_text(encoding="utf-8"))
+
+                self.assertNotIn("REQUESTS_CA_BUNDLE", os.environ)
+                self.assertNotIn("SSL_CERT_FILE", os.environ)
+                self.assertNotIn("CURL_CA_BUNDLE", os.environ)
+
+    def test_fetch_model_repo_size_configures_tls_before_huggingface_import(self):
+        calls = []
+        fake_hf_module = types.ModuleType("huggingface_hub")
+
+        class FakeSibling:
+            size = 123
+
+        class FakeInfo:
+            siblings = [FakeSibling()]
+
+        class FakeHfApi:
+            def model_info(self, repo_id, files_metadata=False):
+                calls.append(("model_info", repo_id, files_metadata))
+                return FakeInfo()
+
+        fake_hf_module.HfApi = FakeHfApi
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(sys.modules, {"huggingface_hub": fake_hf_module}):
+                with patch.object(bootstrap_launcher_module, "configure_download_tls") as configure_tls:
+                    result = bootstrap_launcher_module.fetch_model_repo_size("org/model", Path(tmp))
+
+        self.assertEqual(result, 123)
+        configure_tls.assert_called_once_with(Path(tmp))
+        self.assertEqual(calls, [("model_info", "org/model", True)])
+
+    def test_certificate_verify_failure_gets_corporate_https_error_message(self):
+        message = bootstrap_launcher_module.setup_error_card_message(
+            "HTTPSConnectionPool failed: CERTIFICATE_VERIFY_FAILED unable to get local issuer certificate"
+        )
+
+        self.assertIn("corporate network is intercepting HTTPS", message)
+        self.assertIn("company-ca.pem", message)
+        self.assertIn("Retry", message)
 
     def test_online_download_env_injects_windows_truststore_when_available(self):
         fake_truststore = types.ModuleType("truststore")
@@ -772,9 +883,23 @@ class BootstrapLauncherTests(unittest.TestCase):
         self.assertIn('text="Retry this step"', source)
         self.assertIn('text="Copy details"', source)
         self.assertIn('text="Open error_log.txt"', source)
-        self.assertIn('text="Show details"', source)
+        self.assertIn('text="Show install log"', source)
+        self.assertIn('text="Hide install log"', source)
         self.assertIn('text="Launch now"', source)
         self.assertIn("messagebox.askyesno", source)
+        self.assertIn("details_frame.pack_forget()", source)
+        self.assertIn("before=button_row", source)
+
+    def test_confirm_screen_uses_fixed_footer_not_overlapping_content(self):
+        source = (Path(__file__).resolve().parents[1] / "app" / "bootstrap_launcher.py").read_text(encoding="utf-8")
+
+        self.assertIn('window.geometry("860x680")', source)
+        self.assertIn("window.minsize(820, 650)", source)
+        self.assertIn('install_button_row.pack(side="bottom"', source)
+        self.assertNotIn("install_button_row.place(", source)
+        self.assertNotIn("install_canvas = tk.Canvas", source)
+        self.assertNotIn("install_content_window", source)
+        self.assertIn("before=models_title", source)
 
     def test_write_setup_error_log_records_command_and_recent_output(self):
         with tempfile.TemporaryDirectory() as tmp:

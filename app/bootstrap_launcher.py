@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 import threading
@@ -78,8 +79,9 @@ APP_VERSION = "local"
 HF_OFFLINE_ENV_VARS = ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE")
 HF_PROGRESS_ENV_VARS = ("HF_HUB_DISABLE_PROGRESS_BARS",)
 CA_BUNDLE_ENV = "LOCAL_WHISPER_CA_BUNDLE"
-TLS_CERT_ENV_VARS = ("REQUESTS_CA_BUNDLE", "SSL_CERT_FILE")
+TLS_CERT_ENV_VARS = ("REQUESTS_CA_BUNDLE", "SSL_CERT_FILE", "CURL_CA_BUNDLE")
 CA_BUNDLE_FILENAMES = ("company-ca.pem", "corporate-ca.pem", "ca-bundle.pem")
+WINDOWS_CA_BUNDLE_NAME = "windows-ca-bundle.pem"
 INSTALL_LOG_FILE_NAME = "install_log.txt"
 SETUP_PROGRESS_STYLE = "Setup.Horizontal.TProgressbar"
 DETAIL_PROGRESS_STYLE = "Detail.Horizontal.TProgressbar"
@@ -305,8 +307,9 @@ def model_info_total_size(info: Any) -> int | None:
     return total if found else None
 
 
-def fetch_model_repo_size(repo_id: str) -> int | None:
+def fetch_model_repo_size(repo_id: str, root: Path | None = None) -> int | None:
     try:
+        configure_download_tls(root)
         from huggingface_hub import HfApi
 
         info = HfApi().model_info(repo_id, files_metadata=True)
@@ -315,8 +318,11 @@ def fetch_model_repo_size(repo_id: str) -> int | None:
     return model_info_total_size(info)
 
 
-def estimate_model_download_sizes(specs: tuple[ModelDownloadSpec, ...] = DEFAULT_MODEL_DOWNLOADS) -> dict[str, int | None]:
-    return {spec.name: fetch_model_repo_size(spec.repo_id) for spec in specs}
+def estimate_model_download_sizes(
+    specs: tuple[ModelDownloadSpec, ...] = DEFAULT_MODEL_DOWNLOADS,
+    root: Path | None = None,
+) -> dict[str, int | None]:
+    return {spec.name: fetch_model_repo_size(spec.repo_id, root) for spec in specs}
 
 
 def total_known_size(sizes: Mapping[str, int | None]) -> int | None:
@@ -844,6 +850,20 @@ def missing_model_setup_message(missing_models: list[str]) -> str:
     )
 
 
+def setup_error_card_message(message: str) -> str:
+    if "CERTIFICATE_VERIFY_FAILED" in message.upper():
+        return (
+            "Your corporate network is intercepting HTTPS, so the model download certificate cannot be verified.\n\n"
+            "Fix: export your proxy/root CA certificate, save it as company-ca.pem beside the launcher, "
+            "then click Retry this step."
+        )
+    for line in message.splitlines():
+        cleaned = line.strip()
+        if cleaned:
+            return cleaned
+    return "Setup failed. See details below."
+
+
 def find_local_ca_bundle(root: Path | None = None) -> Path | None:
     configured = os.environ.get(CA_BUNDLE_ENV)
     if configured:
@@ -869,6 +889,60 @@ def find_local_ca_bundle(root: Path | None = None) -> Path | None:
     return None
 
 
+def read_certifi_bundle_pem() -> str:
+    try:
+        import certifi
+
+        return Path(certifi.where()).read_text(encoding="utf-8")
+    except Exception:
+        return ""
+
+
+def build_windows_ca_bundle_pem(
+    base_pem: str,
+    enum_certificates: Callable[[str], Iterable[tuple[bytes, str, Any]]] | None = None,
+    der_to_pem: Callable[[bytes], str] | None = None,
+) -> str:
+    enum_certificates = enum_certificates or getattr(ssl, "enum_certificates", None)
+    der_to_pem = der_to_pem or ssl.DER_cert_to_PEM_cert
+    if enum_certificates is None:
+        return base_pem
+
+    parts: list[str] = [base_pem.rstrip(), ""]
+    seen: set[str] = set()
+    for store_name in ("ROOT", "CA"):
+        try:
+            certificates = enum_certificates(store_name)
+        except Exception:
+            continue
+        for cert_bytes, encoding, _trust in certificates:
+            if encoding != "x509_asn":
+                continue
+            try:
+                pem = der_to_pem(cert_bytes).strip()
+            except Exception:
+                continue
+            if pem and pem not in seen:
+                seen.add(pem)
+                parts.append(pem)
+    return "\n".join(part for part in parts if part) + "\n"
+
+
+def ensure_windows_ca_bundle(root: Path | None = None) -> Path | None:
+    if root is None:
+        return None
+    base_pem = read_certifi_bundle_pem()
+    combined_pem = build_windows_ca_bundle_pem(base_pem)
+    if not combined_pem.strip():
+        return None
+    bundle = local_runtime_dir(root) / WINDOWS_CA_BUNDLE_NAME
+    bundle.parent.mkdir(parents=True, exist_ok=True)
+    current = bundle.read_text(encoding="utf-8") if bundle.exists() else None
+    if current != combined_pem:
+        bundle.write_text(combined_pem, encoding="utf-8")
+    return bundle
+
+
 def configure_download_tls(root: Path | None = None) -> None:
     try:
         import truststore
@@ -878,6 +952,8 @@ def configure_download_tls(root: Path | None = None) -> None:
         pass
 
     bundle = find_local_ca_bundle(root)
+    if bundle is None:
+        bundle = ensure_windows_ca_bundle(root)
     if bundle is None:
         return
     for name in TLS_CERT_ENV_VARS:
@@ -1110,7 +1186,7 @@ def download_default_models(root: Path, on_event, downloader: Callable[..., str]
         on_event(PipProgressEvent("Downloading model", detail, base_progress, detail))
         staging = prepare_model_download_staging_dir(root, spec)
         end_progress = int((index / total) * 100)
-        total_bytes = fetch_model_repo_size(spec.repo_id)
+        total_bytes = fetch_model_repo_size(spec.repo_id, root)
         if total_bytes:
             size_detail = f"{spec.repo_id} download size: {format_bytes(total_bytes)}"
             on_event(PipProgressEvent("Model size", size_detail, base_progress, size_detail))
@@ -1295,6 +1371,7 @@ def needs_setup(root: Path, required: Mapping[str, str] = REQUIRED_IMPORTS) -> b
 def run_bootstrap() -> int:
     root = runtime_root()
     package_root = installer_source_root()
+    configure_download_tls(root)
     splash = None
     splash_status = None
     try:
@@ -1332,8 +1409,8 @@ def run_bootstrap() -> int:
 
     window = tk.Tk()
     window.title("Offline Meeting Transcriber Setup")
-    window.geometry("860x560")
-    window.minsize(820, 540)
+    window.geometry("860x680")
+    window.minsize(820, 650)
     window.resizable(False, False)
     window.configure(bg="#f7f7f7")
 
@@ -1427,8 +1504,14 @@ def run_bootstrap() -> int:
     install_frame = tk.Frame(detail_frame, bg="#ffffff")
     install_frame.pack(fill="both", expand=True)
 
+    install_button_row = tk.Frame(install_frame, bg="#ffffff")
+    install_button_row.pack(side="bottom", fill="x", padx=20, pady=(8, 16))
+
+    install_content = tk.Frame(install_frame, bg="#ffffff")
+    install_content.pack(side="top", fill="both", expand=True)
+
     install_title = tk.Label(
-        install_frame,
+        install_content,
         text="Install Offline Meeting Transcriber?",
         font=("Segoe UI", 16, "bold"),
         anchor="w",
@@ -1438,7 +1521,7 @@ def run_bootstrap() -> int:
     install_title.pack(fill="x", padx=20, pady=(14, 4))
 
     app_type = tk.Label(
-        install_frame,
+        install_content,
         text="Local Windows App",
         font=("Segoe UI", 10),
         anchor="w",
@@ -1448,7 +1531,7 @@ def run_bootstrap() -> int:
     app_type.pack(fill="x", padx=20)
 
     publisher = tk.Label(
-        install_frame,
+        install_content,
         text=f"Publisher: {APP_PUBLISHER}",
         font=("Segoe UI", 10),
         anchor="w",
@@ -1458,7 +1541,7 @@ def run_bootstrap() -> int:
     publisher.pack(fill="x", padx=20)
 
     version = tk.Label(
-        install_frame,
+        install_content,
         text=f"Version: {APP_VERSION}",
         font=("Segoe UI", 10),
         anchor="w",
@@ -1468,7 +1551,7 @@ def run_bootstrap() -> int:
     version.pack(fill="x", padx=20, pady=(0, 10))
 
     install_path_label = tk.Label(
-        install_frame,
+        install_content,
         textvariable=install_path_detail,
         font=("Segoe UI", 9),
         anchor="w",
@@ -1480,7 +1563,7 @@ def run_bootstrap() -> int:
     install_path_label.pack(fill="x", padx=20, pady=(0, 8))
 
     models_title = tk.Label(
-        install_frame,
+        install_content,
         text="Models to install locally:",
         font=("Segoe UI", 10),
         anchor="w",
@@ -1490,7 +1573,7 @@ def run_bootstrap() -> int:
     models_title.pack(fill="x", padx=20, pady=(0, 4))
 
     model_size_label = tk.Label(
-        install_frame,
+        install_content,
         textvariable=model_size_summary,
         font=("Segoe UI", 9),
         anchor="w",
@@ -1501,7 +1584,7 @@ def run_bootstrap() -> int:
 
     for item in setup_model_list():
         tk.Label(
-            install_frame,
+            install_content,
             text=f"- {item}",
             font=("Segoe UI", 10),
             anchor="w",
@@ -1510,7 +1593,7 @@ def run_bootstrap() -> int:
         ).pack(fill="x", padx=28)
 
     packages_title = tk.Label(
-        install_frame,
+        install_content,
         text="Python packages to install locally:",
         font=("Segoe UI", 10),
         anchor="w",
@@ -1519,11 +1602,11 @@ def run_bootstrap() -> int:
     )
     packages_title.pack(fill="x", padx=20, pady=(10, 4))
 
-    packages_box = tk.Frame(install_frame, bg="#ffffff")
+    packages_box = tk.Frame(install_content, bg="#ffffff")
     packages_box.pack(fill="x", padx=20)
     package_list = tk.Text(
         packages_box,
-        height=4,
+        height=3,
         wrap="none",
         font=("Cascadia Mono", 9),
         bg="#ffffff",
@@ -1542,7 +1625,7 @@ def run_bootstrap() -> int:
     package_list.configure(state="disabled", cursor="arrow", takefocus=False)
 
     install_note = tk.Label(
-        install_frame,
+        install_content,
         text="Internet required for first setup downloads. Runtime stays local/offline.",
         font=("Segoe UI", 10),
         anchor="w",
@@ -1551,7 +1634,12 @@ def run_bootstrap() -> int:
     )
     install_note.pack(fill="x", padx=20, pady=(8, 8))
 
-    onedrive_warning_frame = tk.Frame(install_frame, bg="#fff4ce", highlightbackground="#d29922", highlightthickness=1)
+    onedrive_warning_frame = tk.Frame(
+        install_content,
+        bg="#fff4ce",
+        highlightbackground="#d29922",
+        highlightthickness=1,
+    )
     onedrive_warning = tk.Label(
         onedrive_warning_frame,
         text=(
@@ -1568,9 +1656,6 @@ def run_bootstrap() -> int:
     onedrive_warning.pack(fill="x", padx=10, pady=(8, 6))
     onedrive_actions = tk.Frame(onedrive_warning_frame, bg="#fff4ce")
     onedrive_actions.pack(fill="x", padx=10, pady=(0, 8))
-
-    install_button_row = tk.Frame(install_frame, bg="#ffffff")
-    install_button_row.place(relx=0, rely=1, relwidth=1, anchor="sw", y=-16)
 
     progress_frame = tk.Frame(detail_frame, bg="#ffffff")
 
@@ -1637,7 +1722,7 @@ def run_bootstrap() -> int:
         foreground="#222222",
         wrap="word",
     )
-    package_text.pack(fill="both", expand=True, padx=18, pady=(0, 14))
+    package_text.pack(fill="x", expand=False, padx=18, pady=(0, 14))
 
     button_row = tk.Frame(progress_frame, bg="#ffffff")
     button_row.pack(fill="x", padx=18, pady=(0, 6))
@@ -1645,7 +1730,7 @@ def run_bootstrap() -> int:
     model_button_row = tk.Frame(progress_frame, bg="#ffffff")
     model_button_row.pack(fill="x", padx=18, pady=(0, 18))
 
-    details_button = tk.Button(button_row, text="Show details", width=14)
+    details_button = tk.Button(button_row, text="Show install log", width=16)
     details_button.pack(side="left")
 
     launch_now_button = tk.Button(button_row, text="Launch now", width=14, state="disabled")
@@ -1654,8 +1739,8 @@ def run_bootstrap() -> int:
     details_frame = tk.Frame(progress_frame, bg="#ffffff")
     details_text = tk.Text(
         details_frame,
-        height=7,
-        wrap="none",
+        height=6,
+        wrap="word",
         font=("Cascadia Mono", 9),
         bg="#ffffff",
         fg="#333333",
@@ -1733,10 +1818,10 @@ def run_bootstrap() -> int:
     def toggle_details_log() -> None:
         if details_frame.winfo_ismapped():
             details_frame.pack_forget()
-            details_button.config(text="Show details")
+            details_button.config(text="Show install log")
         else:
-            details_frame.pack(fill="both", expand=False, padx=18, pady=(0, 12))
-            details_button.config(text="Hide details")
+            details_frame.pack(fill="both", expand=True, padx=18, pady=(0, 12), before=button_row)
+            details_button.config(text="Hide install log")
 
     details_button.config(command=toggle_details_log)
 
@@ -1785,7 +1870,7 @@ def run_bootstrap() -> int:
         install_path_detail.set(f"Install path: {root}")
         if is_onedrive_path(root):
             if not onedrive_warning_frame.winfo_ismapped():
-                onedrive_warning_frame.pack(fill="x", padx=20, pady=(0, 44))
+                onedrive_warning_frame.pack(fill="x", padx=20, pady=(0, 10), before=models_title)
             set_install_button_enabled(False)
         else:
             onedrive_warning_frame.pack_forget()
@@ -1811,7 +1896,7 @@ def run_bootstrap() -> int:
 
     def refresh_model_size_estimate() -> None:
         with online_huggingface_download_env(root):
-            sizes = estimate_model_download_sizes(DEFAULT_MODEL_DOWNLOADS)
+            sizes = estimate_model_download_sizes(DEFAULT_MODEL_DOWNLOADS, root)
         total = total_known_size(sizes)
         if total:
             message = f"Estimated model download: {format_bytes(total)}"
@@ -1833,11 +1918,7 @@ def run_bootstrap() -> int:
         sensitive_install_phase["active"] = active
 
     def short_error_cause(message: str) -> str:
-        for line in message.splitlines():
-            cleaned = line.strip()
-            if cleaned:
-                return cleaned
-        return "Setup failed. See details below."
+        return setup_error_card_message(message)
 
     def copy_error_details() -> None:
         window.clipboard_clear()
@@ -2269,6 +2350,8 @@ def run_bootstrap() -> int:
             child.config(state="disabled")
         install_frame.pack_forget()
         progress_frame.pack(fill="both", expand=True)
+        details_frame.pack_forget()
+        details_button.config(text="Show install log")
         set_text(command_text, "")
         set_text(package_text, "")
         overall_bar.configure(style=SETUP_PROGRESS_STYLE)
