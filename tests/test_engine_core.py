@@ -16,6 +16,7 @@ from transcriber_engine import (
     MeetingTranscriberEngine,
     TranscriptStore,
     audio_chunk_has_activity,
+    audio_chunk_duration_seconds,
     microphone_health_message,
     preferred_input_sample_rate,
     resample_audio,
@@ -271,6 +272,21 @@ class EngineConfigTests(unittest.TestCase):
 
 
 class TranscriptionBacklogTests(unittest.TestCase):
+    def test_audio_chunk_duration_uses_sample_count_and_rate(self):
+        chunk = AudioChunk(1, 0.0, [0.0] * 32000, 16000)
+
+        self.assertEqual(audio_chunk_duration_seconds(chunk), 2.0)
+
+    def test_queued_audio_seconds_ignores_stop_sentinel(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = MeetingTranscriberEngine(EngineConfig(output_file=os.path.join(tmp, "out.txt")))
+            engine._transcription_queue.put(AudioChunk(1, 0.0, [0.0] * 16000, 16000))
+            engine._transcription_queue.put(None)
+
+            seconds = engine._queued_audio_seconds()
+
+        self.assertEqual(seconds, 1.0)
+
     def test_stale_chunks_are_dropped_and_newest_chunks_retained(self):
         with tempfile.TemporaryDirectory() as tmp:
             engine = MeetingTranscriberEngine(EngineConfig(output_file=os.path.join(tmp, "out.txt")))

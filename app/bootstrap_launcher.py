@@ -1566,7 +1566,7 @@ def run_bootstrap() -> int:
     style.configure(COMPLETE_PROGRESS_STYLE, troughcolor="#e1e1e1", background="#2e7d32")
 
     step_states = {step: StepState.PENDING for step in BOOTSTRAP_STEPS}
-    spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    spinner_frames = ["|", "/", "-", "\\"]
     spinner_index = 0
     current_step = BOOTSTRAP_STEPS[0]
     detail_progress_value = tk.IntVar(value=0)
@@ -2163,6 +2163,8 @@ def run_bootstrap() -> int:
                 label.config(text=f"{spinner_frames[spinner_index % len(spinner_frames)]} {step}", fg="#1f6feb")
             else:
                 label.config(text=f"○ {step}", fg="#555555")
+        if step_states.get(current_step) == StepState.RUNNING:
+            detail_title.config(text=f"{spinner_frames[spinner_index % len(spinner_frames)]} {current_step}")
 
     def tick_spinner() -> None:
         nonlocal spinner_index

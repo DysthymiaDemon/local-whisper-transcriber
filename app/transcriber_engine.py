@@ -153,6 +153,16 @@ def audio_chunk_has_activity(samples: Any, noise_floor: float = DEFAULT_NOISE_FL
     return rms >= threshold or peak >= threshold * 3.0
 
 
+def audio_chunk_duration_seconds(chunk: "AudioChunk") -> float:
+    try:
+        sample_count = len(chunk.samples)
+    except TypeError:
+        sample_count = 0
+    if chunk.sample_rate <= 0:
+        return 0.0
+    return max(0.0, sample_count / float(chunk.sample_rate))
+
+
 def _force_offline_mode() -> None:
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
@@ -533,6 +543,7 @@ class MeetingTranscriberEngine:
             with self._state_lock:
                 self._pending_transcription_chunks.add(chunk.index)
             self._transcription_queue.put(chunk)
+            self._emit_transcription_lag(active=True)
             if dropped:
                 noun = "chunk" if dropped == 1 else "chunks"
                 self._emit("log", {"message": f"Catching up: skipped {dropped} stale audio {noun}"})
@@ -552,6 +563,21 @@ class MeetingTranscriberEngine:
                 self._pending_transcription_chunks.discard(stale.index)
         return dropped
 
+    def _queued_audio_seconds(self) -> float:
+        total = 0.0
+        with self._transcription_queue.mutex:
+            queued_items = list(self._transcription_queue.queue)
+        for item in queued_items:
+            if isinstance(item, AudioChunk):
+                total += audio_chunk_duration_seconds(item)
+        return total
+
+    def _emit_transcription_lag(self, active: bool, current_chunk: AudioChunk | None = None) -> None:
+        behind_seconds = self._queued_audio_seconds()
+        if current_chunk is not None:
+            behind_seconds += audio_chunk_duration_seconds(current_chunk)
+        self._emit("lag", {"behind_seconds": behind_seconds, "active": active and behind_seconds > 0})
+
     def _transcription_loop(self) -> None:
         try:
             self._emit("log", {"message": "Loading Whisper model..."})
@@ -564,10 +590,10 @@ class MeetingTranscriberEngine:
         while True:
             chunk = self._transcription_queue.get()
             if chunk is None:
+                self._emit("lag", {"behind_seconds": 0.0, "active": False})
                 return
             try:
-                behind_at_start = max(0.0, time.monotonic() - chunk.captured_at)
-                self._emit("lag", {"behind_seconds": behind_at_start, "active": True})
+                self._emit_transcription_lag(active=True, current_chunk=chunk)
                 self._emit("log", {"message": f"Transcribing chunk {chunk.index}..."})
                 started_at = time.monotonic()
                 segment_count = 0
@@ -608,12 +634,12 @@ class MeetingTranscriberEngine:
                         )
                     },
                 )
-                self._emit("lag", {"behind_seconds": behind_after, "active": True})
             except Exception as exc:  # pragma: no cover - environment-dependent
                 self._emit("error", {"message": f"Transcription failed for chunk {chunk.index}: {exc}"})
             finally:
                 with self._state_lock:
                     self._pending_transcription_chunks.discard(chunk.index)
+                self._emit_transcription_lag(active=True)
 
     def _load_whisper_model(self) -> Any:
         _force_offline_mode()

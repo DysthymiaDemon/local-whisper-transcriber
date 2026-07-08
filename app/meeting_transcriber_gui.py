@@ -113,6 +113,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Offline Meeting Transcriber")
         self.resize(1040, 720)
         self.engine: MeetingTranscriberEngine | None = None
+        self._stopping = False
         self.bridge = EngineSignalBridge()
         self.bridge.event.connect(self._handle_engine_event)
         self._behind_seconds = 0.0
@@ -272,6 +273,8 @@ class MainWindow(QMainWindow):
         )
 
     def _start_recording(self) -> None:
+        if self._stopping:
+            return
         config = self._read_config()
         errors = config.validate()
         if errors:
@@ -292,6 +295,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Start failed", f"{message}\n\nError details saved to {log_path}")
             self.engine = None
             return
+        self._stopping = False
         self._set_running(True)
 
     def _toggle_pause(self) -> None:
@@ -305,12 +309,26 @@ class MainWindow(QMainWindow):
             self.pause_button.setText("Pause")
 
     def _stop_recording(self) -> None:
-        if not self.engine:
+        if not self.engine or self._stopping:
             return
-        self._set_running(False)
+        self._stopping = True
+        self.status_label.setText("Stopping")
+        self.record_button.setEnabled(False)
+        self.pause_button.setEnabled(False)
+        self.stop_button.setEnabled(False)
+        self.level_meter.set_level(0)
+        self._update_transcription_state(running=True)
+        if not self.spinner_timer.isActive():
+            self.spinner_timer.start()
+        for widget in (self.device_combo, self.whisper_path, self.output_path):
+            widget.setEnabled(False)
         engine = self.engine
-        self.engine = None
-        threading.Thread(target=engine.stop, name="gui-stop-engine", daemon=True).start()
+
+        def stop_worker() -> None:
+            engine.stop()
+            self.bridge.event.emit("engine_stopped", {})
+
+        threading.Thread(target=stop_worker, name="gui-stop-engine", daemon=True).start()
 
     def _copy_transcript(self) -> None:
         clipboard = QApplication.clipboard()
@@ -335,6 +353,8 @@ class MainWindow(QMainWindow):
                 self._append_log(f"{message}\nError details saved to {log_path}")
         elif event_type == "log":
             self._append_log(str(payload.get("message", "")))
+        elif event_type == "engine_stopped":
+            self._finish_engine_stop()
 
     def _append_transcript(self, row: TranscriptRow) -> None:
         text = row.text.strip()
@@ -354,12 +374,12 @@ class MainWindow(QMainWindow):
 
     def _tick_spinner(self) -> None:
         self._spinner_index = (self._spinner_index + 1) % len(self._spinner_frames)
-        if self.engine:
+        if self.engine or self._stopping:
             self._update_transcription_state(running=True)
 
     def _update_transcription_state(self, running: bool) -> None:
         if not running:
-            self.transcription_state_label.setText("Idle")
+            self.transcription_state_label.setText("Idle, 0s behind")
             return
         frame = self._spinner_frames[self._spinner_index]
         self.transcription_state_label.setText(f"Transcribing, {int(round(self._behind_seconds))}s behind {frame}")
@@ -387,6 +407,13 @@ class MainWindow(QMainWindow):
             self.level_meter.set_level(0)
         for widget in (self.device_combo, self.whisper_path, self.output_path):
             widget.setEnabled(not running)
+
+    def _finish_engine_stop(self) -> None:
+        self._behind_seconds = 0.0
+        self._stopping = False
+        self.engine = None
+        self._set_running(False)
+        self.status_label.setText("Stopped")
 
     def closeEvent(self, event: Any) -> None:  # pragma: no cover - GUI lifecycle
         if self.engine:

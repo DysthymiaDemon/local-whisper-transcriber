@@ -127,6 +127,12 @@ class BootstrapLauncherTests(unittest.TestCase):
         self.assertNotIn('text="Open model folder"', source)
         self.assertNotIn("text=f\"Set {model}\"", source)
 
+    def test_setup_spinner_uses_portable_ascii_frames_in_task_and_detail_title(self):
+        source = (Path(__file__).resolve().parents[1] / "app" / "bootstrap_launcher.py").read_text(encoding="utf-8")
+
+        self.assertIn('spinner_frames = ["|", "/", "-", "\\\\"]', source)
+        self.assertIn('detail_title.config(text=f"{spinner_frames[spinner_index % len(spinner_frames)]} {current_step}")', source)
+
     def test_bootstrap_steps_cover_setup_flow(self):
         self.assertEqual(BOOTSTRAP_STEPS[0], "Checking Python runtime")
         self.assertIn("Installing Python packages", BOOTSTRAP_STEPS)
