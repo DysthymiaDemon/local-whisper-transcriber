@@ -114,6 +114,7 @@ class BootstrapLauncherTests(unittest.TestCase):
             packages = setup_package_list(root)
 
         self.assertIn(f"Publisher: {APP_PUBLISHER}", summary)
+        self.assertIn("Disk space: ~1.8 GB for packages and models.", summary)
         self.assertIn("Systran/faster-whisper-small -> models\\faster-whisper", summary)
         self.assertNotIn("speechbrain", summary)
         self.assertEqual(packages, ["alpha==1.0", "beta>=2.0"])
@@ -127,11 +128,18 @@ class BootstrapLauncherTests(unittest.TestCase):
         self.assertNotIn('text="Open model folder"', source)
         self.assertNotIn("text=f\"Set {model}\"", source)
 
-    def test_setup_spinner_uses_portable_ascii_frames_in_task_and_detail_title(self):
+    def test_setup_spinner_uses_npm_dots_frames_in_task_and_detail_title(self):
         source = (Path(__file__).resolve().parents[1] / "app" / "bootstrap_launcher.py").read_text(encoding="utf-8")
 
-        self.assertIn('spinner_frames = ["|", "/", "-", "\\\\"]', source)
+        self.assertIn('NPM_DOTS5_SPINNER_FRAMES = ("⠋", "⠙", "⠚", "⠞", "⠖", "⠦", "⠴", "⠲", "⠳", "⠓")', source)
+        self.assertIn("spinner_frames = list(NPM_DOTS5_SPINNER_FRAMES)", source)
         self.assertIn('detail_title.config(text=f"{spinner_frames[spinner_index % len(spinner_frames)]} {current_step}")', source)
+
+    def test_setup_confirmation_mentions_disk_space(self):
+        source = (Path(__file__).resolve().parents[1] / "app" / "bootstrap_launcher.py").read_text(encoding="utf-8")
+
+        self.assertIn('INSTALL_DISK_SPACE_ESTIMATE = "~1.8 GB"', source)
+        self.assertIn("this install uses {INSTALL_DISK_SPACE_ESTIMATE} for packages and models", source)
 
     def test_bootstrap_steps_cover_setup_flow(self):
         self.assertEqual(BOOTSTRAP_STEPS[0], "Checking Python runtime")

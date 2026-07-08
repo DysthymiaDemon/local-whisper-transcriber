@@ -55,6 +55,8 @@ RUNTIME_ENV = "LOCAL_WHISPER_RUNTIME_ROOT"
 RUNTIME_APP_FOLDER_NAME = "OfflineMeetingTranscriberRuntime"
 APP_PUBLISHER = "Ameen Khan"
 APP_VERSION = "local"
+INSTALL_DISK_SPACE_ESTIMATE = "~1.8 GB"
+NPM_DOTS5_SPINNER_FRAMES = ("⠋", "⠙", "⠚", "⠞", "⠖", "⠦", "⠴", "⠲", "⠳", "⠓")
 HF_OFFLINE_ENV_VARS = ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE")
 HF_PROGRESS_ENV_VARS = ("HF_HUB_DISABLE_PROGRESS_BARS",)
 CA_BUNDLE_ENV = "LOCAL_WHISPER_CA_BUNDLE"
@@ -175,6 +177,7 @@ def setup_install_summary(package_root: Path | None = None) -> str:
         "Local Windows App\n"
         f"Publisher: {APP_PUBLISHER}\n"
         f"Version: {APP_VERSION}\n\n"
+        f"Disk space: {INSTALL_DISK_SPACE_ESTIMATE} for packages and models.\n\n"
         "Models to install locally:\n"
         f"{model_lines}\n\n"
         "Python packages to install locally:\n"
@@ -1566,7 +1569,7 @@ def run_bootstrap() -> int:
     style.configure(COMPLETE_PROGRESS_STYLE, troughcolor="#e1e1e1", background="#2e7d32")
 
     step_states = {step: StepState.PENDING for step in BOOTSTRAP_STEPS}
-    spinner_frames = ["|", "/", "-", "\\"]
+    spinner_frames = list(NPM_DOTS5_SPINNER_FRAMES)
     spinner_index = 0
     current_step = BOOTSTRAP_STEPS[0]
     detail_progress_value = tk.IntVar(value=0)
@@ -1706,6 +1709,16 @@ def run_bootstrap() -> int:
         justify="left",
     )
     install_path_label.pack(fill="x", padx=20, pady=(0, 8))
+
+    install_size_label = tk.Label(
+        install_content,
+        text=f"Disk space: this install uses {INSTALL_DISK_SPACE_ESTIMATE} for packages and models.",
+        font=("Segoe UI", 9),
+        anchor="w",
+        bg="#ffffff",
+        fg="#333333",
+    )
+    install_size_label.pack(fill="x", padx=20, pady=(0, 8))
 
     models_title = tk.Label(
         install_content,
