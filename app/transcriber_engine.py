@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import math
 import os
 import queue
 import re
@@ -10,17 +9,9 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, Optional
 
 
-UNKNOWN_SPEAKER_LABEL = "Speaker ?"
-EMBEDDING_WEIGHT_FILES = ("pytorch_model.bin", "model.safetensors")
-DIARIZATION_BACKEND_LOCAL_ECAPA = "local-ecapa"
-DIARIZATION_BACKEND_PYANNOTE = "pyannote"
-SPEECHBRAIN_CHECKPOINT_FILES = ("embedding_model.ckpt", "model.ckpt")
-LOCAL_DIARIZATION_MIN_SECONDS = 0.75
-LOCAL_DIARIZATION_TARGET_SECONDS = 2.0
-LOCAL_SPEAKER_CONTINUITY_THRESHOLD = 0.45
 MIC_SILENCE_RMS_THRESHOLD = 0.0001
 
 
@@ -81,21 +72,13 @@ def _force_offline_mode() -> None:
 @dataclass(frozen=True)
 class EngineConfig:
     whisper_model_dir: str = r"C:\models\faster-whisper-small"
-    diarization_backend: str = DIARIZATION_BACKEND_LOCAL_ECAPA
-    speaker_embedding_model_dir: str = r"C:\models\speechbrain-ecapa"
-    speaker_cluster_distance_threshold: float = 0.55
-    pyannote_pipeline_dir: str = r"C:\models\pyannote-speaker-diarization"
-    pyannote_embedding_model_dir: str = r"C:\models\pyannote-embedding"
     output_file: str = "meeting_transcript.txt"
     sample_rate: int = 16_000
-    chunk_seconds: float = 8.0
-    overlap_seconds: float = 2.0
+    chunk_seconds: float = 4.0
+    overlap_seconds: float = 0.5
     compute_type: str = "int8"
-    speaker_match_threshold: float = 0.70
-    min_speaker_confidence: float = 0.50
-    min_overlap_ratio: float = 0.35
     input_device: Optional[int] = None
-    language: Optional[str] = None
+    language: Optional[str] = "en"
     max_queue_chunks: int = 8
 
     def validate(self) -> list[str]:
@@ -113,48 +96,6 @@ class EngineConfig:
             errors.append(
                 "Whisper model is incomplete: expected model.bin in "
                 f"{whisper_path}. Copy a CTranslate2 faster-whisper model folder into this path."
-            )
-
-        if self.diarization_backend == DIARIZATION_BACKEND_LOCAL_ECAPA:
-            speaker_path = self._validate_folder(
-                "Speaker embedding model", self.speaker_embedding_model_dir, errors
-            )
-            if speaker_path:
-                missing_speaker_files: list[str] = []
-                if not (speaker_path / "hyperparams.yaml").is_file():
-                    missing_speaker_files.append("hyperparams.yaml")
-                if not any((speaker_path / name).is_file() for name in SPEECHBRAIN_CHECKPOINT_FILES):
-                    missing_speaker_files.append("embedding_model.ckpt")
-                if missing_speaker_files:
-                    errors.append(
-                        "Speaker embedding model is incomplete: expected "
-                        + ", ".join(missing_speaker_files)
-                        + f" in {speaker_path}. Copy or download the SpeechBrain ECAPA model folder into this path."
-                    )
-        elif self.diarization_backend == DIARIZATION_BACKEND_PYANNOTE:
-            pipeline_path = self._validate_folder("Pyannote pipeline", self.pyannote_pipeline_dir, errors)
-            if pipeline_path and not (pipeline_path / "config.yaml").is_file():
-                errors.append(
-                    "Pyannote pipeline is incomplete: expected config.yaml in "
-                    f"{pipeline_path}. Copy the local pyannote pipeline folder into this path."
-                )
-
-            embedding_path = self._validate_folder("Pyannote embedding model", self.pyannote_embedding_model_dir, errors)
-            if embedding_path:
-                missing_embedding_files: list[str] = []
-                if not (embedding_path / "config.yaml").is_file():
-                    missing_embedding_files.append("config.yaml")
-                if not any((embedding_path / name).is_file() for name in EMBEDDING_WEIGHT_FILES):
-                    missing_embedding_files.append("pytorch_model.bin or model.safetensors")
-                if missing_embedding_files:
-                    errors.append(
-                        "Pyannote embedding model is incomplete: expected "
-                        + ", ".join(missing_embedding_files)
-                        + f" in {embedding_path}. Copy the local pyannote embedding model folder into this path."
-                    )
-        else:
-            errors.append(
-                "Diarization backend must be local-ecapa or pyannote."
             )
         return errors
 
@@ -189,27 +130,8 @@ class TranscriptRow:
     start: float
     end: float
     text: str
-    speaker_key: Optional[str] = None
-    speaker_label: str = UNKNOWN_SPEAKER_LABEL
     is_final: bool = False
     updated_at: float = field(default_factory=time.time)
-
-
-@dataclass
-class DiarizationTurn:
-    start: float
-    end: float
-    local_label: str
-    embedding: Optional[list[float]] = None
-    confidence: float = 1.0
-
-
-@dataclass
-class SpeakerIdentity:
-    key: str
-    display_name_value: str
-    embedding: list[float]
-    sample_count: int = 1
 
 
 class InputBlockBuffer:
@@ -233,187 +155,8 @@ class InputBlockBuffer:
         return self._queue.get(timeout=timeout)
 
 
-def cosine_similarity(left: Iterable[float], right: Iterable[float]) -> float:
-    left_values = [float(value) for value in left]
-    right_values = [float(value) for value in right]
-    if len(left_values) != len(right_values) or not left_values:
-        return 0.0
-    dot = sum(a * b for a, b in zip(left_values, right_values))
-    left_norm = math.sqrt(sum(value * value for value in left_values))
-    right_norm = math.sqrt(sum(value * value for value in right_values))
-    if left_norm == 0.0 or right_norm == 0.0:
-        return 0.0
-    return dot / (left_norm * right_norm)
-
-
-def _normalize_embedding(embedding: Iterable[float] | None) -> Optional[list[float]]:
-    if embedding is None:
-        return None
-    values = [float(value) for value in embedding]
-    norm = math.sqrt(sum(value * value for value in values))
-    if norm == 0.0:
-        return None
-    return [value / norm for value in values]
-
-
-def cluster_local_embeddings(embeddings: list[list[float]], distance_threshold: float = 0.55) -> list[int]:
-    if not embeddings:
-        return []
-    if len(embeddings) == 1:
-        return [0]
-    try:
-        from sklearn.cluster import AgglomerativeClustering
-
-        try:
-            clustering = AgglomerativeClustering(
-                n_clusters=None,
-                metric="cosine",
-                linkage="average",
-                distance_threshold=distance_threshold,
-            )
-        except TypeError:
-            clustering = AgglomerativeClustering(
-                n_clusters=None,
-                affinity="cosine",
-                linkage="average",
-                distance_threshold=distance_threshold,
-            )
-        return [int(label) for label in clustering.fit_predict(embeddings)]
-    except Exception:
-        labels: list[int] = []
-        centroids: list[list[float]] = []
-        for embedding in embeddings:
-            normalized = _normalize_embedding(embedding)
-            if normalized is None:
-                labels.append(-1)
-                continue
-            best_index = -1
-            best_distance = 2.0
-            for index, centroid in enumerate(centroids):
-                distance = 1.0 - cosine_similarity(normalized, centroid)
-                if distance < best_distance:
-                    best_distance = distance
-                    best_index = index
-            if best_index >= 0 and best_distance <= distance_threshold:
-                labels.append(best_index)
-            else:
-                centroids.append(normalized)
-                labels.append(len(centroids) - 1)
-        return labels
-
-
-def extract_row_audio_window(chunk: AudioChunk, row: TranscriptRow, target_seconds: float = LOCAL_DIARIZATION_TARGET_SECONDS) -> Any:
-    import numpy as np
-
-    samples = np.asarray(chunk.samples, dtype=np.float32).reshape(-1)
-    sample_rate = chunk.sample_rate
-    relative_start = max(0.0, row.start - chunk.start_time)
-    relative_end = max(relative_start, row.end - chunk.start_time)
-    duration = relative_end - relative_start
-    if duration < target_seconds:
-        midpoint = (relative_start + relative_end) / 2.0
-        relative_start = midpoint - (target_seconds / 2.0)
-        relative_end = midpoint + (target_seconds / 2.0)
-
-    start_sample = math.floor(relative_start * sample_rate)
-    end_sample = math.ceil(relative_end * sample_rate)
-    left_pad = max(0, -start_sample)
-    right_pad = max(0, end_sample - samples.size)
-    start_sample = max(0, start_sample)
-    end_sample = min(samples.size, end_sample)
-    window = samples[start_sample:end_sample]
-    if left_pad or right_pad:
-        window = np.pad(window, (left_pad, right_pad))
-    return window.astype(np.float32, copy=False)
-
-
-class SpeakerRegistry:
-    def __init__(
-        self,
-        match_threshold: float = 0.70,
-        min_confidence: float = 0.50,
-        continuity_threshold: float = LOCAL_SPEAKER_CONTINUITY_THRESHOLD,
-    ):
-        self.match_threshold = match_threshold
-        self.min_confidence = min_confidence
-        self.continuity_threshold = max(0.0, min(match_threshold, continuity_threshold))
-        self._lock = threading.RLock()
-        self._identities: dict[str, SpeakerIdentity] = {}
-        self._last_identity_key: str | None = None
-        self._next_index = 1
-
-    def assign(self, embedding: Iterable[float] | None, confidence: float = 1.0) -> Optional[SpeakerIdentity]:
-        if confidence < self.min_confidence:
-            return None
-        normalized = _normalize_embedding(embedding)
-        if normalized is None:
-            return None
-
-        with self._lock:
-            best_identity: Optional[SpeakerIdentity] = None
-            best_score = -1.0
-            for identity in self._identities.values():
-                score = cosine_similarity(identity.embedding, normalized)
-                if score > best_score:
-                    best_score = score
-                    best_identity = identity
-
-            if best_identity is not None and (
-                best_score >= self.match_threshold
-                or (
-                    best_score >= self.continuity_threshold
-                    and (best_identity.key == self._last_identity_key or len(self._identities) == 1)
-                )
-            ):
-                self._update_identity(best_identity, normalized)
-                self._last_identity_key = best_identity.key
-                return best_identity
-
-            key = f"speaker_{self._next_index}"
-            identity = SpeakerIdentity(
-                key=key,
-                display_name_value=f"Speaker {self._next_index}",
-                embedding=normalized,
-            )
-            self._identities[key] = identity
-            self._last_identity_key = key
-            self._next_index += 1
-            return identity
-
-    @staticmethod
-    def _update_identity(identity: SpeakerIdentity, normalized: list[float]) -> None:
-        total = identity.sample_count + 1
-        averaged = [
-            ((old * identity.sample_count) + new) / total
-            for old, new in zip(identity.embedding, normalized)
-        ]
-        identity.embedding = _normalize_embedding(averaged) or identity.embedding
-        identity.sample_count = total
-
-    def display_name(self, speaker_key: str | None) -> str:
-        if speaker_key is None:
-            return UNKNOWN_SPEAKER_LABEL
-        with self._lock:
-            identity = self._identities.get(speaker_key)
-            return identity.display_name_value if identity else UNKNOWN_SPEAKER_LABEL
-
-    def rename(self, speaker_key: str, display_name: str) -> None:
-        cleaned = display_name.strip()
-        if not cleaned:
-            return
-        with self._lock:
-            if speaker_key in self._identities:
-                self._identities[speaker_key].display_name_value = cleaned
-
-    def speakers(self) -> list[SpeakerIdentity]:
-        with self._lock:
-            return list(self._identities.values())
-
-
 class TranscriptStore:
-    def __init__(self, speaker_registry: SpeakerRegistry, min_overlap_ratio: float = 0.35):
-        self.speaker_registry = speaker_registry
-        self.min_overlap_ratio = min_overlap_ratio
+    def __init__(self):
         self.rows: list[TranscriptRow] = []
         self._lock = threading.RLock()
         self._next_row_id = 1
@@ -431,55 +174,9 @@ class TranscriptStore:
             self.rows.append(row)
             return row
 
-    def apply_diarization(self, chunk_index: int, turns: list[DiarizationTurn]) -> list[TranscriptRow]:
-        updates: list[TranscriptRow] = []
-        with self._lock:
-            for row in self.rows:
-                if row.chunk_index != chunk_index:
-                    continue
-                best_turn, best_ratio = self._best_turn_for_row(row, turns)
-                if best_turn is None or best_ratio < self.min_overlap_ratio:
-                    continue
-                identity = self.speaker_registry.assign(best_turn.embedding, best_turn.confidence)
-                if identity is None:
-                    continue
-                new_label = self.speaker_registry.display_name(identity.key)
-                if row.speaker_key != identity.key or row.speaker_label != new_label:
-                    row.speaker_key = identity.key
-                    row.speaker_label = new_label
-                    row.updated_at = time.time()
-                    updates.append(row)
-        return updates
-
-    def rename_speaker(self, speaker_key: str, display_name: str) -> list[TranscriptRow]:
-        self.speaker_registry.rename(speaker_key, display_name)
-        updated: list[TranscriptRow] = []
-        with self._lock:
-            new_name = self.speaker_registry.display_name(speaker_key)
-            for row in self.rows:
-                if row.speaker_key == speaker_key:
-                    row.speaker_label = new_name
-                    row.updated_at = time.time()
-                    updated.append(row)
-        return updated
-
     def snapshot(self) -> list[TranscriptRow]:
         with self._lock:
             return [copy.copy(row) for row in self.rows]
-
-    @staticmethod
-    def _best_turn_for_row(
-        row: TranscriptRow, turns: list[DiarizationTurn]
-    ) -> tuple[Optional[DiarizationTurn], float]:
-        duration = max(row.end - row.start, 0.001)
-        best_turn: Optional[DiarizationTurn] = None
-        best_overlap = 0.0
-        for turn in turns:
-            overlap = max(0.0, min(row.end, turn.end) - max(row.start, turn.start))
-            if overlap > best_overlap:
-                best_overlap = overlap
-                best_turn = turn
-        return best_turn, best_overlap / duration
 
 
 class DuplicateSuppressor:
@@ -508,6 +205,21 @@ class DuplicateSuppressor:
         return re.sub(r"\s+", " ", cleaned).strip()
 
 
+def transcription_segment_is_usable(segment: Any, text: str) -> bool:
+    if not text:
+        return False
+    no_speech_prob = getattr(segment, "no_speech_prob", None)
+    avg_logprob = getattr(segment, "avg_logprob", None)
+    compression_ratio = getattr(segment, "compression_ratio", None)
+    if no_speech_prob is not None and float(no_speech_prob) > 0.75:
+        return False
+    if avg_logprob is not None and float(avg_logprob) < -1.2:
+        return False
+    if compression_ratio is not None and float(compression_ratio) > 2.4:
+        return False
+    return True
+
+
 class AtomicTranscriptWriter:
     def __init__(self, path: str):
         self.path = Path(path)
@@ -525,10 +237,7 @@ class AtomicTranscriptWriter:
             try:
                 with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
                     for row in sorted(rows, key=lambda item: (item.start, item.id)):
-                        handle.write(
-                            f"[{format_timestamp(row.start)}] "
-                            f"{row.speaker_label}: {row.text}\n"
-                        )
+                        handle.write(f"[{format_timestamp(row.start)}] {row.text}\n")
                 os.replace(tmp_name, self.path)
             finally:
                 if os.path.exists(tmp_name):
@@ -549,15 +258,7 @@ EventHandler = Callable[[str, dict[str, Any]], None]
 class MeetingTranscriberEngine:
     def __init__(self, config: EngineConfig):
         self.config = config
-        self.speaker_registry = SpeakerRegistry(
-            match_threshold=config.speaker_match_threshold,
-            min_confidence=config.min_speaker_confidence,
-            continuity_threshold=min(
-                config.speaker_match_threshold,
-                1.0 - config.speaker_cluster_distance_threshold,
-            ),
-        )
-        self.store = TranscriptStore(self.speaker_registry, config.min_overlap_ratio)
+        self.store = TranscriptStore()
         self.writer = AtomicTranscriptWriter(config.output_file)
         self.duplicate_suppressor = DuplicateSuppressor(config.overlap_seconds + 0.5)
         self._event_handlers: list[EventHandler] = []
@@ -566,9 +267,7 @@ class MeetingTranscriberEngine:
         self._threads: list[threading.Thread] = []
         self._raw_chunk_queue: queue.Queue[AudioChunk | None] = queue.Queue(config.max_queue_chunks)
         self._transcription_queue: queue.Queue[AudioChunk | None] = queue.Queue(config.max_queue_chunks)
-        self._diarization_queue: queue.Queue[AudioChunk | None] = queue.Queue(config.max_queue_chunks)
         self._pending_transcription_chunks: set[int] = set()
-        self._pending_diarization_chunks: set[int] = set()
         self._audio_block_count = 0
         self._audio_peak_rms = 0.0
         self._audio_chunk_count = 0
@@ -594,7 +293,6 @@ class MeetingTranscriberEngine:
             threading.Thread(target=self._recording_loop, name="recorder", daemon=True),
             threading.Thread(target=self._fanout_loop, name="chunk-fanout", daemon=True),
             threading.Thread(target=self._transcription_loop, name="transcription", daemon=True),
-            threading.Thread(target=self._diarization_loop, name="diarization", daemon=True),
         ]
         for thread in self._threads:
             thread.start()
@@ -623,17 +321,6 @@ class MeetingTranscriberEngine:
     def resume(self) -> None:
         self._pause_event.clear()
         self._emit("status", {"message": "Recording"})
-
-    def rename_speaker(self, speaker_key: str, display_name: str) -> None:
-        updated = self.store.rename_speaker(speaker_key, display_name)
-        self.writer.refresh(self.store.snapshot())
-        for row in updated:
-            self._emit("speaker_update", {"row": row})
-        self._emit("speakers", {"speakers": self.speaker_registry.speakers()})
-
-    def lag_status(self) -> str:
-        with self._state_lock:
-            return f"Diarization: {len(self._pending_diarization_chunks)} chunks behind"
 
     def _recording_loop(self) -> None:
         try:
@@ -729,14 +416,10 @@ class MeetingTranscriberEngine:
             chunk = self._raw_chunk_queue.get()
             if chunk is None:
                 self._transcription_queue.put(None)
-                self._diarization_queue.put(None)
                 return
             with self._state_lock:
                 self._pending_transcription_chunks.add(chunk.index)
-                self._pending_diarization_chunks.add(chunk.index)
-            self._emit("lag", {"message": self.lag_status()})
             self._transcription_queue.put(chunk)
-            self._diarization_queue.put(chunk)
 
     def _transcription_loop(self) -> None:
         try:
@@ -757,13 +440,17 @@ class MeetingTranscriberEngine:
                 segments, _info = model.transcribe(
                     chunk.samples,
                     language=self.config.language,
-                    vad_filter=True,
-                    word_timestamps=True,
+                    vad_filter=False,
+                    word_timestamps=False,
                     beam_size=1,
+                    condition_on_previous_text=False,
+                    no_speech_threshold=0.6,
+                    log_prob_threshold=-1.0,
+                    compression_ratio_threshold=2.4,
                 )
                 for segment in segments:
                     text = getattr(segment, "text", "").strip()
-                    if not text:
+                    if not transcription_segment_is_usable(segment, text):
                         continue
                     start = chunk.start_time + float(getattr(segment, "start", 0.0))
                     end = chunk.start_time + float(getattr(segment, "end", start))
@@ -772,7 +459,7 @@ class MeetingTranscriberEngine:
                     row = self.store.add_transcript(chunk.index, start, end, text)
                     segment_count += 1
                     self.writer.refresh(self.store.snapshot())
-                    print(f"[{format_timestamp(row.start)}] {row.speaker_label}: {row.text}", flush=True)
+                    print(f"[{format_timestamp(row.start)}] {row.text}", flush=True)
                     self._emit("transcript", {"row": row})
                 if segment_count == 0:
                     self._emit("log", {"message": f"No speech detected in chunk {chunk.index}"})
@@ -781,39 +468,6 @@ class MeetingTranscriberEngine:
             finally:
                 with self._state_lock:
                     self._pending_transcription_chunks.discard(chunk.index)
-
-    def _diarization_loop(self) -> None:
-        try:
-            self._emit("log", {"message": "Loading diarization model..."})
-            diarizer = self._load_diarization_backend()
-            self._emit("log", {"message": "Diarization model ready"})
-        except Exception as exc:  # pragma: no cover - environment-dependent
-            self._emit("error", {"message": f"Diarization model load failed: {exc}"})
-            return
-
-        while True:
-            chunk = self._diarization_queue.get()
-            if chunk is None:
-                return
-            try:
-                turns = self._run_diarization_backend(chunk, diarizer)
-                updated_rows = self.store.apply_diarization(chunk.index, turns)
-                if updated_rows:
-                    self.writer.refresh(self.store.snapshot())
-                for row in updated_rows:
-                    print(
-                        f"[speaker update] [{format_timestamp(row.start)}] "
-                        f"{row.speaker_label}: {row.text}",
-                        flush=True,
-                    )
-                    self._emit("speaker_update", {"row": row})
-                self._emit("speakers", {"speakers": self.speaker_registry.speakers()})
-            except Exception as exc:  # pragma: no cover - environment-dependent
-                self._emit("error", {"message": f"Diarization failed for chunk {chunk.index}: {exc}"})
-            finally:
-                with self._state_lock:
-                    self._pending_diarization_chunks.discard(chunk.index)
-                self._emit("lag", {"message": self.lag_status()})
 
     def _load_whisper_model(self) -> Any:
         _force_offline_mode()
@@ -834,153 +488,6 @@ class MeetingTranscriberEngine:
                 device="cpu",
                 compute_type=self.config.compute_type,
             )
-
-    def _load_diarization_backend(self) -> Any:
-        if self.config.diarization_backend == DIARIZATION_BACKEND_LOCAL_ECAPA:
-            return self._load_local_speaker_model()
-        if self.config.diarization_backend == DIARIZATION_BACKEND_PYANNOTE:
-            return self._load_pyannote_models()
-        raise ValueError(f"Unsupported diarization backend: {self.config.diarization_backend}")
-
-    def _run_diarization_backend(self, chunk: AudioChunk, diarizer: Any) -> list[DiarizationTurn]:
-        if self.config.diarization_backend == DIARIZATION_BACKEND_LOCAL_ECAPA:
-            return self._run_local_ecapa_diarization(chunk, diarizer)
-        pipeline, embedding_inference = diarizer
-        return self._run_pyannote_diarization(chunk, pipeline, embedding_inference)
-
-    def _load_pyannote_models(self) -> tuple[Any, Any]:
-        _force_offline_mode()
-        import torch
-        from pyannote.audio import Inference, Model, Pipeline
-
-        pipeline = Pipeline.from_pretrained(self.config.pyannote_pipeline_dir)
-        if hasattr(pipeline, "to"):
-            pipeline.to(torch.device("cpu"))
-        embedding_model = Model.from_pretrained(self.config.pyannote_embedding_model_dir)
-        embedding_inference = Inference(embedding_model, window="whole")
-        return pipeline, embedding_inference
-
-    def _load_local_speaker_model(self) -> Any:
-        _force_offline_mode()
-        try:
-            from speechbrain.inference.speaker import EncoderClassifier
-        except ImportError:  # pragma: no cover - speechbrain older import path
-            from speechbrain.pretrained import EncoderClassifier
-        from speechbrain.utils.fetching import LocalStrategy
-
-        return EncoderClassifier.from_hparams(
-            source=self.config.speaker_embedding_model_dir,
-            savedir=self.config.speaker_embedding_model_dir,
-            local_strategy=LocalStrategy.COPY,
-            run_opts={"device": "cpu"},
-        )
-
-    def _run_local_ecapa_diarization(self, chunk: AudioChunk, classifier: Any) -> list[DiarizationTurn]:
-        rows = self._wait_for_chunk_transcript_rows(chunk.index)
-        if not rows:
-            return []
-
-        embeddings: list[list[float]] = []
-        row_indexes: list[int] = []
-        for index, row in enumerate(rows):
-            if (row.end - row.start) < LOCAL_DIARIZATION_MIN_SECONDS:
-                continue
-            audio_window = extract_row_audio_window(chunk, row)
-            embedding = self._extract_speechbrain_embedding(classifier, audio_window)
-            if embedding is None:
-                continue
-            embeddings.append(embedding)
-            row_indexes.append(index)
-
-        labels = cluster_local_embeddings(embeddings, self.config.speaker_cluster_distance_threshold)
-        turns: list[DiarizationTurn] = []
-        label_by_row = {row_index: labels[index] for index, row_index in enumerate(row_indexes)}
-        embedding_by_row = {row_index: embeddings[index] for index, row_index in enumerate(row_indexes)}
-        for index, row in enumerate(rows):
-            local_label = label_by_row.get(index)
-            embedding = embedding_by_row.get(index)
-            turns.append(
-                DiarizationTurn(
-                    start=row.start,
-                    end=row.end,
-                    local_label=f"local_{local_label}" if local_label is not None and local_label >= 0 else "unknown",
-                    embedding=embedding,
-                    confidence=1.0 if embedding is not None else 0.0,
-                )
-            )
-        return turns
-
-    def _wait_for_chunk_transcript_rows(self, chunk_index: int) -> list[TranscriptRow]:
-        deadline = time.monotonic() + max(30.0, self.config.chunk_seconds * 4.0)
-        while True:
-            rows = [row for row in self.store.snapshot() if row.chunk_index == chunk_index]
-            with self._state_lock:
-                transcription_pending = chunk_index in self._pending_transcription_chunks
-            if rows or not transcription_pending or time.monotonic() >= deadline:
-                return rows
-            time.sleep(0.05)
-
-    @staticmethod
-    def _extract_speechbrain_embedding(classifier: Any, audio_window: Any) -> Optional[list[float]]:
-        try:
-            import numpy as np
-            import torch
-
-            waveform = torch.from_numpy(np.asarray(audio_window, dtype=np.float32)).float().unsqueeze(0)
-            with torch.no_grad():
-                result = classifier.encode_batch(waveform)
-            if hasattr(result, "detach"):
-                result = result.detach().cpu().numpy()
-            values = result.tolist() if hasattr(result, "tolist") else list(result)
-            while values and isinstance(values[0], list):
-                values = values[0]
-            return [float(value) for value in values]
-        except Exception:
-            return None
-
-    def _run_pyannote_diarization(self, chunk: AudioChunk, pipeline: Any, embedding_inference: Any) -> list[DiarizationTurn]:
-        import numpy as np
-        import torch
-        from pyannote.core import Segment
-
-        waveform = torch.from_numpy(np.asarray(chunk.samples, dtype=np.float32)).unsqueeze(0)
-        audio = {"waveform": waveform, "sample_rate": chunk.sample_rate}
-        diarization = pipeline(audio)
-        turns: list[DiarizationTurn] = []
-        for segment, _track, label in diarization.itertracks(yield_label=True):
-            start = chunk.start_time + float(segment.start)
-            end = chunk.start_time + float(segment.end)
-            embedding = self._extract_embedding(
-                embedding_inference,
-                audio,
-                Segment(float(segment.start), float(segment.end)),
-            )
-            turns.append(
-                DiarizationTurn(
-                    start=start,
-                    end=end,
-                    local_label=str(label),
-                    embedding=embedding,
-                    confidence=1.0 if embedding else 0.0,
-                )
-            )
-        return turns
-
-    @staticmethod
-    def _extract_embedding(embedding_inference: Any, audio: dict[str, Any], segment: Any) -> Optional[list[float]]:
-        try:
-            result = embedding_inference.crop(audio, segment)
-            if hasattr(result, "detach"):
-                result = result.detach().cpu().numpy()
-            if hasattr(result, "tolist"):
-                values = result.tolist()
-            else:
-                values = list(result)
-            while values and isinstance(values[0], list):
-                values = values[0]
-            return [float(value) for value in values]
-        except Exception:
-            return None
 
     def _emit(self, event_type: str, payload: dict[str, Any]) -> None:
         for handler in list(self._event_handlers):

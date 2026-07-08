@@ -95,7 +95,7 @@ def write_payload_file(root: Path, rel_path: str, encoded: str, expected_sha: st
 
 
 def ensure_runtime_folders(root: Path) -> None:
-    for model in ("faster-whisper", "speechbrain-ecapa", "pyannote-pipeline", "pyannote-embedding"):
+    for model in ("faster-whisper",):
         (root / "models" / model).mkdir(parents=True, exist_ok=True)
     (root / "transcripts").mkdir(parents=True, exist_ok=True)
     config_path = root / "config.json"

@@ -33,8 +33,6 @@ python -m PyInstaller --clean --noconfirm .\packaging\local_whisper_transcriber.
 
 $DistDir = ".\dist\OfflineMeetingTranscriber"
 New-Item -ItemType Directory -Force -Path "$DistDir\models\faster-whisper" | Out-Null
-New-Item -ItemType Directory -Force -Path "$DistDir\models\pyannote-pipeline" | Out-Null
-New-Item -ItemType Directory -Force -Path "$DistDir\models\pyannote-embedding" | Out-Null
 New-Item -ItemType Directory -Force -Path "$DistDir\transcripts" | Out-Null
 
 Copy-Item -LiteralPath ".\packaging\Run-OfflineMeetingTranscriber.bat" -Destination "$DistDir\Run-OfflineMeetingTranscriber.bat" -Force

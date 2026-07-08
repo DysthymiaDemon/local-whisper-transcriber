@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_all, collect_submodules
+from PyInstaller.utils.hooks import collect_all
 
 
 block_cipher = None
@@ -16,18 +16,12 @@ for package in (
     "PySide6",
     "faster_whisper",
     "ctranslate2",
-    "pyannote.audio",
-    "torch",
-    "torchaudio",
     "sounddevice",
 ):
     package_datas, package_binaries, package_hiddenimports = collect_all(package)
     datas += package_datas
     binaries += package_binaries
     hiddenimports += package_hiddenimports
-
-hiddenimports += collect_submodules("pyannote")
-hiddenimports += collect_submodules("torch")
 
 a = Analysis(
     ["app/bootstrap_launcher.py"],

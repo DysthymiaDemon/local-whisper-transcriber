@@ -32,15 +32,12 @@ REQUIRED_IMPORTS: dict[str, str] = {
     "PySide6": "PySide6",
     "sounddevice": "sounddevice",
     "faster-whisper": "faster_whisper",
-    "speechbrain": "speechbrain",
-    "scikit-learn": "sklearn",
     "huggingface_hub": "huggingface_hub",
     "truststore": "truststore",
-    "torch": "torch",
 }
 
-DEFAULT_MODEL_DIRS = ("faster-whisper", "speechbrain-ecapa")
-OPTIONAL_MODEL_DIRS = ("pyannote-pipeline", "pyannote-embedding")
+DEFAULT_MODEL_DIRS = ("faster-whisper",)
+OPTIONAL_MODEL_DIRS: tuple[str, ...] = ()
 MODEL_DIRS = DEFAULT_MODEL_DIRS + OPTIONAL_MODEL_DIRS
 MODEL_GUIDES: dict[str, str] = {
     "faster-whisper": (
@@ -48,25 +45,6 @@ MODEL_GUIDES: dict[str, str] = {
         "Required file:\n"
         "- model.bin\n\n"
         "Example source model: Systran/faster-whisper-small\n"
-    ),
-    "speechbrain-ecapa": (
-        "Default setup downloads the non-gated SpeechBrain ECAPA speaker model here.\n\n"
-        "Required files:\n"
-        "- hyperparams.yaml\n"
-        "- embedding_model.ckpt or model.ckpt\n\n"
-        "Example source model: speechbrain/spkrec-ecapa-voxceleb\n"
-    ),
-    "pyannote-pipeline": (
-        "Optional advanced backend only. Copy the local pyannote diarization pipeline here.\n\n"
-        "Required file:\n"
-        "- config.yaml\n\n"
-        "The config.yaml must reference local model paths only.\n"
-    ),
-    "pyannote-embedding": (
-        "Optional advanced backend only. Copy the local pyannote embedding model here.\n\n"
-        "Required files:\n"
-        "- config.yaml\n"
-        "- pytorch_model.bin or model.safetensors\n"
     ),
 }
 SETUP_MARKER = ".setup_complete"
@@ -185,11 +163,6 @@ DEFAULT_MODEL_DOWNLOADS = (
         name="faster-whisper",
         repo_id="Systran/faster-whisper-small",
         target_subdir="models/faster-whisper",
-    ),
-    ModelDownloadSpec(
-        name="speechbrain-ecapa",
-        repo_id="speechbrain/spkrec-ecapa-voxceleb",
-        target_subdir="models/speechbrain-ecapa",
     ),
 )
 
@@ -906,19 +879,12 @@ def ensure_portable_layout(root: Path, template_root: Path | None = None) -> Pat
                 json.dumps(
                     {
                         "whisper_model_dir": "models/faster-whisper",
-                        "diarization_backend": "local-ecapa",
-                        "speaker_embedding_model_dir": "models/speechbrain-ecapa",
-                        "speaker_cluster_distance_threshold": 0.55,
-                        "pyannote_pipeline_dir": "models/pyannote-pipeline",
-                        "pyannote_embedding_model_dir": "models/pyannote-embedding",
                         "output_file": "transcripts/meeting_transcript.txt",
                         "sample_rate": 16000,
-                        "chunk_seconds": 8.0,
-                        "overlap_seconds": 2.0,
+                        "chunk_seconds": 4.0,
+                        "overlap_seconds": 0.5,
                         "compute_type": "int8",
-                        "speaker_match_threshold": 0.7,
-                        "min_speaker_confidence": 0.5,
-                        "min_overlap_ratio": 0.35,
+                        "language": "en",
                     },
                     indent=2,
                 )
@@ -935,16 +901,6 @@ def _model_folder_ready(root: Path, name: str) -> bool:
 def _model_folder_ready_at(folder: Path, name: str) -> bool:
     if name == "faster-whisper":
         return (folder / "model.bin").is_file()
-    if name == "speechbrain-ecapa":
-        return (folder / "hyperparams.yaml").is_file() and any(
-            (folder / filename).is_file() for filename in ("embedding_model.ckpt", "model.ckpt")
-        )
-    if name == "pyannote-pipeline":
-        return (folder / "config.yaml").is_file()
-    if name == "pyannote-embedding":
-        return (folder / "config.yaml").is_file() and any(
-            (folder / filename).is_file() for filename in ("pytorch_model.bin", "model.safetensors")
-        )
     return False
 
 

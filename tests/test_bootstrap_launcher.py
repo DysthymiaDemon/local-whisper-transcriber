@@ -93,12 +93,12 @@ class BootstrapLauncherTests(unittest.TestCase):
         self.assertIn("PySide6", REQUIRED_IMPORTS)
         self.assertIn("sounddevice", REQUIRED_IMPORTS)
         self.assertIn("faster-whisper", REQUIRED_IMPORTS)
-        self.assertIn("speechbrain", REQUIRED_IMPORTS)
-        self.assertIn("scikit-learn", REQUIRED_IMPORTS)
         self.assertIn("huggingface_hub", REQUIRED_IMPORTS)
         self.assertIn("truststore", REQUIRED_IMPORTS)
+        self.assertNotIn("speechbrain", REQUIRED_IMPORTS)
+        self.assertNotIn("scikit-learn", REQUIRED_IMPORTS)
         self.assertNotIn("pyannote.audio", REQUIRED_IMPORTS)
-        self.assertIn("torch", REQUIRED_IMPORTS)
+        self.assertNotIn("torch", REQUIRED_IMPORTS)
 
     def test_setup_install_summary_lists_publisher_models_and_packages(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -115,7 +115,7 @@ class BootstrapLauncherTests(unittest.TestCase):
 
         self.assertIn(f"Publisher: {APP_PUBLISHER}", summary)
         self.assertIn("Systran/faster-whisper-small -> models\\faster-whisper", summary)
-        self.assertIn("speechbrain/spkrec-ecapa-voxceleb -> models\\speechbrain-ecapa", summary)
+        self.assertNotIn("speechbrain", summary)
         self.assertEqual(packages, ["alpha==1.0", "beta>=2.0"])
         self.assertIn("- alpha==1.0", summary)
         self.assertIn("- beta>=2.0", summary)
@@ -141,17 +141,16 @@ class BootstrapLauncherTests(unittest.TestCase):
             self.assertTrue(config_path.exists())
             self.assertTrue((root / ".runtime").is_dir())
             self.assertTrue((root / "models" / "faster-whisper").is_dir())
-            self.assertTrue((root / "models" / "speechbrain-ecapa").is_dir())
-            self.assertTrue((root / "models" / "pyannote-pipeline").is_dir())
-            self.assertTrue((root / "models" / "pyannote-embedding").is_dir())
+            self.assertFalse((root / "models" / "speechbrain-ecapa").exists())
+            self.assertFalse((root / "models" / "pyannote-pipeline").exists())
+            self.assertFalse((root / "models" / "pyannote-embedding").exists())
             self.assertTrue((root / "transcripts").is_dir())
             self.assertTrue((root / "models" / "faster-whisper" / "README_MODEL_FILES.txt").is_file())
             config = json.loads(config_path.read_text(encoding="utf-8"))
 
         self.assertEqual(config["whisper_model_dir"], "models/faster-whisper")
-        self.assertEqual(config["diarization_backend"], "local-ecapa")
-        self.assertEqual(config["speaker_embedding_model_dir"], "models/speechbrain-ecapa")
         self.assertEqual(config["output_file"], "transcripts/meeting_transcript.txt")
+        self.assertEqual(config["language"], "en")
 
     def test_local_runtime_paths_stay_under_install_root_without_venv(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -362,31 +361,27 @@ class BootstrapLauncherTests(unittest.TestCase):
             root = Path(tmp)
             ensure_portable_layout(root)
             (root / "models" / "faster-whisper" / "model.bin").write_bytes(b"model")
-            (root / "models" / "speechbrain-ecapa" / "hyperparams.yaml").write_text("speaker", encoding="utf-8")
 
             status = model_folder_status(root)
 
         self.assertEqual(status["faster-whisper"], BootstrapStatus.READY)
-        self.assertEqual(status["speechbrain-ecapa"], BootstrapStatus.MISSING)
-        self.assertNotIn("pyannote-pipeline", status)
+        self.assertEqual(set(status), {"faster-whisper"})
 
-    def test_model_folder_status_can_include_optional_pyannote_dirs(self):
+    def test_model_folder_status_has_no_optional_diarization_dirs(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             ensure_portable_layout(root)
-            (root / "models" / "pyannote-pipeline" / "config.yaml").write_text("pipeline", encoding="utf-8")
 
             status = model_folder_status(root, include_optional=True)
 
-        self.assertEqual(status["pyannote-pipeline"], BootstrapStatus.READY)
-        self.assertEqual(status["pyannote-embedding"], BootstrapStatus.MISSING)
+        self.assertEqual(set(status), {"faster-whisper"})
 
     def test_missing_model_setup_message_blocks_launch(self):
-        message = missing_model_setup_message(["faster-whisper", "speechbrain-ecapa"])
+        message = missing_model_setup_message(["faster-whisper"])
 
         self.assertIn("Setup stopped", message)
         self.assertIn("faster-whisper", message)
-        self.assertIn("speechbrain-ecapa", message)
+        self.assertNotIn("speechbrain", message)
         self.assertIn("Recording cannot start", message)
 
     def test_model_downloader_skips_complete_default_models(self):
@@ -394,9 +389,6 @@ class BootstrapLauncherTests(unittest.TestCase):
             root = Path(tmp)
             ensure_portable_layout(root)
             (root / "models" / "faster-whisper" / "model.bin").write_bytes(b"model")
-            speaker = root / "models" / "speechbrain-ecapa"
-            (speaker / "hyperparams.yaml").write_text("speaker", encoding="utf-8")
-            (speaker / "embedding_model.ckpt").write_bytes(b"speaker")
             calls = []
 
             downloaded = download_default_models(
@@ -417,24 +409,19 @@ class BootstrapLauncherTests(unittest.TestCase):
             def fake_download(**kwargs):
                 calls.append(kwargs)
                 target = Path(kwargs["local_dir"])
-                if kwargs["repo_id"] == "Systran/faster-whisper-small":
-                    (target / "model.bin").write_bytes(b"model")
-                else:
-                    (target / "hyperparams.yaml").write_text("speaker", encoding="utf-8")
-                    (target / "embedding_model.ckpt").write_bytes(b"speaker")
+                self.assertEqual(kwargs["repo_id"], "Systran/faster-whisper-small")
+                (target / "model.bin").write_bytes(b"model")
                 return str(target)
 
             downloaded = download_default_models(root, lambda event: None, downloader=fake_download)
 
-            self.assertEqual(downloaded, ["faster-whisper", "speechbrain-ecapa"])
+            self.assertEqual(downloaded, ["faster-whisper"])
             self.assertEqual([call["repo_id"] for call in calls], [spec.repo_id for spec in DEFAULT_MODEL_DOWNLOADS])
             self.assertTrue(all(call["local_files_only"] is False for call in calls))
             self.assertTrue(all(call["force_download"] is True for call in calls))
             self.assertTrue(all(Path(call["local_dir"]).is_relative_to(local_runtime_dir(root)) for call in calls))
             self.assertTrue(all("model-downloads" in Path(call["local_dir"]).parts for call in calls))
             self.assertTrue((root / "models" / "faster-whisper" / "model.bin").is_file())
-            self.assertTrue((root / "models" / "speechbrain-ecapa" / "hyperparams.yaml").is_file())
-            self.assertTrue((root / "models" / "speechbrain-ecapa" / "embedding_model.ckpt").is_file())
 
     def test_model_downloader_does_not_treat_placeholder_as_downloaded_model(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -446,20 +433,16 @@ class BootstrapLauncherTests(unittest.TestCase):
             def fake_download(**kwargs):
                 calls.append(kwargs)
                 target = Path(kwargs["local_dir"])
-                if kwargs["repo_id"] == "Systran/faster-whisper-small":
-                    (target / "model.bin").write_bytes(b"model")
-                else:
-                    (target / "hyperparams.yaml").write_text("speaker", encoding="utf-8")
-                    (target / "model.ckpt").write_bytes(b"speaker")
+                self.assertEqual(kwargs["repo_id"], "Systran/faster-whisper-small")
+                (target / "model.bin").write_bytes(b"model")
                 return str(target)
 
             downloaded = download_default_models(root, lambda event: None, downloader=fake_download)
 
-            self.assertEqual(downloaded, ["faster-whisper", "speechbrain-ecapa"])
-            self.assertEqual(len(calls), 2)
+            self.assertEqual(downloaded, ["faster-whisper"])
+            self.assertEqual(len(calls), 1)
             self.assertTrue((root / "models" / "faster-whisper" / "README_MODEL_FILES.txt").is_file())
             self.assertTrue((root / "models" / "faster-whisper" / "model.bin").is_file())
-            self.assertTrue((root / "models" / "speechbrain-ecapa" / "model.ckpt").is_file())
 
     def test_model_downloader_clears_stale_staging_before_download(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -472,11 +455,8 @@ class BootstrapLauncherTests(unittest.TestCase):
             def fake_download(**kwargs):
                 target = Path(kwargs["local_dir"])
                 self.assertFalse((target / "stale.txt").exists())
-                if kwargs["repo_id"] == "Systran/faster-whisper-small":
-                    (target / "model.bin").write_bytes(b"model")
-                else:
-                    (target / "hyperparams.yaml").write_text("speaker", encoding="utf-8")
-                    (target / "embedding_model.ckpt").write_bytes(b"speaker")
+                self.assertEqual(kwargs["repo_id"], "Systran/faster-whisper-small")
+                (target / "model.bin").write_bytes(b"model")
                 return str(target)
 
             download_default_models(root, lambda event: None, downloader=fake_download)
@@ -492,11 +472,8 @@ class BootstrapLauncherTests(unittest.TestCase):
             def fake_download(**kwargs):
                 seen_env.append({name: os.environ.get(name) for name in HF_OFFLINE_ENV_VARS})
                 target = Path(kwargs["local_dir"])
-                if kwargs["repo_id"] == "Systran/faster-whisper-small":
-                    (target / "model.bin").write_bytes(b"model")
-                else:
-                    (target / "hyperparams.yaml").write_text("speaker", encoding="utf-8")
-                    (target / "embedding_model.ckpt").write_bytes(b"speaker")
+                self.assertEqual(kwargs["repo_id"], "Systran/faster-whisper-small")
+                (target / "model.bin").write_bytes(b"model")
                 return str(target)
 
             with patch.dict(
@@ -729,9 +706,6 @@ class BootstrapLauncherTests(unittest.TestCase):
             (root / SETUP_MARKER).write_text("complete\n", encoding="utf-8")
             local_package_dir(root).mkdir(parents=True)
             (root / "models" / "faster-whisper" / "model.bin").write_bytes(b"model")
-            speaker = root / "models" / "speechbrain-ecapa"
-            (speaker / "hyperparams.yaml").write_text("speaker", encoding="utf-8")
-            (speaker / "embedding_model.ckpt").write_bytes(b"speaker")
 
             self.assertFalse(needs_setup(root, {"json": "json"}))
 
@@ -740,8 +714,8 @@ class BootstrapLauncherTests(unittest.TestCase):
 
         collect = parser.parse("Collecting PySide6==6.11.1")
         download = parser.parse("Downloading pyside6-6.11.1-cp310-abi3-win_amd64.whl (578 kB)")
-        installing = parser.parse("Installing collected packages: PySide6, sounddevice, torch")
-        installed_one = parser.parse("Successfully installed PySide6-6.11.1 sounddevice-0.5.5 torch-2.11.0")
+        installing = parser.parse("Installing collected packages: PySide6, sounddevice")
+        installed_one = parser.parse("Successfully installed PySide6-6.11.1 sounddevice-0.5.5")
 
         self.assertEqual(collect.phase, "Resolving package")
         self.assertEqual(collect.detail, "PySide6==6.11.1")
@@ -824,15 +798,10 @@ class BootstrapLauncherTests(unittest.TestCase):
 
             def fake_download(**kwargs):
                 target = Path(kwargs["local_dir"])
-                if kwargs["repo_id"] == "Systran/faster-whisper-small":
-                    for size in (25, 50, 100):
-                        (target / "model.bin").write_bytes(b"x" * size)
-                        time.sleep(0.35)
-                else:
-                    (target / "hyperparams.yaml").write_text("speaker", encoding="utf-8")
-                    for size in (25, 50, 100):
-                        (target / "embedding_model.ckpt").write_bytes(b"x" * size)
-                        time.sleep(0.35)
+                self.assertEqual(kwargs["repo_id"], "Systran/faster-whisper-small")
+                for size in (25, 50, 100):
+                    (target / "model.bin").write_bytes(b"x" * size)
+                    time.sleep(0.35)
                 return str(target)
 
             with patch.object(bootstrap_launcher_module, "fetch_model_repo_size", return_value=100, create=True):
@@ -937,16 +906,16 @@ class BootstrapLauncherTests(unittest.TestCase):
         tracker.record(
             PipProgressEvent(
                 "Installing packages",
-                "torch, torchaudio",
+                "faster-whisper, PySide6",
                 0,
-                "Installing collected packages: torch, torchaudio",
+                "Installing collected packages: faster-whisper, PySide6",
             ),
             now=130.0,
         )
         progress, detail = tracker.record(PipProgressEvent("Running pip", "Building wheels"), now=180.0)
 
         self.assertLess(progress, 100)
-        self.assertIn("Installing collected packages: torch, torchaudio", detail)
+        self.assertIn("Installing collected packages: faster-whisper, PySide6", detail)
         self.assertNotIn("ETA ~1s", detail)
 
     def test_install_log_records_setup_events(self):

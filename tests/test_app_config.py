@@ -93,11 +93,8 @@ class PortableConfigTests(unittest.TestCase):
             config = default_portable_config(root)
 
         self.assertEqual(config.whisper_model_dir, os.path.join(tmp, "models", "faster-whisper"))
-        self.assertEqual(config.diarization_backend, "local-ecapa")
-        self.assertEqual(config.speaker_embedding_model_dir, os.path.join(tmp, "models", "speechbrain-ecapa"))
-        self.assertEqual(config.pyannote_pipeline_dir, os.path.join(tmp, "models", "pyannote-pipeline"))
-        self.assertEqual(config.pyannote_embedding_model_dir, os.path.join(tmp, "models", "pyannote-embedding"))
         self.assertEqual(config.output_file, os.path.join(tmp, "transcripts", "meeting_transcript.txt"))
+        self.assertEqual(config.language, "en")
 
     def test_config_file_overrides_portable_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -127,9 +124,6 @@ class PortableConfigTests(unittest.TestCase):
                 json.dumps(
                     {
                         "whisper_model_dir": "custom/whisper",
-                        "speaker_embedding_model_dir": "custom/speaker",
-                        "pyannote_pipeline_dir": "custom/pipeline",
-                        "pyannote_embedding_model_dir": "custom/embedding",
                         "output_file": "custom-output/transcript.txt",
                     }
                 ),
@@ -139,10 +133,28 @@ class PortableConfigTests(unittest.TestCase):
             config = load_portable_config(root)
 
         self.assertEqual(config.whisper_model_dir, os.path.join(tmp, "custom", "whisper"))
-        self.assertEqual(config.speaker_embedding_model_dir, os.path.join(tmp, "custom", "speaker"))
-        self.assertEqual(config.pyannote_pipeline_dir, os.path.join(tmp, "custom", "pipeline"))
-        self.assertEqual(config.pyannote_embedding_model_dir, os.path.join(tmp, "custom", "embedding"))
         self.assertEqual(config.output_file, os.path.join(tmp, "custom-output", "transcript.txt"))
+
+    def test_legacy_diarization_config_uses_new_transcription_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "config.json").write_text(
+                json.dumps(
+                    {
+                        "diarization_backend": "local-ecapa",
+                        "speaker_embedding_model_dir": "models/speechbrain-ecapa",
+                        "chunk_seconds": 8.0,
+                        "overlap_seconds": 2.0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_portable_config(root)
+
+        self.assertEqual(config.chunk_seconds, 4.0)
+        self.assertEqual(config.overlap_seconds, 0.5)
+        self.assertFalse(hasattr(config, "diarization_backend"))
 
 
 if __name__ == "__main__":

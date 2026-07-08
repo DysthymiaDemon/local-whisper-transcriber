@@ -82,7 +82,7 @@ class StandaloneLauncherTests(unittest.TestCase):
             self.assertTrue((app_root / "resources" / "requirements.txt").is_file())
             self.assertTrue((app_root / "config.json").is_file())
             self.assertTrue((app_root / "models" / "faster-whisper").is_dir())
-            self.assertTrue((app_root / "models" / "speechbrain-ecapa").is_dir())
+            self.assertFalse((app_root / "models" / "speechbrain-ecapa").exists())
             self.assertTrue((app_root / "transcripts").is_dir())
 
     def test_init_only_uses_current_folder_when_named_like_app(self):

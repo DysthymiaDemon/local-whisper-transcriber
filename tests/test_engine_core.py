@@ -1,7 +1,6 @@
 import os
 import sys
 import tempfile
-import types
 import unittest
 from pathlib import Path
 
@@ -9,134 +8,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 from transcriber_engine import (
     AtomicTranscriptWriter,
-    AudioChunk,
-    DiarizationTurn,
     DuplicateSuppressor,
     EngineConfig,
     InputBlockBuffer,
     MeetingTranscriberEngine,
-    SpeakerRegistry,
-    TranscriptRow,
     TranscriptStore,
-    cluster_local_embeddings,
-    extract_row_audio_window,
     microphone_health_message,
     preferred_input_sample_rate,
     resample_audio,
     rms_to_meter_percent,
+    transcription_segment_is_usable,
 )
-
-
-class SpeakerRegistryTests(unittest.TestCase):
-    def test_same_embedding_reuses_existing_speaker(self):
-        registry = SpeakerRegistry(match_threshold=0.70)
-
-        first = registry.assign([1.0, 0.0, 0.0], confidence=0.95)
-        second = registry.assign([0.98, 0.02, 0.0], confidence=0.95)
-
-        self.assertEqual(first.key, "speaker_1")
-        self.assertEqual(second.key, "speaker_1")
-        self.assertEqual(registry.display_name("speaker_1"), "Speaker 1")
-
-    def test_different_embedding_creates_new_speaker(self):
-        registry = SpeakerRegistry(match_threshold=0.70)
-
-        first = registry.assign([1.0, 0.0, 0.0], confidence=0.95)
-        second = registry.assign([0.0, 1.0, 0.0], confidence=0.95)
-
-        self.assertEqual(first.key, "speaker_1")
-        self.assertEqual(second.key, "speaker_2")
-
-    def test_recent_speaker_reuses_moderate_continuity_match(self):
-        registry = SpeakerRegistry(match_threshold=0.70, continuity_threshold=0.45)
-
-        first = registry.assign([1.0, 0.0, 0.0], confidence=0.95)
-        second = registry.assign([0.5, 0.8660254, 0.0], confidence=0.95)
-
-        self.assertEqual(first.key, "speaker_1")
-        self.assertEqual(second.key, "speaker_1")
-        self.assertEqual(first.sample_count, 2)
-
-    def test_low_confidence_keeps_unknown_speaker(self):
-        registry = SpeakerRegistry(match_threshold=0.70)
-
-        identity = registry.assign([1.0, 0.0, 0.0], confidence=0.20)
-
-        self.assertIsNone(identity)
-
-
-class TranscriptStoreTests(unittest.TestCase):
-    def test_transcript_row_updates_when_diarization_arrives_later(self):
-        registry = SpeakerRegistry(match_threshold=0.70)
-        store = TranscriptStore(registry)
-
-        row = store.add_transcript(
-            chunk_index=4,
-            start=12.0,
-            end=15.0,
-            text="We need to close the action items.",
-        )
-        self.assertEqual(row.speaker_label, "Speaker ?")
-
-        updates = store.apply_diarization(
-            chunk_index=4,
-            turns=[
-                DiarizationTurn(
-                    start=11.5,
-                    end=15.5,
-                    local_label="LOCAL_A",
-                    embedding=[1.0, 0.0, 0.0],
-                    confidence=0.95,
-                )
-            ],
-        )
-
-        self.assertEqual(len(updates), 1)
-        self.assertEqual(store.rows[0].id, row.id)
-        self.assertEqual(store.rows[0].speaker_label, "Speaker 1")
-        self.assertEqual(store.rows[0].text, "We need to close the action items.")
-
-    def test_low_overlap_diarization_does_not_force_wrong_label(self):
-        registry = SpeakerRegistry(match_threshold=0.70)
-        store = TranscriptStore(registry, min_overlap_ratio=0.50)
-        store.add_transcript(chunk_index=1, start=10.0, end=20.0, text="Long segment")
-
-        updates = store.apply_diarization(
-            chunk_index=1,
-            turns=[
-                DiarizationTurn(
-                    start=10.0,
-                    end=11.0,
-                    local_label="LOCAL_A",
-                    embedding=[1.0, 0.0, 0.0],
-                    confidence=0.95,
-                )
-            ],
-        )
-
-        self.assertEqual(updates, [])
-        self.assertEqual(store.rows[0].speaker_label, "Speaker ?")
-
-    def test_rename_speaker_updates_existing_rows(self):
-        registry = SpeakerRegistry(match_threshold=0.70)
-        store = TranscriptStore(registry)
-        store.add_transcript(chunk_index=1, start=0.0, end=2.0, text="Hello.")
-        store.apply_diarization(
-            chunk_index=1,
-            turns=[
-                DiarizationTurn(
-                    start=0.0,
-                    end=2.0,
-                    local_label="LOCAL_A",
-                    embedding=[1.0, 0.0, 0.0],
-                    confidence=0.95,
-                )
-            ],
-        )
-
-        store.rename_speaker("speaker_1", "Alice")
-
-        self.assertEqual(store.rows[0].speaker_label, "Alice")
 
 
 class DuplicateSuppressorTests(unittest.TestCase):
@@ -148,71 +30,20 @@ class DuplicateSuppressorTests(unittest.TestCase):
         self.assertFalse(suppressor.is_duplicate(13.1, "Confirm the deadline."))
 
 
-class LocalDiarizationHelperTests(unittest.TestCase):
-    def test_cluster_local_embeddings_groups_similar_vectors(self):
-        labels = cluster_local_embeddings(
-            [
-                [1.0, 0.0, 0.0],
-                [0.98, 0.02, 0.0],
-                [0.0, 1.0, 0.0],
-            ],
-            distance_threshold=0.20,
-        )
+class TranscriptStoreTests(unittest.TestCase):
+    def test_add_transcript_keeps_plain_text_rows(self):
+        store = TranscriptStore()
 
-        self.assertEqual(labels[0], labels[1])
-        self.assertNotEqual(labels[0], labels[2])
+        row = store.add_transcript(chunk_index=1, start=0.0, end=2.0, text=" Hello team. ")
 
-    def test_short_transcript_segment_is_padded_for_embedding(self):
-        import numpy as np
-
-        chunk = AudioChunk(
-            index=1,
-            start_time=0.0,
-            samples=np.ones(16000, dtype=np.float32),
-            sample_rate=16000,
-        )
-        row = TranscriptRow(
-            id="row_1",
-            chunk_index=1,
-            start=0.10,
-            end=0.20,
-            text="Yes.",
-        )
-
-        window = extract_row_audio_window(chunk, row, target_seconds=1.0)
-
-        self.assertEqual(len(window), 16000)
-
-    def test_tiny_transcript_segment_does_not_spawn_local_speaker(self):
-        import numpy as np
-
-        class UnexpectedClassifier:
-            def encode_batch(self, waveform):
-                raise AssertionError("short segment should not be embedded")
-
-        engine = MeetingTranscriberEngine(EngineConfig())
-        engine.store.add_transcript(chunk_index=1, start=0.0, end=0.3, text="Yes.")
-        chunk = AudioChunk(
-            index=1,
-            start_time=0.0,
-            samples=np.ones(16000, dtype=np.float32),
-            sample_rate=16000,
-        )
-
-        turns = engine._run_local_ecapa_diarization(chunk, UnexpectedClassifier())
-
-        self.assertEqual(len(turns), 1)
-        self.assertEqual(turns[0].local_label, "unknown")
-        self.assertIsNone(turns[0].embedding)
+        self.assertEqual(row.text, "Hello team.")
+        self.assertEqual(store.snapshot()[0].text, "Hello team.")
 
 
 class AtomicTranscriptWriterTests(unittest.TestCase):
-    def test_refresh_writes_latest_labels_atomically(self):
-        registry = SpeakerRegistry()
-        store = TranscriptStore(registry)
-        row = store.add_transcript(chunk_index=1, start=0.0, end=2.0, text="Hello team.")
-        row.speaker_key = "speaker_1"
-        row.speaker_label = "Speaker 1"
+    def test_refresh_writes_plain_transcript_atomically(self):
+        store = TranscriptStore()
+        store.add_transcript(chunk_index=1, start=0.0, end=2.0, text="Hello team.")
 
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "transcript.txt")
@@ -222,7 +53,8 @@ class AtomicTranscriptWriterTests(unittest.TestCase):
             with open(path, "r", encoding="utf-8") as handle:
                 content = handle.read()
 
-        self.assertIn("[00:00:00] Speaker 1: Hello team.", content)
+        self.assertIn("[00:00:00] Hello team.", content)
+        self.assertNotIn("Speaker", content)
 
 
 class InputBlockBufferTests(unittest.TestCase):
@@ -304,58 +136,21 @@ class MicrophoneDiagnosticsTests(unittest.TestCase):
         self.assertEqual(resampled.dtype, np.float32)
 
 
-class LocalSpeakerModelLoadTests(unittest.TestCase):
-    def test_local_speaker_model_uses_copy_strategy_to_avoid_windows_symlinks(self):
-        calls = {}
-        copy_strategy = object()
+class TranscriptionFilterTests(unittest.TestCase):
+    def test_rejects_high_no_speech_probability(self):
+        segment = type("Segment", (), {"no_speech_prob": 0.9})()
 
-        class FakeLocalStrategy:
-            COPY = copy_strategy
+        self.assertFalse(transcription_segment_is_usable(segment, "hello"))
 
-        class FakeEncoderClassifier:
-            @staticmethod
-            def from_hparams(**kwargs):
-                calls["kwargs"] = kwargs
-                return "classifier"
+    def test_rejects_low_log_probability(self):
+        segment = type("Segment", (), {"avg_logprob": -2.0})()
 
-        fake_speechbrain = types.ModuleType("speechbrain")
-        fake_speechbrain.__path__ = []
-        fake_inference = types.ModuleType("speechbrain.inference")
-        fake_inference.__path__ = []
-        fake_speaker = types.ModuleType("speechbrain.inference.speaker")
-        fake_speaker.EncoderClassifier = FakeEncoderClassifier
-        fake_utils = types.ModuleType("speechbrain.utils")
-        fake_utils.__path__ = []
-        fake_fetching = types.ModuleType("speechbrain.utils.fetching")
-        fake_fetching.LocalStrategy = FakeLocalStrategy
-        fake_speechbrain.inference = fake_inference
-        fake_speechbrain.utils = fake_utils
-        fake_inference.speaker = fake_speaker
-        fake_utils.fetching = fake_fetching
-        fake_modules = {
-            "speechbrain": fake_speechbrain,
-            "speechbrain.inference": fake_inference,
-            "speechbrain.inference.speaker": fake_speaker,
-            "speechbrain.utils": fake_utils,
-            "speechbrain.utils.fetching": fake_fetching,
-        }
-        previous_modules = {name: sys.modules.get(name) for name in fake_modules}
-        try:
-            sys.modules.update(fake_modules)
-            config = EngineConfig(speaker_embedding_model_dir=r"C:\models\speechbrain-ecapa")
-            result = MeetingTranscriberEngine(config)._load_local_speaker_model()
-        finally:
-            for name, module in previous_modules.items():
-                if module is None:
-                    sys.modules.pop(name, None)
-                else:
-                    sys.modules[name] = module
+        self.assertFalse(transcription_segment_is_usable(segment, "hello"))
 
-        self.assertEqual(result, "classifier")
-        self.assertEqual(calls["kwargs"]["source"], r"C:\models\speechbrain-ecapa")
-        self.assertEqual(calls["kwargs"]["savedir"], r"C:\models\speechbrain-ecapa")
-        self.assertEqual(calls["kwargs"]["run_opts"], {"device": "cpu"})
-        self.assertIs(calls["kwargs"]["local_strategy"], copy_strategy)
+    def test_accepts_normal_segment(self):
+        segment = type("Segment", (), {"no_speech_prob": 0.1, "avg_logprob": -0.2})()
+
+        self.assertTrue(transcription_segment_is_usable(segment, "hello"))
 
 
 class EngineConfigTests(unittest.TestCase):
@@ -363,46 +158,35 @@ class EngineConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             config = EngineConfig(
                 whisper_model_dir=os.path.join(tmp, "missing-whisper"),
-                speaker_embedding_model_dir=os.path.join(tmp, "missing-speaker"),
                 output_file=os.path.join(tmp, "out.txt"),
             )
 
             errors = config.validate()
 
         self.assertIn("Whisper model path does not exist", "\n".join(errors))
-        self.assertIn("Speaker embedding model path does not exist", "\n".join(errors))
-        self.assertNotIn("Pyannote pipeline path does not exist", "\n".join(errors))
+        self.assertNotIn("Speaker", "\n".join(errors))
 
-    def test_empty_model_folders_return_incomplete_validation_errors(self):
+    def test_empty_model_folder_returns_incomplete_validation_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             whisper = os.path.join(tmp, "whisper")
-            speaker = os.path.join(tmp, "speaker")
             os.mkdir(whisper)
-            os.mkdir(speaker)
             config = EngineConfig(
                 whisper_model_dir=whisper,
-                speaker_embedding_model_dir=speaker,
                 output_file=os.path.join(tmp, "out.txt"),
             )
 
             errors = "\n".join(config.validate())
 
         self.assertIn("Whisper model is incomplete: expected model.bin", errors)
-        self.assertIn("Speaker embedding model is incomplete", errors)
-        self.assertNotIn("Pyannote", errors)
+        self.assertNotIn("Speaker", errors)
 
     def test_minimal_required_model_files_pass_validation(self):
         with tempfile.TemporaryDirectory() as tmp:
             whisper = os.path.join(tmp, "whisper")
-            speaker = os.path.join(tmp, "speaker")
             os.mkdir(whisper)
-            os.mkdir(speaker)
             open(os.path.join(whisper, "model.bin"), "wb").close()
-            open(os.path.join(speaker, "hyperparams.yaml"), "w", encoding="utf-8").close()
-            open(os.path.join(speaker, "embedding_model.ckpt"), "wb").close()
             config = EngineConfig(
                 whisper_model_dir=whisper,
-                speaker_embedding_model_dir=speaker,
                 output_file=os.path.join(tmp, "out.txt"),
             )
 
@@ -410,29 +194,12 @@ class EngineConfigTests(unittest.TestCase):
 
         self.assertEqual(errors, [])
 
-    def test_pyannote_backend_validates_pyannote_model_files(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            whisper = os.path.join(tmp, "whisper")
-            pipeline = os.path.join(tmp, "pipeline")
-            embedding = os.path.join(tmp, "embedding")
-            os.mkdir(whisper)
-            os.mkdir(pipeline)
-            os.mkdir(embedding)
-            open(os.path.join(whisper, "model.bin"), "wb").close()
-            open(os.path.join(pipeline, "config.yaml"), "w", encoding="utf-8").close()
-            open(os.path.join(embedding, "config.yaml"), "w", encoding="utf-8").close()
-            open(os.path.join(embedding, "pytorch_model.bin"), "wb").close()
-            config = EngineConfig(
-                diarization_backend="pyannote",
-                whisper_model_dir=whisper,
-                pyannote_pipeline_dir=pipeline,
-                pyannote_embedding_model_dir=embedding,
-                output_file=os.path.join(tmp, "out.txt"),
-            )
+    def test_defaults_pin_english_and_shorter_chunks(self):
+        config = EngineConfig()
 
-            errors = config.validate()
-
-        self.assertEqual(errors, [])
+        self.assertEqual(config.language, "en")
+        self.assertEqual(config.chunk_seconds, 4.0)
+        self.assertEqual(config.overlap_seconds, 0.5)
 
 
 if __name__ == "__main__":

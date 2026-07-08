@@ -69,11 +69,6 @@ def default_portable_config(root: Path | None = None) -> EngineConfig:
     models_root = app_root / "models"
     return EngineConfig(
         whisper_model_dir=str(models_root / "faster-whisper"),
-        diarization_backend="local-ecapa",
-        speaker_embedding_model_dir=str(models_root / "speechbrain-ecapa"),
-        speaker_cluster_distance_threshold=0.55,
-        pyannote_pipeline_dir=str(models_root / "pyannote-pipeline"),
-        pyannote_embedding_model_dir=str(models_root / "pyannote-embedding"),
         output_file=str(app_root / "transcripts" / "meeting_transcript.txt"),
     )
 
@@ -92,11 +87,11 @@ def load_portable_config(root: Path | None = None) -> EngineConfig:
 
     allowed = set(EngineConfig.__dataclass_fields__.keys())
     overrides: dict[str, Any] = {key: value for key, value in raw.items() if key in allowed}
+    if raw.get("chunk_seconds") == 8.0 and raw.get("overlap_seconds") == 2.0 and "language" not in raw:
+        overrides["chunk_seconds"] = config.chunk_seconds
+        overrides["overlap_seconds"] = config.overlap_seconds
     for key in (
         "whisper_model_dir",
-        "speaker_embedding_model_dir",
-        "pyannote_pipeline_dir",
-        "pyannote_embedding_model_dir",
         "output_file",
     ):
         value = overrides.get(key)

@@ -6,12 +6,9 @@ from typing import Any
 
 from app_config import append_error_log, application_root, load_portable_config
 from transcriber_engine import (
-    DIARIZATION_BACKEND_LOCAL_ECAPA,
-    DIARIZATION_BACKEND_PYANNOTE,
     EngineConfig,
     MeetingTranscriberEngine,
     TranscriptRow,
-    format_timestamp,
     list_input_devices,
     rms_to_meter_percent,
 )
@@ -19,20 +16,17 @@ from transcriber_engine import (
 
 PORTABLE_DEFAULTS = load_portable_config()
 WHISPER_MODEL_DIR = PORTABLE_DEFAULTS.whisper_model_dir
-DIARIZATION_BACKEND = PORTABLE_DEFAULTS.diarization_backend
-SPEAKER_EMBEDDING_MODEL_DIR = PORTABLE_DEFAULTS.speaker_embedding_model_dir
-PYANNOTE_PIPELINE_DIR = PORTABLE_DEFAULTS.pyannote_pipeline_dir
-PYANNOTE_EMBEDDING_MODEL_DIR = PORTABLE_DEFAULTS.pyannote_embedding_model_dir
 OUTPUT_FILE = PORTABLE_DEFAULTS.output_file
 SAMPLE_RATE = PORTABLE_DEFAULTS.sample_rate
 CHUNK_SECONDS = PORTABLE_DEFAULTS.chunk_seconds
 OVERLAP_SECONDS = PORTABLE_DEFAULTS.overlap_seconds
 COMPUTE_TYPE = PORTABLE_DEFAULTS.compute_type
+LANGUAGE = PORTABLE_DEFAULTS.language
 
 
 try:
     from PySide6.QtCore import QObject, Qt, Signal
-    from PySide6.QtGui import QColor, QPainter, QPen
+    from PySide6.QtGui import QColor, QPainter, QPen, QTextCursor
     from PySide6.QtWidgets import (
         QApplication,
         QComboBox,
@@ -40,19 +34,13 @@ try:
         QFormLayout,
         QGroupBox,
         QHBoxLayout,
-        QHeaderView,
         QLabel,
         QLineEdit,
-        QListWidget,
-        QListWidgetItem,
         QMainWindow,
         QMessageBox,
         QPushButton,
         QSizePolicy,
         QSplitter,
-        QSpinBox,
-        QTableWidget,
-        QTableWidgetItem,
         QTextEdit,
         QVBoxLayout,
         QWidget,
@@ -120,8 +108,6 @@ class MainWindow(QMainWindow):
         self.engine: MeetingTranscriberEngine | None = None
         self.bridge = EngineSignalBridge()
         self.bridge.event.connect(self._handle_engine_event)
-        self.row_indexes: dict[str, int] = {}
-        self.speaker_keys_by_item: dict[int, str] = {}
 
         self._build_ui()
         self._load_devices()
@@ -138,18 +124,22 @@ class MainWindow(QMainWindow):
         main_splitter.setChildrenCollapsible(False)
         root_layout.addWidget(main_splitter, 1)
 
-        self.transcript_table = QTableWidget(0, 4)
-        self.transcript_table.setMinimumWidth(0)
-        self.transcript_table.setHorizontalHeaderLabels(["Time", "Speaker", "Text", "State"])
-        self.transcript_table.verticalHeader().setVisible(False)
-        self.transcript_table.setAlternatingRowColors(True)
-        self.transcript_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.transcript_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.transcript_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.transcript_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.transcript_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
-        self.transcript_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        main_splitter.addWidget(self.transcript_table)
+        self.transcript_text = QTextEdit()
+        self.transcript_text.setReadOnly(True)
+        self.transcript_text.setAcceptRichText(False)
+        self.transcript_text.setLineWrapMode(QTextEdit.WidgetWidth)
+        self.transcript_text.setPlaceholderText("Transcription appears here...")
+        self.transcript_text.setStyleSheet(
+            "QTextEdit {"
+            "background: #2b2b2b;"
+            "color: #f2f2f2;"
+            "border: 1px solid #444;"
+            "padding: 14px;"
+            "font: 14px 'Segoe UI';"
+            "selection-background-color: #174ea6;"
+            "}"
+        )
+        main_splitter.addWidget(self.transcript_text)
 
         right_panel = QWidget()
         right_panel.setMinimumWidth(260)
@@ -167,20 +157,21 @@ class MainWindow(QMainWindow):
         self.record_button = QPushButton("Record")
         self.pause_button = QPushButton("Pause")
         self.stop_button = QPushButton("Stop")
+        self.copy_button = QPushButton("Copy")
         self.record_button.clicked.connect(self._start_recording)
         self.pause_button.clicked.connect(self._toggle_pause)
         self.stop_button.clicked.connect(self._stop_recording)
+        self.copy_button.clicked.connect(self._copy_transcript)
         button_row.addWidget(self.record_button)
         button_row.addWidget(self.pause_button)
         button_row.addWidget(self.stop_button)
+        button_row.addWidget(self.copy_button)
         controls_layout.addLayout(button_row)
 
         status_row = QFormLayout()
         self.status_label = QLabel("Idle")
-        self.lag_label = QLabel("Diarization: 0 chunks behind")
         self.level_meter = MicLevelMeter()
         status_row.addRow("Status", self.status_label)
-        status_row.addRow("Speaker sync", self.lag_label)
         status_row.addRow("Mic level", self.level_meter)
         controls_layout.addLayout(status_row)
         right_layout.addWidget(controls)
@@ -189,63 +180,15 @@ class MainWindow(QMainWindow):
         settings_layout = QFormLayout(settings)
         self.device_combo = QComboBox()
         self.whisper_path = QLineEdit(WHISPER_MODEL_DIR)
-        self.backend_combo = QComboBox()
-        self.backend_combo.addItem("Local ECAPA (one-touch default)", DIARIZATION_BACKEND_LOCAL_ECAPA)
-        self.backend_combo.addItem("Pyannote advanced", DIARIZATION_BACKEND_PYANNOTE)
-        backend_index = self.backend_combo.findData(DIARIZATION_BACKEND)
-        self.backend_combo.setCurrentIndex(max(0, backend_index))
-        self.speaker_model_path = QLineEdit(SPEAKER_EMBEDDING_MODEL_DIR)
-        self.pyannote_path = QLineEdit(PYANNOTE_PIPELINE_DIR)
-        self.embedding_path = QLineEdit(PYANNOTE_EMBEDDING_MODEL_DIR)
         self.output_path = QLineEdit(OUTPUT_FILE)
-        self.chunk_seconds = QSpinBox()
-        self.chunk_seconds.setRange(3, 60)
-        self.chunk_seconds.setValue(int(CHUNK_SECONDS))
-        self.overlap_seconds = QSpinBox()
-        self.overlap_seconds.setRange(0, 20)
-        self.overlap_seconds.setValue(int(OVERLAP_SECONDS))
-        for widget in (
-            self.device_combo,
-            self.whisper_path,
-            self.backend_combo,
-            self.speaker_model_path,
-            self.pyannote_path,
-            self.embedding_path,
-            self.output_path,
-            self.chunk_seconds,
-            self.overlap_seconds,
-        ):
+        for widget in (self.device_combo, self.whisper_path, self.output_path):
             self._allow_field_to_shrink(widget)
 
         settings_layout.addRow("Microphone", self.device_combo)
         settings_layout.addRow("Whisper", self._path_row(self.whisper_path, folder=True))
-        settings_layout.addRow("Diarization", self.backend_combo)
-        settings_layout.addRow("Speaker model", self._path_row(self.speaker_model_path, folder=True))
-        self.pyannote_label = QLabel("Pyannote")
-        self.pyannote_row = self._path_row(self.pyannote_path, folder=True)
-        self.pyannote_embedding_label = QLabel("Pyannote embedding")
-        self.pyannote_embedding_row = self._path_row(self.embedding_path, folder=True)
-        settings_layout.addRow(self.pyannote_label, self.pyannote_row)
-        settings_layout.addRow(self.pyannote_embedding_label, self.pyannote_embedding_row)
         settings_layout.addRow("Output", self._path_row(self.output_path, folder=False))
-        settings_layout.addRow("Chunk seconds", self.chunk_seconds)
-        settings_layout.addRow("Overlap seconds", self.overlap_seconds)
-        self.backend_combo.currentIndexChanged.connect(self._toggle_backend_fields)
-        self._toggle_backend_fields()
         right_layout.addWidget(settings)
-
-        speakers = QGroupBox("Speakers")
-        speaker_layout = QVBoxLayout(speakers)
-        self.speaker_list = QListWidget()
-        rename_row = QHBoxLayout()
-        self.speaker_name = QLineEdit()
-        self.rename_button = QPushButton("Rename")
-        self.rename_button.clicked.connect(self._rename_selected_speaker)
-        rename_row.addWidget(self.speaker_name)
-        rename_row.addWidget(self.rename_button)
-        speaker_layout.addWidget(self.speaker_list)
-        speaker_layout.addLayout(rename_row)
-        right_layout.addWidget(speakers, 1)
+        right_layout.addStretch(1)
 
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
@@ -297,28 +240,14 @@ class MainWindow(QMainWindow):
     def _read_config(self) -> EngineConfig:
         return EngineConfig(
             whisper_model_dir=self.whisper_path.text().strip(),
-            diarization_backend=str(self.backend_combo.currentData() or DIARIZATION_BACKEND_LOCAL_ECAPA),
-            speaker_embedding_model_dir=self.speaker_model_path.text().strip(),
-            speaker_cluster_distance_threshold=PORTABLE_DEFAULTS.speaker_cluster_distance_threshold,
-            pyannote_pipeline_dir=self.pyannote_path.text().strip(),
-            pyannote_embedding_model_dir=self.embedding_path.text().strip(),
             output_file=self.output_path.text().strip(),
             sample_rate=SAMPLE_RATE,
-            chunk_seconds=float(self.chunk_seconds.value()),
-            overlap_seconds=float(self.overlap_seconds.value()),
+            chunk_seconds=float(CHUNK_SECONDS),
+            overlap_seconds=float(OVERLAP_SECONDS),
             compute_type=COMPUTE_TYPE,
             input_device=self.device_combo.currentData(),
+            language=LANGUAGE,
         )
-
-    def _toggle_backend_fields(self) -> None:
-        pyannote_selected = self.backend_combo.currentData() == DIARIZATION_BACKEND_PYANNOTE
-        for widget in (
-            self.pyannote_label,
-            self.pyannote_row,
-            self.pyannote_embedding_label,
-            self.pyannote_embedding_row,
-        ):
-            widget.setVisible(pyannote_selected)
 
     def _start_recording(self) -> None:
         config = self._read_config()
@@ -329,9 +258,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Configuration error", f"{message}\n\nError details saved to {log_path}")
             return
 
-        self.transcript_table.setRowCount(0)
-        self.row_indexes.clear()
-        self.speaker_list.clear()
+        self.transcript_text.clear()
         self.engine = MeetingTranscriberEngine(config)
         self.engine.on_event(lambda event_type, payload: self.bridge.event.emit(event_type, payload))
         try:
@@ -363,14 +290,9 @@ class MainWindow(QMainWindow):
         self.engine = None
         threading.Thread(target=engine.stop, name="gui-stop-engine", daemon=True).start()
 
-    def _rename_selected_speaker(self) -> None:
-        if not self.engine:
-            return
-        item = self.speaker_list.currentItem()
-        if item is None:
-            return
-        speaker_key = item.data(Qt.UserRole)
-        self.engine.rename_speaker(speaker_key, self.speaker_name.text())
+    def _copy_transcript(self) -> None:
+        clipboard = QApplication.clipboard()
+        clipboard.setText(self.transcript_text.toPlainText())
 
     def _handle_engine_event(self, event_type: str, payload: dict[str, Any]) -> None:
         if event_type == "status":
@@ -379,14 +301,8 @@ class MainWindow(QMainWindow):
             rms = float(payload.get("rms", 0.0))
             percent = payload.get("percent")
             self.level_meter.set_level(int(percent) if percent is not None else rms_to_meter_percent(rms))
-        elif event_type == "lag":
-            self.lag_label.setText(str(payload.get("message", "")))
         elif event_type == "transcript":
-            self._upsert_row(payload["row"])
-        elif event_type == "speaker_update":
-            self._upsert_row(payload["row"])
-        elif event_type == "speakers":
-            self._update_speakers(payload.get("speakers", []))
+            self._append_transcript(payload["row"])
         elif event_type == "error":
             message = str(payload.get("message", ""))
             if message:
@@ -395,38 +311,17 @@ class MainWindow(QMainWindow):
         elif event_type == "log":
             self._append_log(str(payload.get("message", "")))
 
-    def _upsert_row(self, row: TranscriptRow) -> None:
-        if row.id in self.row_indexes:
-            index = self.row_indexes[row.id]
-        else:
-            index = self.transcript_table.rowCount()
-            self.transcript_table.insertRow(index)
-            self.row_indexes[row.id] = index
-        values = [
-            format_timestamp(row.start),
-            row.speaker_label,
-            row.text,
-            "Speaker pending" if row.speaker_label == "Speaker ?" else "Speaker set",
-        ]
-        for column, value in enumerate(values):
-            self.transcript_table.setItem(index, column, QTableWidgetItem(value))
-        self.transcript_table.scrollToBottom()
-
-    def _update_speakers(self, speakers: list[Any]) -> None:
-        current_key = None
-        current_item = self.speaker_list.currentItem()
-        if current_item is not None:
-            current_key = current_item.data(Qt.UserRole)
-        self.speaker_list.clear()
-        restore_row = -1
-        for index, speaker in enumerate(speakers):
-            item = QListWidgetItem(speaker.display_name_value)
-            item.setData(Qt.UserRole, speaker.key)
-            self.speaker_list.addItem(item)
-            if speaker.key == current_key:
-                restore_row = index
-        if restore_row >= 0:
-            self.speaker_list.setCurrentRow(restore_row)
+    def _append_transcript(self, row: TranscriptRow) -> None:
+        text = row.text.strip()
+        if not text:
+            return
+        cursor = self.transcript_text.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        existing = self.transcript_text.toPlainText()
+        separator = "" if not existing or existing.endswith((" ", "\n")) else " "
+        cursor.insertText(separator + text)
+        self.transcript_text.setTextCursor(cursor)
+        self.transcript_text.ensureCursorVisible()
 
     def _append_log(self, message: str) -> None:
         if message:
@@ -445,17 +340,7 @@ class MainWindow(QMainWindow):
         self.pause_button.setText("Pause")
         if not running:
             self.level_meter.set_level(0)
-        for widget in (
-            self.device_combo,
-            self.whisper_path,
-            self.backend_combo,
-            self.speaker_model_path,
-            self.pyannote_path,
-            self.embedding_path,
-            self.output_path,
-            self.chunk_seconds,
-            self.overlap_seconds,
-        ):
+        for widget in (self.device_combo, self.whisper_path, self.output_path):
             widget.setEnabled(not running)
 
     def closeEvent(self, event: Any) -> None:  # pragma: no cover - GUI lifecycle
