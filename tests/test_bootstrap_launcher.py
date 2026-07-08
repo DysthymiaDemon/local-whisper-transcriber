@@ -141,6 +141,14 @@ class BootstrapLauncherTests(unittest.TestCase):
         self.assertIn('INSTALL_DISK_SPACE_ESTIMATE = "~1.8 GB"', source)
         self.assertIn("this install uses {INSTALL_DISK_SPACE_ESTIMATE} for packages and models", source)
 
+    def test_successful_package_install_marks_package_check_done(self):
+        source = (Path(__file__).resolve().parents[1] / "app" / "bootstrap_launcher.py").read_text(encoding="utf-8")
+
+        self.assertGreaterEqual(
+            source.count('set_step(BOOTSTRAP_STEPS[2], StepState.DONE, "Python packages ready", 100)'),
+            2,
+        )
+
     def test_bootstrap_steps_cover_setup_flow(self):
         self.assertEqual(BOOTSTRAP_STEPS[0], "Checking Python runtime")
         self.assertIn("Installing Python packages", BOOTSTRAP_STEPS)

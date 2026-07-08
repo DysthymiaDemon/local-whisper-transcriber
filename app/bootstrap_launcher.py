@@ -2468,6 +2468,7 @@ def run_bootstrap() -> int:
                         )
                         show_error_card(BOOTSTRAP_STEPS[3], message, log_path, recent)
                         return
+                    set_step(BOOTSTRAP_STEPS[2], StepState.DONE, "Python packages ready", 100)
                     set_step(BOOTSTRAP_STEPS[3], StepState.DONE, "Python packages installed", 100)
                 else:
                     set_step(BOOTSTRAP_STEPS[2], StepState.DONE, "Python packages ready", 100)
