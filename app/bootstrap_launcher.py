@@ -1892,7 +1892,6 @@ def run_bootstrap() -> int:
     details_button.pack(side="left")
 
     launch_now_button = tk.Button(button_row, text="Launch now", width=14, state="disabled")
-    launch_now_button.pack(side="right")
 
     details_frame = tk.Frame(progress_frame, bg="#ffffff")
     details_text = tk.Text(
@@ -2143,6 +2142,7 @@ def run_bootstrap() -> int:
             set_detail_bar_indeterminate(False)
             detail_progress_value.set(0)
             eta_detail.set("")
+            hide_launch_now_button()
             render_steps()
 
         run_on_ui(reset_failed_steps)
@@ -2161,6 +2161,10 @@ def run_bootstrap() -> int:
     copy_details_button.config(command=copy_error_details)
     open_error_log_button.config(command=open_error_log_file)
     window.protocol("WM_DELETE_WINDOW", on_close_setup)
+
+    def hide_launch_now_button() -> None:
+        launch_now_button.config(state="disabled")
+        launch_now_button.pack_forget()
 
     def render_steps() -> None:
         overall_progress_value.set(weighted_overall_progress(step_states, step_progress_values))
@@ -2341,6 +2345,8 @@ def run_bootstrap() -> int:
         final_message_active.set(True)
         step_states[BOOTSTRAP_STEPS[-1]] = StepState.RUNNING
         log_install(BOOTSTRAP_STEPS[-1], "Launch countdown started", {"delay_seconds": IMPORTANT_MESSAGE_SECONDS})
+        if not launch_now_button.winfo_ismapped():
+            launch_now_button.pack(side="right")
         launch_now_button.config(state="normal")
         render_steps()
 
@@ -2416,7 +2422,8 @@ def run_bootstrap() -> int:
                     important_message(BOOTSTRAP_STEPS[2], "Checking required Python packages...")
                 missing = missing_runtime_imports(root)
                 if missing:
-                    set_step(BOOTSTRAP_STEPS[2], StepState.WARNING, "Missing: " + ", ".join(missing), 100)
+                    package_word = "package" if len(missing) == 1 else "packages"
+                    set_step(BOOTSTRAP_STEPS[2], StepState.DONE, f"{len(missing)} {package_word} to install", 100)
                     set_step(BOOTSTRAP_STEPS[3], StepState.RUNNING, "Installing missing packages", 0)
                     command = subprocess.list2cmdline(
                         [

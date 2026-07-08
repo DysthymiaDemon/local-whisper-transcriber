@@ -62,6 +62,19 @@ class StandaloneLauncherTests(unittest.TestCase):
         self.assertIn('os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")', content)
         self.assertIn('os.environ.setdefault("HF_DATASETS_OFFLINE", "1")', content)
 
+    def test_copy_buttons_show_temporary_copied_feedback(self):
+        content = (PROJECT_ROOT / "app" / "meeting_transcriber_gui.py").read_text(encoding="utf-8")
+
+        self.assertIn("self.copy_button.clicked.connect(lambda: self._copy_transcript(self.copy_button))", content)
+        self.assertIn(
+            "self.copy_footer_button.clicked.connect(lambda: self._copy_transcript(self.copy_footer_button))",
+            content,
+        )
+        self.assertIn('button.setText("✓ Copied!")', content)
+        self.assertIn('button.setStyleSheet("QPushButton { color: #2e7d32; }")', content)
+        self.assertIn("QTimer.singleShot(1500, restore)", content)
+        self.assertIn("self._copy_feedback_tokens", content)
+
     def test_init_only_extracts_beside_copied_launcher(self):
         with tempfile.TemporaryDirectory() as tmp:
             folder = Path(tmp)

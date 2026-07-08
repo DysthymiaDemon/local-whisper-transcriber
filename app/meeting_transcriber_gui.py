@@ -119,6 +119,8 @@ class MainWindow(QMainWindow):
         self._behind_seconds = 0.0
         self._spinner_index = 0
         self._spinner_frames = ["|", "/", "-", "\\"]
+        self._copy_feedback_tokens: dict[int, int] = {}
+        self._copy_button_originals: dict[int, tuple[str, QIcon, str]] = {}
         self.spinner_timer = QTimer(self)
         self.spinner_timer.setInterval(160)
         self.spinner_timer.timeout.connect(self._tick_spinner)
@@ -175,7 +177,7 @@ class MainWindow(QMainWindow):
         self.record_button.clicked.connect(self._start_recording)
         self.pause_button.clicked.connect(self._toggle_pause)
         self.stop_button.clicked.connect(self._stop_recording)
-        self.copy_button.clicked.connect(self._copy_transcript)
+        self.copy_button.clicked.connect(lambda: self._copy_transcript(self.copy_button))
         button_row.addWidget(self.record_button)
         button_row.addWidget(self.pause_button)
         button_row.addWidget(self.stop_button)
@@ -208,7 +210,7 @@ class MainWindow(QMainWindow):
         self.transcription_state_label = QLabel("Idle")
         self.copy_footer_button = QPushButton("Copy to Clipboard")
         self.copy_footer_button.setIcon(QIcon.fromTheme("edit-copy"))
-        self.copy_footer_button.clicked.connect(self._copy_transcript)
+        self.copy_footer_button.clicked.connect(lambda: self._copy_transcript(self.copy_footer_button))
         footer_row.addWidget(self.transcription_state_label, 1)
         footer_row.addWidget(self.copy_footer_button)
         root_layout.addLayout(footer_row)
@@ -330,9 +332,31 @@ class MainWindow(QMainWindow):
 
         threading.Thread(target=stop_worker, name="gui-stop-engine", daemon=True).start()
 
-    def _copy_transcript(self) -> None:
+    def _copy_transcript(self, feedback_button: QPushButton | None = None) -> None:
         clipboard = QApplication.clipboard()
         clipboard.setText(self.transcript_text.toPlainText())
+        if feedback_button is not None:
+            self._show_copy_feedback(feedback_button)
+
+    def _show_copy_feedback(self, button: QPushButton) -> None:
+        button_id = id(button)
+        if button_id not in self._copy_button_originals:
+            self._copy_button_originals[button_id] = (button.text(), button.icon(), button.styleSheet())
+        token = self._copy_feedback_tokens.get(button_id, 0) + 1
+        self._copy_feedback_tokens[button_id] = token
+        button.setText("✓ Copied!")
+        button.setStyleSheet("QPushButton { color: #2e7d32; }")
+
+        def restore() -> None:
+            if self._copy_feedback_tokens.get(button_id) != token:
+                return
+            original_text, original_icon, original_style = self._copy_button_originals.pop(button_id)
+            self._copy_feedback_tokens.pop(button_id, None)
+            button.setText(original_text)
+            button.setIcon(original_icon)
+            button.setStyleSheet(original_style)
+
+        QTimer.singleShot(1500, restore)
 
     def _handle_engine_event(self, event_type: str, payload: dict[str, Any]) -> None:
         if event_type == "status":

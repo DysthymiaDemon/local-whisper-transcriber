@@ -149,6 +149,16 @@ class BootstrapLauncherTests(unittest.TestCase):
             2,
         )
 
+    def test_missing_packages_are_normal_install_work_not_warning(self):
+        source = (Path(__file__).resolve().parents[1] / "app" / "bootstrap_launcher.py").read_text(encoding="utf-8")
+
+        self.assertIn('package_word = "package" if len(missing) == 1 else "packages"', source)
+        self.assertIn(
+            'set_step(BOOTSTRAP_STEPS[2], StepState.DONE, f"{len(missing)} {package_word} to install", 100)',
+            source,
+        )
+        self.assertNotIn('set_step(BOOTSTRAP_STEPS[2], StepState.WARNING, "Missing: " + ", ".join(missing), 100)', source)
+
     def test_bootstrap_steps_cover_setup_flow(self):
         self.assertEqual(BOOTSTRAP_STEPS[0], "Checking Python runtime")
         self.assertIn("Installing Python packages", BOOTSTRAP_STEPS)
@@ -987,6 +997,15 @@ class BootstrapLauncherTests(unittest.TestCase):
         self.assertIn("before=button_row", source)
         self.assertIn("replace_last=", source)
         self.assertIn("is_live_download_progress", source)
+
+    def test_launch_now_is_hidden_until_launch_countdown(self):
+        source = (Path(__file__).resolve().parents[1] / "app" / "bootstrap_launcher.py").read_text(encoding="utf-8")
+
+        self.assertIn('launch_now_button = tk.Button(button_row, text="Launch now", width=14, state="disabled")', source)
+        self.assertIn("def hide_launch_now_button() -> None:", source)
+        self.assertIn("launch_now_button.pack_forget()", source)
+        self.assertIn("hide_launch_now_button()", source)
+        self.assertIn('launch_now_button.pack(side="right")', source)
 
     def test_confirm_screen_uses_fixed_footer_not_overlapping_content(self):
         source = (Path(__file__).resolve().parents[1] / "app" / "bootstrap_launcher.py").read_text(encoding="utf-8")
