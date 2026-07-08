@@ -136,6 +136,17 @@ class PipProgressEvent:
     raw_line: str = ""
 
 
+@dataclass(frozen=True)
+class CliDownloadStatus:
+    progress_percent: int
+    current_bytes: int
+    total_bytes: int
+    current_text: str
+    total_text: str
+    speed_text: str = ""
+    eta_text: str = ""
+
+
 @dataclass
 class StepDiagnostic:
     name: str
@@ -461,11 +472,33 @@ def _unit_factor(unit: str | None, fallback: str | None = None) -> float:
     return _UNIT_FACTORS.get(normalized, 1.0)
 
 
+def _format_cli_size_text(value: str, unit: str | None, fallback: str | None = None) -> str:
+    number = value.rstrip("0").rstrip(".") if "." in value else value
+    normalized = (unit or fallback or "B").upper()
+    if normalized in {"K", "KB", "KIB"}:
+        normalized = "KB"
+    elif normalized in {"M", "MB", "MIB"}:
+        normalized = "MB"
+    elif normalized in {"G", "GB", "GIB"}:
+        normalized = "GB"
+    elif normalized in {"T", "TB", "TIB"}:
+        normalized = "TB"
+    elif normalized in {"P", "PB", "PIB"}:
+        normalized = "PB"
+    elif normalized in {"E", "EB", "EIB"}:
+        normalized = "EB"
+    return f"{number} {normalized}"
+
+
 def parse_cli_download_percent(line: str) -> int | None:
     clean = _clean_cli_progress_line(line)
     percent = re.search(r"(?<![\d.])(\d{1,3})\s*%", clean)
     if percent:
         return max(0, min(100, int(percent.group(1))))
+
+    status = parse_cli_download_status(clean)
+    if status is not None:
+        return status.progress_percent
 
     size = _SIZE_UNIT_RE.search(clean)
     if not size:
@@ -477,6 +510,61 @@ def parse_cli_download_percent(line: str) -> int | None:
     if total <= 0:
         return None
     return max(0, min(100, int((current / total) * 100)))
+
+
+def parse_cli_download_status(line: str) -> CliDownloadStatus | None:
+    clean = _clean_cli_progress_line(line)
+    size = _SIZE_UNIT_RE.search(clean)
+    if not size:
+        return None
+
+    total_unit = size.group("total_unit")
+    current_unit = size.group("current_unit") or total_unit
+    current = float(size.group("current")) * _unit_factor(current_unit, total_unit)
+    total = float(size.group("total")) * _unit_factor(total_unit)
+    if total <= 0:
+        return None
+
+    progress = max(0, min(100, int((current / total) * 100)))
+    speed_text = ""
+    speed = re.search(
+        r"(?P<speed>\d+(?:\.\d+)?)\s*(?P<unit>[KMGTPE]?i?B|[KMGTPE]?B|[KMGTPE])\s*/\s*s",
+        clean,
+        re.IGNORECASE,
+    )
+    if speed:
+        speed_text = f"{speed.group('speed')} {speed.group('unit').upper()}/s"
+
+    eta_text = ""
+    eta = re.search(r"\beta\s+(?P<eta>\d+:\d{2}(?::\d{2})?)", clean, re.IGNORECASE)
+    if eta is None:
+        eta = re.search(r"<(?P<eta>\d+:\d{2}(?::\d{2})?)", clean)
+    if eta:
+        eta_text = eta.group("eta")
+
+    return CliDownloadStatus(
+        progress_percent=progress,
+        current_bytes=int(current),
+        total_bytes=int(total),
+        current_text=_format_cli_size_text(size.group("current"), current_unit, total_unit),
+        total_text=_format_cli_size_text(size.group("total"), total_unit),
+        speed_text=speed_text,
+        eta_text=eta_text,
+    )
+
+
+def format_cli_download_detail(filename: str, status: CliDownloadStatus) -> str:
+    parts = [f"{status.current_text} / {status.total_text}"]
+    if status.speed_text:
+        parts.append(status.speed_text)
+    if status.eta_text:
+        parts.append(f"ETA {status.eta_text}")
+    prefix = filename or "Package download"
+    return f"{prefix} - {' - '.join(parts)}"
+
+
+def is_live_download_progress(event: PipProgressEvent) -> bool:
+    return event.phase == "Downloading package" and parse_cli_download_status(event.raw_line) is not None
 
 
 def cli_download_progress_event(line: str, phase: str, detail_prefix: str = "") -> PipProgressEvent | None:
@@ -544,12 +632,15 @@ class PipInstallProgressTracker:
     def record(self, event: PipProgressEvent, now: float | None = None) -> tuple[int, str]:
         self.event_count += 1
         current = time.time() if now is None else now
-        if event.progress_percent == 100:
+        if event.phase == "Install complete" or (event.progress_percent == 100 and event.phase != "Downloading package"):
             self.progress = 100
-        elif event.progress_percent == 0:
+        elif event.phase == "Installing packages" and event.progress_percent == 0:
             self.installing_started = True
             self.installing_message = event.raw_line.strip() or f"Installing collected packages: {event.detail}"
             self.progress = max(self.progress, 80)
+        elif event.phase == "Downloading package" and event.progress_percent is not None:
+            download_progress = max(8, min(78, int(event.progress_percent * 0.78)))
+            self.progress = max(self.progress, download_progress)
         elif event.progress_percent is not None:
             self.progress = max(self.progress, event.progress_percent)
         else:
@@ -557,7 +648,9 @@ class PipInstallProgressTracker:
             self.progress = min(cap, max(self.progress + 3, 8 + self.event_count * 4))
 
         elapsed = current - self.start_time
-        if self.progress >= 100:
+        if event.phase == "Downloading package" and event.progress_percent is not None and event.detail:
+            eta = event.detail
+        elif self.progress >= 100:
             eta = "ETA complete"
         elif self.installing_started:
             eta = self.installing_message or "Installing collected packages..."
@@ -572,11 +665,21 @@ class PipInstallProgressTracker:
 class PipProgressParser:
     def __init__(self) -> None:
         self.install_total = 0
+        self.current_download = ""
 
     def parse(self, line: str) -> PipProgressEvent:
         stripped = line.strip()
         if not stripped:
             return PipProgressEvent("Running pip", "", None, line)
+
+        download_status = parse_cli_download_status(stripped)
+        if download_status is not None and self.current_download:
+            return PipProgressEvent(
+                "Downloading package",
+                format_cli_download_detail(self.current_download, download_status),
+                download_status.progress_percent,
+                line,
+            )
 
         download_progress = cli_download_progress_event(stripped, "Downloading package")
         if download_progress is not None:
@@ -592,7 +695,9 @@ class PipProgressParser:
 
         downloading = re.match(r"Downloading\s+(.+)$", stripped)
         if downloading:
-            return PipProgressEvent("Downloading package", downloading.group(1), 0, line)
+            detail = downloading.group(1)
+            self.current_download = re.sub(r"\s+\([^)]*\)\s*$", "", detail).strip()
+            return PipProgressEvent("Downloading package", detail, 0, line)
 
         installing = re.match(r"Installing collected packages:\s+(.+)$", stripped)
         if installing:
@@ -1891,11 +1996,28 @@ def run_bootstrap() -> int:
         widget.insert("1.0", value)
         widget.configure(state="disabled")
 
-    def append_details_log(line: str) -> None:
+    details_log_state = {"live_progress": False}
+
+    def append_details_log(line: str, replace_last: bool = False) -> None:
         if not line:
             return
+        text = line.rstrip()
+        if not text:
+            return
         details_text.configure(state="normal")
-        details_text.insert("end", line.rstrip() + "\n")
+        insert_index = "end"
+        if replace_last:
+            if details_log_state["live_progress"]:
+                details_text.delete("live_progress_start", "end-1c")
+                insert_index = "live_progress_start"
+            else:
+                details_text.mark_set("live_progress_start", "end-1c")
+                details_text.mark_gravity("live_progress_start", "left")
+                insert_index = "live_progress_start"
+            details_log_state["live_progress"] = True
+        else:
+            details_log_state["live_progress"] = False
+        details_text.insert(insert_index, text + "\n")
         details_text.see("end")
         details_text.configure(state="disabled")
 
@@ -2174,7 +2296,11 @@ def run_bootstrap() -> int:
 
         def apply_event() -> None:
             set_command_text(event.phase)
-            append_details_log(event.raw_line or event.detail or event.phase)
+            replace_last = is_live_download_progress(event)
+            append_details_log(
+                event.detail if replace_last else event.raw_line or event.detail or event.phase,
+                replace_last=replace_last,
+            )
             if event.detail:
                 package_detail.set(event.detail)
                 set_text(package_text, event.detail)
@@ -2185,13 +2311,21 @@ def run_bootstrap() -> int:
             if tracker is not None:
                 progress, eta = tracker.record(event)
                 eta_detail.set(eta)
-                if tracker.installing_started and event.progress_percent != 100:
+                if event.phase == "Downloading package" and event.progress_percent is not None:
+                    set_detail_bar_indeterminate(False)
+                    detail_progress_value.set(event.progress_percent)
+                    step_progress_values[BOOTSTRAP_STEPS[3]] = progress
+                elif tracker.installing_started and event.progress_percent != 100:
                     set_detail_bar_indeterminate(True)
                 else:
                     set_detail_bar_indeterminate(False)
                     detail_progress_value.set(progress)
                     step_progress_values[BOOTSTRAP_STEPS[3]] = progress
-            if event.progress_percent is not None:
+            elif event.phase == "Downloading package" and event.progress_percent is not None:
+                set_detail_bar_indeterminate(False)
+                detail_progress_value.set(event.progress_percent)
+                step_progress_values[BOOTSTRAP_STEPS[3]] = event.progress_percent
+            if event.progress_percent is not None and event.phase != "Downloading package":
                 if event.progress_percent == 100:
                     set_detail_bar_indeterminate(False)
                     detail_progress_value.set(100)

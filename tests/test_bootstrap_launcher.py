@@ -41,6 +41,7 @@ from bootstrap_launcher import (
     model_folder_status,
     needs_setup,
     online_huggingface_download_env,
+    parse_cli_download_status,
     setup_install_summary,
     setup_package_list,
     verify_downloaded_model,
@@ -760,6 +761,31 @@ class BootstrapLauncherTests(unittest.TestCase):
         self.assertEqual(event.progress_percent, 42)
         self.assertIn("42.0/100.0 MB", event.detail)
 
+    def test_pip_progress_parser_formats_pip_download_status(self):
+        parser = PipProgressParser()
+
+        start = parser.parse("Downloading av-18.0.0-cp311-abi3-win_amd64.whl (27.6 MB)")
+        event = parser.parse("---------------------------------------- 13.8/27.6 MB 4.1 MB/s eta 0:00:03")
+
+        self.assertEqual(start.progress_percent, 0)
+        self.assertEqual(event.phase, "Downloading package")
+        self.assertEqual(event.progress_percent, 50)
+        self.assertIn("av-18.0.0-cp311-abi3-win_amd64.whl", event.detail)
+        self.assertIn("13.8 MB / 27.6 MB", event.detail)
+        self.assertIn("4.1 MB/s", event.detail)
+        self.assertIn("ETA 0:00:03", event.detail)
+
+    def test_cli_download_status_parses_speed_eta_and_sizes(self):
+        status = parse_cli_download_status("---- 328.7/328.7 kB 4.1 MB/s eta 0:00:00")
+
+        self.assertIsNotNone(status)
+        assert status is not None
+        self.assertEqual(status.progress_percent, 100)
+        self.assertEqual(status.current_text, "328.7 KB")
+        self.assertEqual(status.total_text, "328.7 KB")
+        self.assertEqual(status.speed_text, "4.1 MB/s")
+        self.assertEqual(status.eta_text, "0:00:00")
+
     def test_run_pip_install_emits_carriage_return_download_progress(self):
         from bootstrap_launcher import run_pip_install
 
@@ -968,6 +994,8 @@ class BootstrapLauncherTests(unittest.TestCase):
         self.assertIn("messagebox.askyesno", source)
         self.assertIn("details_frame.pack_forget()", source)
         self.assertIn("before=button_row", source)
+        self.assertIn("replace_last=", source)
+        self.assertIn("is_live_download_progress", source)
 
     def test_confirm_screen_uses_fixed_footer_not_overlapping_content(self):
         source = (Path(__file__).resolve().parents[1] / "app" / "bootstrap_launcher.py").read_text(encoding="utf-8")

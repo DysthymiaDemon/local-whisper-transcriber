@@ -47,6 +47,16 @@ class SpeakerRegistryTests(unittest.TestCase):
         self.assertEqual(first.key, "speaker_1")
         self.assertEqual(second.key, "speaker_2")
 
+    def test_recent_speaker_reuses_moderate_continuity_match(self):
+        registry = SpeakerRegistry(match_threshold=0.70, continuity_threshold=0.45)
+
+        first = registry.assign([1.0, 0.0, 0.0], confidence=0.95)
+        second = registry.assign([0.5, 0.8660254, 0.0], confidence=0.95)
+
+        self.assertEqual(first.key, "speaker_1")
+        self.assertEqual(second.key, "speaker_1")
+        self.assertEqual(first.sample_count, 2)
+
     def test_low_confidence_keeps_unknown_speaker(self):
         registry = SpeakerRegistry(match_threshold=0.70)
 
@@ -172,6 +182,28 @@ class LocalDiarizationHelperTests(unittest.TestCase):
         window = extract_row_audio_window(chunk, row, target_seconds=1.0)
 
         self.assertEqual(len(window), 16000)
+
+    def test_tiny_transcript_segment_does_not_spawn_local_speaker(self):
+        import numpy as np
+
+        class UnexpectedClassifier:
+            def encode_batch(self, waveform):
+                raise AssertionError("short segment should not be embedded")
+
+        engine = MeetingTranscriberEngine(EngineConfig())
+        engine.store.add_transcript(chunk_index=1, start=0.0, end=0.3, text="Yes.")
+        chunk = AudioChunk(
+            index=1,
+            start_time=0.0,
+            samples=np.ones(16000, dtype=np.float32),
+            sample_rate=16000,
+        )
+
+        turns = engine._run_local_ecapa_diarization(chunk, UnexpectedClassifier())
+
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0].local_label, "unknown")
+        self.assertIsNone(turns[0].embedding)
 
 
 class AtomicTranscriptWriterTests(unittest.TestCase):

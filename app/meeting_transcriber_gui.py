@@ -38,7 +38,6 @@ try:
         QComboBox,
         QFileDialog,
         QFormLayout,
-        QGridLayout,
         QGroupBox,
         QHBoxLayout,
         QHeaderView,
@@ -49,6 +48,8 @@ try:
         QMainWindow,
         QMessageBox,
         QPushButton,
+        QSizePolicy,
+        QSplitter,
         QSpinBox,
         QTableWidget,
         QTableWidgetItem,
@@ -133,12 +134,12 @@ class MainWindow(QMainWindow):
         root_layout.setSpacing(10)
         self.setCentralWidget(root)
 
-        top = QGridLayout()
-        top.setColumnStretch(0, 2)
-        top.setColumnStretch(1, 1)
-        root_layout.addLayout(top)
+        main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        main_splitter.setChildrenCollapsible(False)
+        root_layout.addWidget(main_splitter, 1)
 
         self.transcript_table = QTableWidget(0, 4)
+        self.transcript_table.setMinimumWidth(0)
         self.transcript_table.setHorizontalHeaderLabels(["Time", "Speaker", "Text", "State"])
         self.transcript_table.verticalHeader().setVisible(False)
         self.transcript_table.setAlternatingRowColors(True)
@@ -148,7 +149,17 @@ class MainWindow(QMainWindow):
         self.transcript_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.transcript_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
         self.transcript_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        top.addWidget(self.transcript_table, 0, 0, 3, 1)
+        main_splitter.addWidget(self.transcript_table)
+
+        right_panel = QWidget()
+        right_panel.setMinimumWidth(260)
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(10)
+        main_splitter.addWidget(right_panel)
+        main_splitter.setStretchFactor(0, 2)
+        main_splitter.setStretchFactor(1, 1)
+        main_splitter.setSizes([680, 340])
 
         controls = QGroupBox("Controls")
         controls_layout = QVBoxLayout(controls)
@@ -172,7 +183,7 @@ class MainWindow(QMainWindow):
         status_row.addRow("Speaker sync", self.lag_label)
         status_row.addRow("Mic level", self.level_meter)
         controls_layout.addLayout(status_row)
-        top.addWidget(controls, 0, 1)
+        right_layout.addWidget(controls)
 
         settings = QGroupBox("Settings")
         settings_layout = QFormLayout(settings)
@@ -193,6 +204,18 @@ class MainWindow(QMainWindow):
         self.overlap_seconds = QSpinBox()
         self.overlap_seconds.setRange(0, 20)
         self.overlap_seconds.setValue(int(OVERLAP_SECONDS))
+        for widget in (
+            self.device_combo,
+            self.whisper_path,
+            self.backend_combo,
+            self.speaker_model_path,
+            self.pyannote_path,
+            self.embedding_path,
+            self.output_path,
+            self.chunk_seconds,
+            self.overlap_seconds,
+        ):
+            self._allow_field_to_shrink(widget)
 
         settings_layout.addRow("Microphone", self.device_combo)
         settings_layout.addRow("Whisper", self._path_row(self.whisper_path, folder=True))
@@ -209,7 +232,7 @@ class MainWindow(QMainWindow):
         settings_layout.addRow("Overlap seconds", self.overlap_seconds)
         self.backend_combo.currentIndexChanged.connect(self._toggle_backend_fields)
         self._toggle_backend_fields()
-        top.addWidget(settings, 1, 1)
+        right_layout.addWidget(settings)
 
         speakers = QGroupBox("Speakers")
         speaker_layout = QVBoxLayout(speakers)
@@ -222,12 +245,17 @@ class MainWindow(QMainWindow):
         rename_row.addWidget(self.rename_button)
         speaker_layout.addWidget(self.speaker_list)
         speaker_layout.addLayout(rename_row)
-        top.addWidget(speakers, 2, 1)
+        right_layout.addWidget(speakers, 1)
 
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
         self.log_box.setMaximumHeight(120)
         root_layout.addWidget(self.log_box)
+
+    @staticmethod
+    def _allow_field_to_shrink(widget: QWidget) -> None:
+        widget.setMinimumWidth(0)
+        widget.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
 
     def _path_row(self, line_edit: QLineEdit, folder: bool) -> QWidget:
         widget = QWidget()
@@ -235,7 +263,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         browse = QPushButton("Browse")
         browse.clicked.connect(lambda: self._browse_path(line_edit, folder))
-        layout.addWidget(line_edit)
+        layout.addWidget(line_edit, 1)
         layout.addWidget(browse)
         return widget
 

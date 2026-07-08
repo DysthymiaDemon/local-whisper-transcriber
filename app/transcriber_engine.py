@@ -18,8 +18,9 @@ EMBEDDING_WEIGHT_FILES = ("pytorch_model.bin", "model.safetensors")
 DIARIZATION_BACKEND_LOCAL_ECAPA = "local-ecapa"
 DIARIZATION_BACKEND_PYANNOTE = "pyannote"
 SPEECHBRAIN_CHECKPOINT_FILES = ("embedding_model.ckpt", "model.ckpt")
-LOCAL_DIARIZATION_MIN_SECONDS = 0.25
-LOCAL_DIARIZATION_TARGET_SECONDS = 1.0
+LOCAL_DIARIZATION_MIN_SECONDS = 0.75
+LOCAL_DIARIZATION_TARGET_SECONDS = 2.0
+LOCAL_SPEAKER_CONTINUITY_THRESHOLD = 0.45
 MIC_SILENCE_RMS_THRESHOLD = 0.0001
 
 
@@ -327,11 +328,18 @@ def extract_row_audio_window(chunk: AudioChunk, row: TranscriptRow, target_secon
 
 
 class SpeakerRegistry:
-    def __init__(self, match_threshold: float = 0.70, min_confidence: float = 0.50):
+    def __init__(
+        self,
+        match_threshold: float = 0.70,
+        min_confidence: float = 0.50,
+        continuity_threshold: float = LOCAL_SPEAKER_CONTINUITY_THRESHOLD,
+    ):
         self.match_threshold = match_threshold
         self.min_confidence = min_confidence
+        self.continuity_threshold = max(0.0, min(match_threshold, continuity_threshold))
         self._lock = threading.RLock()
         self._identities: dict[str, SpeakerIdentity] = {}
+        self._last_identity_key: str | None = None
         self._next_index = 1
 
     def assign(self, embedding: Iterable[float] | None, confidence: float = 1.0) -> Optional[SpeakerIdentity]:
@@ -350,14 +358,15 @@ class SpeakerRegistry:
                     best_score = score
                     best_identity = identity
 
-            if best_identity is not None and best_score >= self.match_threshold:
-                total = best_identity.sample_count + 1
-                averaged = [
-                    ((old * best_identity.sample_count) + new) / total
-                    for old, new in zip(best_identity.embedding, normalized)
-                ]
-                best_identity.embedding = _normalize_embedding(averaged) or best_identity.embedding
-                best_identity.sample_count = total
+            if best_identity is not None and (
+                best_score >= self.match_threshold
+                or (
+                    best_score >= self.continuity_threshold
+                    and (best_identity.key == self._last_identity_key or len(self._identities) == 1)
+                )
+            ):
+                self._update_identity(best_identity, normalized)
+                self._last_identity_key = best_identity.key
                 return best_identity
 
             key = f"speaker_{self._next_index}"
@@ -367,8 +376,19 @@ class SpeakerRegistry:
                 embedding=normalized,
             )
             self._identities[key] = identity
+            self._last_identity_key = key
             self._next_index += 1
             return identity
+
+    @staticmethod
+    def _update_identity(identity: SpeakerIdentity, normalized: list[float]) -> None:
+        total = identity.sample_count + 1
+        averaged = [
+            ((old * identity.sample_count) + new) / total
+            for old, new in zip(identity.embedding, normalized)
+        ]
+        identity.embedding = _normalize_embedding(averaged) or identity.embedding
+        identity.sample_count = total
 
     def display_name(self, speaker_key: str | None) -> str:
         if speaker_key is None:
@@ -532,6 +552,10 @@ class MeetingTranscriberEngine:
         self.speaker_registry = SpeakerRegistry(
             match_threshold=config.speaker_match_threshold,
             min_confidence=config.min_speaker_confidence,
+            continuity_threshold=min(
+                config.speaker_match_threshold,
+                1.0 - config.speaker_cluster_distance_threshold,
+            ),
         )
         self.store = TranscriptStore(self.speaker_registry, config.min_overlap_ratio)
         self.writer = AtomicTranscriptWriter(config.output_file)
