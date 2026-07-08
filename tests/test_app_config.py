@@ -95,6 +95,8 @@ class PortableConfigTests(unittest.TestCase):
         self.assertEqual(config.whisper_model_dir, os.path.join(tmp, "models", "faster-whisper"))
         self.assertEqual(config.output_file, os.path.join(tmp, "transcripts", "meeting_transcript.txt"))
         self.assertEqual(config.language, "en")
+        self.assertEqual(config.chunk_seconds, 3.0)
+        self.assertEqual(config.overlap_seconds, 0.25)
 
     def test_config_file_overrides_portable_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -152,9 +154,27 @@ class PortableConfigTests(unittest.TestCase):
 
             config = load_portable_config(root)
 
-        self.assertEqual(config.chunk_seconds, 4.0)
-        self.assertEqual(config.overlap_seconds, 0.5)
+        self.assertEqual(config.chunk_seconds, 3.0)
+        self.assertEqual(config.overlap_seconds, 0.25)
         self.assertFalse(hasattr(config, "diarization_backend"))
+
+    def test_previous_transcription_defaults_migrate_to_current_latency(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "config.json").write_text(
+                json.dumps(
+                    {
+                        "chunk_seconds": 4.0,
+                        "overlap_seconds": 0.5,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_portable_config(root)
+
+        self.assertEqual(config.chunk_seconds, 3.0)
+        self.assertEqual(config.overlap_seconds, 0.25)
 
 
 if __name__ == "__main__":

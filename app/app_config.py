@@ -73,6 +73,18 @@ def default_portable_config(root: Path | None = None) -> EngineConfig:
     )
 
 
+def _uses_generated_latency_defaults(raw: Mapping[str, Any]) -> bool:
+    try:
+        chunk_seconds = float(raw.get("chunk_seconds"))
+        overlap_seconds = float(raw.get("overlap_seconds"))
+    except (TypeError, ValueError):
+        return False
+    return (chunk_seconds, overlap_seconds) in {
+        (8.0, 2.0),
+        (4.0, 0.5),
+    }
+
+
 def load_portable_config(root: Path | None = None) -> EngineConfig:
     app_root = (root or application_root()).resolve()
     config = default_portable_config(app_root)
@@ -87,7 +99,7 @@ def load_portable_config(root: Path | None = None) -> EngineConfig:
 
     allowed = set(EngineConfig.__dataclass_fields__.keys())
     overrides: dict[str, Any] = {key: value for key, value in raw.items() if key in allowed}
-    if raw.get("chunk_seconds") == 8.0 and raw.get("overlap_seconds") == 2.0 and "language" not in raw:
+    if _uses_generated_latency_defaults(raw):
         overrides["chunk_seconds"] = config.chunk_seconds
         overrides["overlap_seconds"] = config.overlap_seconds
     for key in (

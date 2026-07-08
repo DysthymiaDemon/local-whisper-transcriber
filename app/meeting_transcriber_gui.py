@@ -12,6 +12,7 @@ from transcriber_engine import (
     list_input_devices,
     rms_to_meter_percent,
 )
+from ui_helpers import meter_bar_geometry
 
 
 PORTABLE_DEFAULTS = load_portable_config()
@@ -25,8 +26,8 @@ LANGUAGE = PORTABLE_DEFAULTS.language
 
 
 try:
-    from PySide6.QtCore import QObject, Qt, Signal
-    from PySide6.QtGui import QColor, QPainter, QPen, QTextCursor
+    from PySide6.QtCore import QObject, Qt, QTimer, Signal
+    from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QTextCursor
     from PySide6.QtWidgets import (
         QApplication,
         QComboBox,
@@ -59,11 +60,13 @@ class EngineSignalBridge(QObject):
 
 
 class MicLevelMeter(QWidget):
-    def __init__(self, segments: int = 30) -> None:
+    def __init__(self, bar_width: int = 7, gap: int = 4, min_segments: int = 18) -> None:
         super().__init__()
-        self.segments = segments
+        self.bar_width = bar_width
+        self.gap = gap
+        self.min_segments = min_segments
         self.level = 0
-        self.setMinimumHeight(24)
+        self.setMinimumHeight(28)
 
     def set_level(self, value: int) -> None:
         self.level = max(0, min(100, value))
@@ -75,18 +78,22 @@ class MicLevelMeter(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         width = self.width()
         height = self.height()
-        gap = 5
-        bar_width = max(3, int((width - gap * (self.segments - 1)) / self.segments))
-        bar_height = max(10, min(18, height - 6))
+        segments, bar_width, gap = meter_bar_geometry(
+            width,
+            bar_width=self.bar_width,
+            gap=self.gap,
+            min_segments=self.min_segments,
+        )
+        bar_height = max(14, min(20, height - 6))
         top = int((height - bar_height) / 2)
-        active_segments = round((self.level / 100) * self.segments)
+        active_segments = round((self.level / 100) * segments)
 
-        for index in range(self.segments):
+        for index in range(segments):
             left = index * (bar_width + gap)
             if left + bar_width > width:
                 break
             active = index < active_segments
-            ratio = (index + 1) / self.segments
+            ratio = (index + 1) / segments
             if not active:
                 color = QColor("#d8d8dc")
             elif ratio <= 0.60:
@@ -108,6 +115,12 @@ class MainWindow(QMainWindow):
         self.engine: MeetingTranscriberEngine | None = None
         self.bridge = EngineSignalBridge()
         self.bridge.event.connect(self._handle_engine_event)
+        self._behind_seconds = 0.0
+        self._spinner_index = 0
+        self._spinner_frames = ["|", "/", "-", "\\"]
+        self.spinner_timer = QTimer(self)
+        self.spinner_timer.setInterval(160)
+        self.spinner_timer.timeout.connect(self._tick_spinner)
 
         self._build_ui()
         self._load_devices()
@@ -189,6 +202,15 @@ class MainWindow(QMainWindow):
         settings_layout.addRow("Output", self._path_row(self.output_path, folder=False))
         right_layout.addWidget(settings)
         right_layout.addStretch(1)
+
+        footer_row = QHBoxLayout()
+        self.transcription_state_label = QLabel("Idle")
+        self.copy_footer_button = QPushButton("Copy to Clipboard")
+        self.copy_footer_button.setIcon(QIcon.fromTheme("edit-copy"))
+        self.copy_footer_button.clicked.connect(self._copy_transcript)
+        footer_row.addWidget(self.transcription_state_label, 1)
+        footer_row.addWidget(self.copy_footer_button)
+        root_layout.addLayout(footer_row)
 
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
@@ -301,6 +323,9 @@ class MainWindow(QMainWindow):
             rms = float(payload.get("rms", 0.0))
             percent = payload.get("percent")
             self.level_meter.set_level(int(percent) if percent is not None else rms_to_meter_percent(rms))
+        elif event_type == "lag":
+            self._behind_seconds = float(payload.get("behind_seconds", 0.0))
+            self._update_transcription_state(running=True)
         elif event_type == "transcript":
             self._append_transcript(payload["row"])
         elif event_type == "error":
@@ -327,6 +352,18 @@ class MainWindow(QMainWindow):
         if message:
             self.log_box.append(message)
 
+    def _tick_spinner(self) -> None:
+        self._spinner_index = (self._spinner_index + 1) % len(self._spinner_frames)
+        if self.engine:
+            self._update_transcription_state(running=True)
+
+    def _update_transcription_state(self, running: bool) -> None:
+        if not running:
+            self.transcription_state_label.setText("Idle")
+            return
+        frame = self._spinner_frames[self._spinner_index]
+        self.transcription_state_label.setText(f"Transcribing, {int(round(self._behind_seconds))}s behind {frame}")
+
     def _write_error_log(self, context: str, message: str, details: Any | None = None) -> str:
         try:
             return str(append_error_log(application_root(), context, message, details))
@@ -338,6 +375,14 @@ class MainWindow(QMainWindow):
         self.pause_button.setEnabled(running)
         self.stop_button.setEnabled(running)
         self.pause_button.setText("Pause")
+        if running:
+            self._behind_seconds = 0.0
+            self._update_transcription_state(running=True)
+            if not self.spinner_timer.isActive():
+                self.spinner_timer.start()
+        else:
+            self.spinner_timer.stop()
+            self._update_transcription_state(running=False)
         if not running:
             self.level_meter.set_level(0)
         for widget in (self.device_combo, self.whisper_path, self.output_path):

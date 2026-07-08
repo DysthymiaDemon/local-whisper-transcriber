@@ -7,18 +7,22 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 from transcriber_engine import (
+    AudioChunk,
+    AudioPreprocessor,
     AtomicTranscriptWriter,
     DuplicateSuppressor,
     EngineConfig,
     InputBlockBuffer,
     MeetingTranscriberEngine,
     TranscriptStore,
+    audio_chunk_has_activity,
     microphone_health_message,
     preferred_input_sample_rate,
     resample_audio,
     rms_to_meter_percent,
     transcription_segment_is_usable,
 )
+from ui_helpers import meter_bar_geometry
 
 
 class DuplicateSuppressorTests(unittest.TestCase):
@@ -136,6 +140,70 @@ class MicrophoneDiagnosticsTests(unittest.TestCase):
         self.assertEqual(resampled.dtype, np.float32)
 
 
+class AudioPreprocessorTests(unittest.TestCase):
+    def test_dc_offset_moves_toward_zero(self):
+        import numpy as np
+
+        processor = AudioPreprocessor(16000)
+        audio = np.full(16000, 0.2, dtype=np.float32)
+
+        cleaned = processor.process(audio)
+
+        self.assertLess(abs(float(np.mean(cleaned[-4000:]))), 0.01)
+
+    def test_high_pass_reduces_low_frequency_drift(self):
+        import numpy as np
+
+        sample_rate = 16000
+        t = np.arange(sample_rate, dtype=np.float32) / sample_rate
+        low = (0.1 * np.sin(2 * np.pi * 20 * t)).astype(np.float32)
+        mid = (0.1 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
+
+        low_cleaned = AudioPreprocessor(sample_rate).process(low)
+        mid_cleaned = AudioPreprocessor(sample_rate).process(mid)
+
+        self.assertLess(float(np.std(low_cleaned)), float(np.std(mid_cleaned)) * 0.8)
+
+    def test_quiet_noise_is_attenuated(self):
+        import numpy as np
+
+        rng = np.random.default_rng(7)
+        noise = rng.normal(0.0, 0.0002, 16000).astype(np.float32)
+
+        cleaned = AudioPreprocessor(16000).process(noise)
+
+        self.assertLess(float(np.sqrt(np.mean(np.square(cleaned)))), 0.0002)
+
+    def test_loud_speech_like_signal_is_preserved(self):
+        import numpy as np
+
+        sample_rate = 16000
+        t = np.arange(sample_rate, dtype=np.float32) / sample_rate
+        speech = (0.05 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
+
+        cleaned = AudioPreprocessor(sample_rate).process(speech)
+
+        self.assertGreater(float(np.sqrt(np.mean(np.square(cleaned)))), 0.02)
+
+    def test_limiter_caps_peaks(self):
+        import numpy as np
+
+        cleaned = AudioPreprocessor(16000).process(np.array([2.0, -2.0, 0.0], dtype=np.float32))
+
+        self.assertLessEqual(float(np.max(np.abs(cleaned))), 0.98)
+
+    def test_chunk_activity_rejects_noise_and_accepts_speech(self):
+        import numpy as np
+
+        sample_rate = 16000
+        t = np.arange(sample_rate, dtype=np.float32) / sample_rate
+        speech = (0.04 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
+        noise = np.zeros(sample_rate, dtype=np.float32)
+
+        self.assertFalse(audio_chunk_has_activity(noise))
+        self.assertTrue(audio_chunk_has_activity(speech))
+
+
 class TranscriptionFilterTests(unittest.TestCase):
     def test_rejects_high_no_speech_probability(self):
         segment = type("Segment", (), {"no_speech_prob": 0.9})()
@@ -198,8 +266,36 @@ class EngineConfigTests(unittest.TestCase):
         config = EngineConfig()
 
         self.assertEqual(config.language, "en")
-        self.assertEqual(config.chunk_seconds, 4.0)
-        self.assertEqual(config.overlap_seconds, 0.5)
+        self.assertEqual(config.chunk_seconds, 3.0)
+        self.assertEqual(config.overlap_seconds, 0.25)
+
+
+class TranscriptionBacklogTests(unittest.TestCase):
+    def test_stale_chunks_are_dropped_and_newest_chunks_retained(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = MeetingTranscriberEngine(EngineConfig(output_file=os.path.join(tmp, "out.txt")))
+            for index in range(4):
+                engine._transcription_queue.put(AudioChunk(index, float(index), [], 16000))
+                engine._pending_transcription_chunks.add(index)
+
+            dropped = engine._drop_stale_transcription_chunks(max_queued=2)
+            remaining = []
+            while not engine._transcription_queue.empty():
+                remaining.append(engine._transcription_queue.get_nowait().index)
+
+        self.assertEqual(dropped, 2)
+        self.assertEqual(remaining, [2, 3])
+        self.assertEqual(engine._pending_transcription_chunks, {2, 3})
+
+
+class MicMeterGeometryTests(unittest.TestCase):
+    def test_segment_count_grows_with_width_and_bar_width_stays_constant(self):
+        narrow_count, narrow_width, _ = meter_bar_geometry(220)
+        wide_count, wide_width, _ = meter_bar_geometry(440)
+
+        self.assertGreater(wide_count, narrow_count)
+        self.assertEqual(narrow_width, 7)
+        self.assertEqual(wide_width, 7)
 
 
 if __name__ == "__main__":

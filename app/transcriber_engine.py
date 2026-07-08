@@ -8,11 +8,13 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
+from math import pi
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 
 MIC_SILENCE_RMS_THRESHOLD = 0.0001
+DEFAULT_NOISE_FLOOR = 0.0008
 
 
 def rms_to_meter_percent(rms: float) -> int:
@@ -63,6 +65,94 @@ def resample_audio(samples: Any, source_rate: int, target_rate: int) -> Any:
     return np.interp(target_positions, source_positions, audio).astype(np.float32)
 
 
+class AudioPreprocessor:
+    def __init__(
+        self,
+        sample_rate: int,
+        high_pass_hz: float = 80.0,
+        dc_decay: float = 0.995,
+        gate_ratio: float = 2.2,
+        gate_attenuation: float = 0.18,
+        noise_floor: float = DEFAULT_NOISE_FLOOR,
+        limiter_level: float = 0.98,
+    ):
+        self.sample_rate = max(1, int(sample_rate))
+        self.high_pass_hz = max(1.0, float(high_pass_hz))
+        self.dc_decay = float(dc_decay)
+        self.gate_ratio = float(gate_ratio)
+        self.gate_attenuation = float(gate_attenuation)
+        self.noise_floor = float(noise_floor)
+        self.limiter_level = float(limiter_level)
+        self._dc_prev_input = 0.0
+        self._dc_prev_output = 0.0
+        self._hp_prev_input = 0.0
+        self._hp_prev_output = 0.0
+        dt = 1.0 / self.sample_rate
+        rc = 1.0 / (2.0 * pi * self.high_pass_hz)
+        self._high_pass_alpha = rc / (rc + dt)
+
+    def process(self, samples: Any) -> Any:
+        import numpy as np
+
+        audio = np.asarray(samples, dtype=np.float32).reshape(-1)
+        if audio.size == 0:
+            return audio.astype(np.float32, copy=False)
+
+        filtered = np.empty_like(audio)
+        for index, value in enumerate(audio):
+            sample = float(value)
+            dc_blocked = sample - self._dc_prev_input + self.dc_decay * self._dc_prev_output
+            self._dc_prev_input = sample
+            self._dc_prev_output = dc_blocked
+
+            high_passed = self._high_pass_alpha * (
+                self._hp_prev_output + dc_blocked - self._hp_prev_input
+            )
+            self._hp_prev_input = dc_blocked
+            self._hp_prev_output = high_passed
+            filtered[index] = high_passed
+
+        rms = float(np.sqrt(np.mean(np.square(filtered)))) if filtered.size else 0.0
+        self._update_noise_floor(rms)
+        filtered = self._apply_soft_gate(filtered, rms)
+        filtered = self._apply_soft_limiter(filtered)
+        return filtered.astype(np.float32, copy=False)
+
+    def _update_noise_floor(self, rms: float) -> None:
+        if rms <= 0.0:
+            return
+        quiet_ceiling = max(DEFAULT_NOISE_FLOOR * 2.0, self.noise_floor * 1.8)
+        if rms <= quiet_ceiling:
+            self.noise_floor = (self.noise_floor * 0.95) + (rms * 0.05)
+
+    def _apply_soft_gate(self, samples: Any, rms: float) -> Any:
+        threshold = max(DEFAULT_NOISE_FLOOR, self.noise_floor * self.gate_ratio)
+        if rms >= threshold or threshold <= 0.0:
+            return samples
+        attenuation = max(self.gate_attenuation, min(1.0, rms / threshold))
+        return samples * attenuation
+
+    def _apply_soft_limiter(self, samples: Any) -> Any:
+        import numpy as np
+
+        peak = float(np.max(np.abs(samples))) if len(samples) else 0.0
+        if peak <= self.limiter_level:
+            return samples
+        return np.tanh(samples / self.limiter_level).astype(np.float32) * self.limiter_level
+
+
+def audio_chunk_has_activity(samples: Any, noise_floor: float = DEFAULT_NOISE_FLOOR) -> bool:
+    import numpy as np
+
+    audio = np.asarray(samples, dtype=np.float32).reshape(-1)
+    if audio.size == 0:
+        return False
+    rms = float(np.sqrt(np.mean(np.square(audio))))
+    peak = float(np.max(np.abs(audio)))
+    threshold = max(MIC_SILENCE_RMS_THRESHOLD * 3.0, noise_floor * 1.6)
+    return rms >= threshold or peak >= threshold * 3.0
+
+
 def _force_offline_mode() -> None:
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
@@ -74,8 +164,8 @@ class EngineConfig:
     whisper_model_dir: str = r"C:\models\faster-whisper-small"
     output_file: str = "meeting_transcript.txt"
     sample_rate: int = 16_000
-    chunk_seconds: float = 4.0
-    overlap_seconds: float = 0.5
+    chunk_seconds: float = 3.0
+    overlap_seconds: float = 0.25
     compute_type: str = "int8"
     input_device: Optional[int] = None
     language: Optional[str] = "en"
@@ -120,6 +210,7 @@ class AudioChunk:
     start_time: float
     samples: Any
     sample_rate: int
+    captured_at: float = field(default_factory=time.monotonic)
     is_final: bool = False
 
 
@@ -337,6 +428,7 @@ class MeetingTranscriberEngine:
         chunk_samples = int(self.config.chunk_seconds * input_sample_rate)
         overlap_samples = int(self.config.overlap_seconds * input_sample_rate)
         keep_samples = max(0, overlap_samples)
+        preprocessor = AudioPreprocessor(input_sample_rate)
         accumulated = np.empty((0,), dtype=np.float32)
         chunk_index = 0
         stream_start = time.monotonic()
@@ -377,35 +469,55 @@ class MeetingTranscriberEngine:
                     except queue.Empty:
                         continue
                     mono = np.asarray(block, dtype=np.float32).reshape(-1)
-                    level = float(np.sqrt(np.mean(np.square(mono)))) if mono.size else 0.0
+                    cleaned = preprocessor.process(mono)
+                    level = float(np.sqrt(np.mean(np.square(cleaned)))) if cleaned.size else 0.0
                     with self._state_lock:
                         self._audio_block_count += 1
                         self._audio_peak_rms = max(self._audio_peak_rms, level)
                     self._emit("level", {"rms": level, "percent": rms_to_meter_percent(level)})
-                    accumulated = np.concatenate([accumulated, mono])
+                    accumulated = np.concatenate([accumulated, cleaned])
                     while accumulated.size >= chunk_samples:
                         start_time = max(
                             0.0,
                             ((chunk_index * (chunk_samples - keep_samples)) / input_sample_rate),
                         )
                         samples = resample_audio(accumulated[:chunk_samples].copy(), input_sample_rate, model_sample_rate)
-                        self._emit("log", {"message": f"Audio chunk {chunk_index} captured ({self.config.chunk_seconds:.1f}s)"})
-                        self._raw_chunk_queue.put(
-                            AudioChunk(chunk_index, start_time, samples, model_sample_rate)
-                        )
                         with self._state_lock:
                             self._audio_chunk_count += 1
+                        if audio_chunk_has_activity(samples, preprocessor.noise_floor):
+                            self._emit("log", {"message": f"Audio chunk {chunk_index} captured ({self.config.chunk_seconds:.1f}s)"})
+                            self._raw_chunk_queue.put(
+                                AudioChunk(
+                                    chunk_index,
+                                    start_time,
+                                    samples,
+                                    model_sample_rate,
+                                    captured_at=time.monotonic(),
+                                )
+                            )
+                        else:
+                            self._emit("log", {"message": f"No speech detected in chunk {chunk_index}"})
                         chunk_index += 1
                         accumulated = accumulated[chunk_samples - keep_samples :]
                 if accumulated.size > input_sample_rate // 2:
                     start_time = max(0.0, time.monotonic() - stream_start - (accumulated.size / input_sample_rate))
                     samples = resample_audio(accumulated.copy(), input_sample_rate, model_sample_rate)
-                    self._emit("log", {"message": f"Final audio chunk {chunk_index} captured"})
-                    self._raw_chunk_queue.put(
-                        AudioChunk(chunk_index, start_time, samples, model_sample_rate, is_final=True)
-                    )
                     with self._state_lock:
                         self._audio_chunk_count += 1
+                    if audio_chunk_has_activity(samples, preprocessor.noise_floor):
+                        self._emit("log", {"message": f"Final audio chunk {chunk_index} captured"})
+                        self._raw_chunk_queue.put(
+                            AudioChunk(
+                                chunk_index,
+                                start_time,
+                                samples,
+                                model_sample_rate,
+                                captured_at=time.monotonic(),
+                                is_final=True,
+                            )
+                        )
+                    else:
+                        self._emit("log", {"message": f"No speech detected in final chunk {chunk_index}"})
         except Exception as exc:  # pragma: no cover - environment-dependent
             self._emit("error", {"message": f"Recording failed: {exc}"})
         finally:
@@ -417,9 +529,28 @@ class MeetingTranscriberEngine:
             if chunk is None:
                 self._transcription_queue.put(None)
                 return
+            dropped = self._drop_stale_transcription_chunks(max_queued=1)
             with self._state_lock:
                 self._pending_transcription_chunks.add(chunk.index)
             self._transcription_queue.put(chunk)
+            if dropped:
+                noun = "chunk" if dropped == 1 else "chunks"
+                self._emit("log", {"message": f"Catching up: skipped {dropped} stale audio {noun}"})
+
+    def _drop_stale_transcription_chunks(self, max_queued: int = 2) -> int:
+        dropped = 0
+        while self._transcription_queue.qsize() > max_queued:
+            try:
+                stale = self._transcription_queue.get_nowait()
+            except queue.Empty:
+                break
+            if stale is None:
+                self._transcription_queue.put(None)
+                break
+            dropped += 1
+            with self._state_lock:
+                self._pending_transcription_chunks.discard(stale.index)
+        return dropped
 
     def _transcription_loop(self) -> None:
         try:
@@ -435,7 +566,10 @@ class MeetingTranscriberEngine:
             if chunk is None:
                 return
             try:
+                behind_at_start = max(0.0, time.monotonic() - chunk.captured_at)
+                self._emit("lag", {"behind_seconds": behind_at_start, "active": True})
                 self._emit("log", {"message": f"Transcribing chunk {chunk.index}..."})
+                started_at = time.monotonic()
                 segment_count = 0
                 segments, _info = model.transcribe(
                     chunk.samples,
@@ -463,6 +597,18 @@ class MeetingTranscriberEngine:
                     self._emit("transcript", {"row": row})
                 if segment_count == 0:
                     self._emit("log", {"message": f"No speech detected in chunk {chunk.index}"})
+                elapsed = time.monotonic() - started_at
+                behind_after = max(0.0, time.monotonic() - chunk.captured_at)
+                self._emit(
+                    "log",
+                    {
+                        "message": (
+                            f"Chunk {chunk.index} transcribed in {elapsed:.1f}s; "
+                            f"{behind_after:.1f}s behind realtime"
+                        )
+                    },
+                )
+                self._emit("lag", {"behind_seconds": behind_after, "active": True})
             except Exception as exc:  # pragma: no cover - environment-dependent
                 self._emit("error", {"message": f"Transcription failed for chunk {chunk.index}: {exc}"})
             finally:
