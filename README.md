@@ -1,6 +1,6 @@
 # Offline Meeting Transcriber
 
-Windows desktop app for offline meeting transcription with speaker diarization. It records from the laptop microphone, shows live transcript text first, then updates speaker labels asynchronously when diarization catches up.
+Windows desktop app for offline meeting transcription. It records from the laptop microphone and shows live continuous transcript text.
 
 Built for Windows 11 Enterprise laptops with no NVIDIA GPU. First setup can use internet to download packages and default public models; recording/runtime stays local and offline after setup.
 
@@ -29,7 +29,6 @@ OfflineMeetingTranscriber\
 
 ```text
 OfflineMeetingTranscriber\models\faster-whisper
-OfflineMeetingTranscriber\models\speechbrain-ecapa
 ```
 
 7. The setup window closes and launches the transcriber. Click `Record`.
@@ -64,11 +63,8 @@ Portable EXE bundles Python and Python packages. If first setup has internet, it
 
 - Records microphone audio locally.
 - Transcribes with `faster-whisper` on CPU using INT8 quantization.
-- Runs default non-gated speaker diarization with SpeechBrain ECAPA embeddings and local clustering.
-- Keeps pyannote as an optional advanced backend if local pyannote folders are configured.
-- Shows live transcript rows immediately as `Speaker ?`.
-- Replaces pending labels later with `Speaker 1`, `Speaker 2`, etc.
-- Lets users rename speakers in the GUI.
+- Shows live continuous transcript text.
+- Lets users copy the transcript from the GUI.
 - Writes an updated transcript file continuously.
 - Uses internet only during first setup downloads; no cloud APIs are used during recording/runtime.
 
@@ -101,15 +97,14 @@ X:\SomeFolder\OfflineMeetingTranscriber
 - Important setup messages stay visible for 5 seconds before moving on.
 - When prerequisites finish, setup shows a 5-second launch countdown.
 - After setup closes, the small startup window appears again while the main transcriber loads.
-- Setup downloads `Systran/faster-whisper-small` and `speechbrain/spkrec-ecapa-voxceleb` by default.
+- Setup downloads `Systran/faster-distil-whisper-large-v3` by default.
 - Model folder buttons open/prepare local model locations for manual or optional advanced setup.
 - After setup is marked complete, future double-clicks open the GUI immediately.
 
-If default models are still missing and setup cannot download them, recording cannot start until these folders contain local model files:
+If default models are still missing and setup cannot download them, recording cannot start until this folder contains local model files:
 
 ```text
 OfflineMeetingTranscriber\models\faster-whisper
-OfflineMeetingTranscriber\models\speechbrain-ecapa
 ```
 
 For a Windows laptop that does not have Python 3.12 installed, use:
@@ -129,7 +124,6 @@ That wrapper checks for Python 3.12. If missing, it attempts a current-user inst
 
 ```text
 models\faster-whisper
-models\speechbrain-ecapa
 ```
 
 4. Confirm output file path, default:
@@ -140,25 +134,24 @@ transcripts\meeting_transcript.txt
 
 5. Click `Record`.
 6. Speak into laptop microphone.
-7. Watch live transcript table:
+7. Watch live transcript text:
 
 ```text
-Speaker ?: initial transcript text
-Speaker 1: updated after diarization finishes
+Meeting transcript appears here as speech is processed.
 ```
 
 8. Use `Pause` to pause capture.
 9. Use `Stop` to flush final chunk and save transcript.
-10. Rename speakers from speaker panel; output file refreshes with new names.
+10. Use `Copy` or `Copy to Clipboard` to copy transcript text.
 
 Saved transcript format:
 
 ```text
-[00:00:12] Speaker 1: Hello team.
-[00:00:18] Speaker 2: Let's start with actions.
+[00:00:12] Hello team.
+[00:00:18] Let's start with actions.
 ```
 
-The console also prints live lines and later speaker updates.
+The console also prints live lines.
 
 ## Error Logs
 
@@ -181,9 +174,6 @@ OfflineMeetingTranscriber/
   config.json
   models/
     faster-whisper/
-    speechbrain-ecapa/
-    pyannote-pipeline/
-    pyannote-embedding/
   transcripts/
 error_log.txt   (created after an error)
 ```
@@ -204,10 +194,7 @@ AI model files are not bundled into the EXE. First setup can download default pu
 
 ```text
 dist\OfflineMeetingTranscriber\models\faster-whisper
-dist\OfflineMeetingTranscriber\models\speechbrain-ecapa
 ```
-
-Optional pyannote advanced mode still needs manually prepared local pyannote folders.
 
 ## Target Layout
 
@@ -221,9 +208,6 @@ OfflineMeetingTranscriber/
   _internal/
   models/
     faster-whisper/
-    speechbrain-ecapa/
-    pyannote-pipeline/
-    pyannote-embedding/
   transcripts/
   offline_setup.md
 ```
@@ -284,16 +268,9 @@ $env:LOCAL_WHISPER_APP_ROOT = "D:\Apps\OfflineMeetingTranscriber"
 
 Default one-touch folders:
 
-- `models\faster-whisper`: CTranslate2 faster-whisper model downloaded from `Systran/faster-whisper-small`; must contain `model.bin`.
-- `models\speechbrain-ecapa`: SpeechBrain ECAPA speaker embedding model downloaded from `speechbrain/spkrec-ecapa-voxceleb`; must contain `hyperparams.yaml` plus `embedding_model.ckpt` or `model.ckpt`.
+- `models\faster-whisper`: CTranslate2 faster-whisper model downloaded from `Systran/faster-distil-whisper-large-v3`; must contain `model.bin`.
 
-Optional advanced pyannote mode:
-
-- Requires installing `pyannote.audio` into the app runtime or source environment.
-- `models\pyannote-pipeline`: local pyannote diarization pipeline; must contain `config.yaml`.
-- `models\pyannote-embedding`: local pyannote embedding model; must contain `config.yaml` plus `pytorch_model.bin` or `model.safetensors`.
-
-Runtime recording does not download models. Pyannote `config.yaml` must reference local paths only.
+Runtime recording does not download models.
 
 ## Source Files
 
@@ -311,7 +288,7 @@ py -3.12 -B -m unittest discover -s tests -v
 py -3.12 -B -m py_compile app\app_config.py app\bootstrap_launcher.py app\meeting_transcriber_gui.py app\transcriber_engine.py packaging\build_standalone_pyw.py "Open Offline Meeting Transcriber.pyw" tests\test_bootstrap_launcher.py tests\test_app_config.py tests\test_engine_core.py tests\test_standalone_launcher.py packaging\local_whisper_transcriber.spec
 ```
 
-Expected current result: 62 tests pass.
+Expected current result: full test suite passes.
 
 ## Corporate Laptop Notes
 
@@ -319,6 +296,6 @@ Expected current result: 62 tests pass.
 - Source `.pyw` launch requires Python 3.12. `Open Offline Meeting Transcriber.cmd` can install it if `winget` is available. Portable EXE does not require system Python.
 - If endpoint security blocks unsigned EXEs, IT must allow-list or sign `OfflineMeetingTranscriber.exe`.
 - First setup uses Windows certificate trust via `truststore` for Hugging Face downloads. If corporate HTTPS inspection still causes `CERTIFICATE_VERIFY_FAILED`, IT can place `company-ca.pem`, `corporate-ca.pem`, or `ca-bundle.pem` beside `Open Offline Meeting Transcriber.pyw`, or set `LOCAL_WHISPER_CA_BUNDLE`.
-- If diarization lags on CPU, increase chunk duration to 10-15 seconds or use smaller local models.
+- If transcription lags on CPU, use a smaller local model or increase chunk duration.
 - Transcript output defaults to `<install folder>\transcripts\meeting_transcript.txt` when launched from the standalone `.pyw`.
 - Avoid placing model folders under OneDrive. Large model files can trigger sync errors and corporate cloud policy warnings.

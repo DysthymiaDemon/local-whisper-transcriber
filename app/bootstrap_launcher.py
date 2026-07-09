@@ -41,10 +41,10 @@ OPTIONAL_MODEL_DIRS: tuple[str, ...] = ()
 MODEL_DIRS = DEFAULT_MODEL_DIRS + OPTIONAL_MODEL_DIRS
 MODEL_GUIDES: dict[str, str] = {
     "faster-whisper": (
-        "Default setup downloads Systran/faster-whisper-small here.\n\n"
+        "Default setup downloads Systran/faster-distil-whisper-large-v3 here.\n\n"
         "Required file:\n"
         "- model.bin\n\n"
-        "Example source model: Systran/faster-whisper-small\n"
+        "Example source model: Systran/faster-distil-whisper-large-v3\n"
     ),
 }
 SETUP_MARKER = ".setup_complete"
@@ -55,7 +55,7 @@ RUNTIME_ENV = "LOCAL_WHISPER_RUNTIME_ROOT"
 RUNTIME_APP_FOLDER_NAME = "OfflineMeetingTranscriberRuntime"
 APP_PUBLISHER = "Ameen Khan"
 APP_VERSION = "local"
-INSTALL_DISK_SPACE_ESTIMATE = "~1.8 GB"
+INSTALL_DISK_SPACE_ESTIMATE = "~2.8 GB"
 NPM_DOTS5_SPINNER_FRAMES = ("⠋", "⠙", "⠚", "⠞", "⠖", "⠦", "⠴", "⠲", "⠳", "⠓")
 HF_OFFLINE_ENV_VARS = ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE")
 HF_PROGRESS_ENV_VARS = ("HF_HUB_DISABLE_PROGRESS_BARS",)
@@ -163,7 +163,7 @@ class JOBOBJECT_CPU_RATE_CONTROL_INFORMATION(ctypes.Structure):
 DEFAULT_MODEL_DOWNLOADS = (
     ModelDownloadSpec(
         name="faster-whisper",
-        repo_id="Systran/faster-whisper-small",
+        repo_id="Systran/faster-distil-whisper-large-v3",
         target_subdir="models/faster-whisper",
     ),
 )
@@ -884,8 +884,8 @@ def ensure_portable_layout(root: Path, template_root: Path | None = None) -> Pat
                         "whisper_model_dir": "models/faster-whisper",
                         "output_file": "transcripts/meeting_transcript.txt",
                         "sample_rate": 16000,
-                        "chunk_seconds": 3.0,
-                        "overlap_seconds": 0.25,
+                        "chunk_seconds": 5.0,
+                        "overlap_seconds": 0.5,
                         "compute_type": "int8",
                         "language": "en",
                     },

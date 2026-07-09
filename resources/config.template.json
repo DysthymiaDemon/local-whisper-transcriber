@@ -2,8 +2,8 @@
   "whisper_model_dir": "models/faster-whisper",
   "output_file": "transcripts/meeting_transcript.txt",
   "sample_rate": 16000,
-  "chunk_seconds": 3.0,
-  "overlap_seconds": 0.25,
+  "chunk_seconds": 5.0,
+  "overlap_seconds": 0.5,
   "compute_type": "int8",
   "language": "en"
 }

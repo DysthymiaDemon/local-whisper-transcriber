@@ -114,8 +114,8 @@ class BootstrapLauncherTests(unittest.TestCase):
             packages = setup_package_list(root)
 
         self.assertIn(f"Publisher: {APP_PUBLISHER}", summary)
-        self.assertIn("Disk space: ~1.8 GB for packages and models.", summary)
-        self.assertIn("Systran/faster-whisper-small -> models\\faster-whisper", summary)
+        self.assertIn("Disk space: ~2.8 GB for packages and models.", summary)
+        self.assertIn("Systran/faster-distil-whisper-large-v3 -> models\\faster-whisper", summary)
         self.assertNotIn("speechbrain", summary)
         self.assertEqual(packages, ["alpha==1.0", "beta>=2.0"])
         self.assertIn("- alpha==1.0", summary)
@@ -138,7 +138,7 @@ class BootstrapLauncherTests(unittest.TestCase):
     def test_setup_confirmation_mentions_disk_space(self):
         source = (Path(__file__).resolve().parents[1] / "app" / "bootstrap_launcher.py").read_text(encoding="utf-8")
 
-        self.assertIn('INSTALL_DISK_SPACE_ESTIMATE = "~1.8 GB"', source)
+        self.assertIn('INSTALL_DISK_SPACE_ESTIMATE = "~2.8 GB"', source)
         self.assertIn("this install uses {INSTALL_DISK_SPACE_ESTIMATE} for packages and models", source)
 
     def test_successful_package_install_marks_package_check_done(self):
@@ -441,7 +441,7 @@ class BootstrapLauncherTests(unittest.TestCase):
             def fake_download(**kwargs):
                 calls.append(kwargs)
                 target = Path(kwargs["local_dir"])
-                self.assertEqual(kwargs["repo_id"], "Systran/faster-whisper-small")
+                self.assertEqual(kwargs["repo_id"], "Systran/faster-distil-whisper-large-v3")
                 (target / "model.bin").write_bytes(b"model")
                 return str(target)
 
@@ -465,7 +465,7 @@ class BootstrapLauncherTests(unittest.TestCase):
             def fake_download(**kwargs):
                 calls.append(kwargs)
                 target = Path(kwargs["local_dir"])
-                self.assertEqual(kwargs["repo_id"], "Systran/faster-whisper-small")
+                self.assertEqual(kwargs["repo_id"], "Systran/faster-distil-whisper-large-v3")
                 (target / "model.bin").write_bytes(b"model")
                 return str(target)
 
@@ -487,7 +487,7 @@ class BootstrapLauncherTests(unittest.TestCase):
             def fake_download(**kwargs):
                 target = Path(kwargs["local_dir"])
                 self.assertFalse((target / "stale.txt").exists())
-                self.assertEqual(kwargs["repo_id"], "Systran/faster-whisper-small")
+                self.assertEqual(kwargs["repo_id"], "Systran/faster-distil-whisper-large-v3")
                 (target / "model.bin").write_bytes(b"model")
                 return str(target)
 
@@ -504,7 +504,7 @@ class BootstrapLauncherTests(unittest.TestCase):
             def fake_download(**kwargs):
                 seen_env.append({name: os.environ.get(name) for name in HF_OFFLINE_ENV_VARS})
                 target = Path(kwargs["local_dir"])
-                self.assertEqual(kwargs["repo_id"], "Systran/faster-whisper-small")
+                self.assertEqual(kwargs["repo_id"], "Systran/faster-distil-whisper-large-v3")
                 (target / "model.bin").write_bytes(b"model")
                 return str(target)
 
@@ -830,7 +830,7 @@ class BootstrapLauncherTests(unittest.TestCase):
 
             def fake_download(**kwargs):
                 target = Path(kwargs["local_dir"])
-                self.assertEqual(kwargs["repo_id"], "Systran/faster-whisper-small")
+                self.assertEqual(kwargs["repo_id"], "Systran/faster-distil-whisper-large-v3")
                 for size in (25, 50, 100):
                     (target / "model.bin").write_bytes(b"x" * size)
                     time.sleep(0.35)

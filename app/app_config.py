@@ -82,6 +82,7 @@ def _uses_generated_latency_defaults(raw: Mapping[str, Any]) -> bool:
     return (chunk_seconds, overlap_seconds) in {
         (8.0, 2.0),
         (4.0, 0.5),
+        (3.0, 0.25),
     }
 
 

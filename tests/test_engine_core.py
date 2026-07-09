@@ -204,6 +204,17 @@ class AudioPreprocessorTests(unittest.TestCase):
         self.assertFalse(audio_chunk_has_activity(noise))
         self.assertTrue(audio_chunk_has_activity(speech))
 
+    def test_soft_speech_survives_cleanup_and_activity_gate(self):
+        import numpy as np
+
+        sample_rate = 16000
+        t = np.arange(sample_rate, dtype=np.float32) / sample_rate
+        soft_speech = (0.0015 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
+
+        cleaned = AudioPreprocessor(sample_rate).process(soft_speech)
+
+        self.assertTrue(audio_chunk_has_activity(cleaned))
+
 
 class TranscriptionFilterTests(unittest.TestCase):
     def test_rejects_high_no_speech_probability(self):
@@ -263,12 +274,12 @@ class EngineConfigTests(unittest.TestCase):
 
         self.assertEqual(errors, [])
 
-    def test_defaults_pin_english_and_shorter_chunks(self):
+    def test_defaults_pin_english_and_accuracy_chunks(self):
         config = EngineConfig()
 
         self.assertEqual(config.language, "en")
-        self.assertEqual(config.chunk_seconds, 3.0)
-        self.assertEqual(config.overlap_seconds, 0.25)
+        self.assertEqual(config.chunk_seconds, 5.0)
+        self.assertEqual(config.overlap_seconds, 0.5)
 
 
 class TranscriptionBacklogTests(unittest.TestCase):

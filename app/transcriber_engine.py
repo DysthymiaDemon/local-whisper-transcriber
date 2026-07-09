@@ -71,8 +71,8 @@ class AudioPreprocessor:
         sample_rate: int,
         high_pass_hz: float = 80.0,
         dc_decay: float = 0.995,
-        gate_ratio: float = 2.2,
-        gate_attenuation: float = 0.18,
+        gate_ratio: float = 1.3,
+        gate_attenuation: float = 0.35,
         noise_floor: float = DEFAULT_NOISE_FLOOR,
         limiter_level: float = 0.98,
     ):
@@ -149,8 +149,8 @@ def audio_chunk_has_activity(samples: Any, noise_floor: float = DEFAULT_NOISE_FL
         return False
     rms = float(np.sqrt(np.mean(np.square(audio))))
     peak = float(np.max(np.abs(audio)))
-    threshold = max(MIC_SILENCE_RMS_THRESHOLD * 3.0, noise_floor * 1.6)
-    return rms >= threshold or peak >= threshold * 3.0
+    threshold = max(MIC_SILENCE_RMS_THRESHOLD * 3.0, noise_floor * 1.1)
+    return rms >= threshold or peak >= threshold * 2.5
 
 
 def audio_chunk_duration_seconds(chunk: "AudioChunk") -> float:
@@ -171,11 +171,11 @@ def _force_offline_mode() -> None:
 
 @dataclass(frozen=True)
 class EngineConfig:
-    whisper_model_dir: str = r"C:\models\faster-whisper-small"
+    whisper_model_dir: str = r"C:\models\faster-whisper"
     output_file: str = "meeting_transcript.txt"
     sample_rate: int = 16_000
-    chunk_seconds: float = 3.0
-    overlap_seconds: float = 0.25
+    chunk_seconds: float = 5.0
+    overlap_seconds: float = 0.5
     compute_type: str = "int8"
     input_device: Optional[int] = None
     language: Optional[str] = "en"
