@@ -26,11 +26,15 @@ from bootstrap_launcher import (
     REQUIRED_IMPORTS,
     SETUP_MARKER,
     BootstrapStatus,
+    GpuVendor,
     StepDiagnostic,
     StepState,
     build_step_tooltip,
+    choose_gpu_trial_backend,
+    detect_gpu_vendors_from_names,
     download_default_models,
     ensure_portable_layout,
+    gpu_trial_required_imports,
     is_onedrive_path,
     local_package_dir,
     local_runtime_dir,
@@ -114,8 +118,8 @@ class BootstrapLauncherTests(unittest.TestCase):
             packages = setup_package_list(root)
 
         self.assertIn(f"Publisher: {APP_PUBLISHER}", summary)
-        self.assertIn("Disk space: ~2.8 GB for packages and models.", summary)
-        self.assertIn("Systran/faster-distil-whisper-large-v3 -> models\\faster-whisper", summary)
+        self.assertIn("Disk space: ~1.8 GB for packages and models.", summary)
+        self.assertIn("Systran/faster-whisper-small.en -> models\\faster-whisper", summary)
         self.assertNotIn("speechbrain", summary)
         self.assertEqual(packages, ["alpha==1.0", "beta>=2.0"])
         self.assertIn("- alpha==1.0", summary)
@@ -138,8 +142,40 @@ class BootstrapLauncherTests(unittest.TestCase):
     def test_setup_confirmation_mentions_disk_space(self):
         source = (Path(__file__).resolve().parents[1] / "app" / "bootstrap_launcher.py").read_text(encoding="utf-8")
 
-        self.assertIn('INSTALL_DISK_SPACE_ESTIMATE = "~2.8 GB"', source)
+        self.assertIn('INSTALL_DISK_SPACE_ESTIMATE = "~1.8 GB"', source)
         self.assertIn("this install uses {INSTALL_DISK_SPACE_ESTIMATE} for packages and models", source)
+
+    def test_detect_gpu_vendors_from_video_controller_names(self):
+        vendors = detect_gpu_vendors_from_names(
+            [
+                "Intel(R) Iris(R) Xe Graphics",
+                "AMD Radeon 780M Graphics",
+                "NVIDIA RTX 4060 Laptop GPU",
+                "Microsoft Basic Display Adapter",
+            ]
+        )
+
+        self.assertEqual(vendors, [GpuVendor.INTEL, GpuVendor.AMD, GpuVendor.NVIDIA])
+
+    def test_choose_gpu_trial_backend_prefers_nvidia_then_intel_then_amd(self):
+        nvidia = choose_gpu_trial_backend([GpuVendor.INTEL, GpuVendor.NVIDIA])
+        intel = choose_gpu_trial_backend([GpuVendor.INTEL])
+        amd = choose_gpu_trial_backend([GpuVendor.AMD])
+
+        self.assertEqual(nvidia.key, "nvidia-cuda")
+        self.assertEqual(nvidia.config_overrides["device"], "cuda")
+        self.assertEqual(nvidia.config_overrides["compute_type"], "float16")
+        self.assertEqual(intel.key, "intel-openvino")
+        self.assertTrue(any(requirement.startswith("openvino-genai") for requirement in intel.requirements))
+        self.assertEqual(amd.key, "amd-directml")
+        self.assertTrue(any(requirement.startswith("onnxruntime-directml") for requirement in amd.requirements))
+
+    def test_gpu_trial_required_imports_are_selected_by_vendor(self):
+        imports = gpu_trial_required_imports([GpuVendor.INTEL])
+
+        self.assertIn("openvino", imports)
+        self.assertIn("openvino-genai", imports)
+        self.assertNotIn("onnxruntime-directml", imports)
 
     def test_successful_package_install_marks_package_check_done(self):
         source = (Path(__file__).resolve().parents[1] / "app" / "bootstrap_launcher.py").read_text(encoding="utf-8")
@@ -183,6 +219,32 @@ class BootstrapLauncherTests(unittest.TestCase):
         self.assertEqual(config["whisper_model_dir"], "models/faster-whisper")
         self.assertEqual(config["output_file"], "transcripts/meeting_transcript.txt")
         self.assertEqual(config["language"], "en")
+
+    def test_gpu_trial_layout_uses_openvino_model_and_config_for_intel(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            with patch.dict(os.environ, {"LOCAL_WHISPER_GPU_TRIAL": "1"}, clear=False):
+                with patch.object(
+                    bootstrap_launcher_module,
+                    "detect_windows_gpu_names",
+                    return_value=["Intel(R) Iris(R) Xe Graphics"],
+                ):
+                    config_path = ensure_portable_layout(root)
+
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            requirements = local_runtime_dir(root) / "gpu-trial-requirements.txt"
+            report = root / "gpu_trial_report.txt"
+            self.assertTrue(requirements.is_file())
+            self.assertTrue(report.is_file())
+            requirements_content = requirements.read_text(encoding="utf-8")
+            report_content = report.read_text(encoding="utf-8")
+
+            self.assertEqual(config["whisper_model_dir"], "models/openvino-whisper")
+            self.assertEqual(config["device"], "openvino:GPU")
+            self.assertEqual(config["compute_type"], "fp16")
+            self.assertIn("openvino-genai", requirements_content)
+            self.assertIn("selected_backend: intel-openvino", report_content)
 
     def test_local_runtime_paths_stay_under_install_root_without_venv(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -294,6 +356,44 @@ class BootstrapLauncherTests(unittest.TestCase):
             self.assertIn("--target", captured["cmd"])
             self.assertIn(str(root / ".runtime" / "site-packages"), captured["cmd"])
             self.assertNotIn("venv", captured["cmd"])
+
+    def test_run_pip_install_adds_gpu_trial_requirements_for_intel(self):
+        from bootstrap_launcher import run_pip_install
+
+        with tempfile.TemporaryDirectory() as runtime_tmp, tempfile.TemporaryDirectory() as package_tmp:
+            root = Path(runtime_tmp)
+            package_root = Path(package_tmp)
+            resources = package_root / "resources"
+            resources.mkdir()
+            (resources / "requirements.txt").write_text("example-package==1.0\n", encoding="utf-8")
+            captured = {}
+
+            class FakeProcess:
+                def __init__(self, cmd, **kwargs):
+                    captured["cmd"] = cmd
+                    self.stdout = iter(["Successfully installed example-package-1.0\n"])
+
+                def wait(self):
+                    return 0
+
+            with patch.dict(os.environ, {"LOCAL_WHISPER_GPU_TRIAL": "1"}, clear=False):
+                with patch.object(
+                    bootstrap_launcher_module,
+                    "detect_windows_gpu_names",
+                    return_value=["Intel(R) Iris(R) Xe Graphics"],
+                ):
+                    with patch("bootstrap_launcher.subprocess.Popen", FakeProcess):
+                        result = run_pip_install(root, lambda event: None, package_root)
+
+            requirement_args = [
+                captured["cmd"][index + 1]
+                for index, item in enumerate(captured["cmd"])
+                if item == "-r"
+            ]
+
+        self.assertEqual(result.code, 0)
+        self.assertEqual(len(requirement_args), 2)
+        self.assertTrue(requirement_args[-1].endswith("gpu-trial-requirements.txt"))
 
     def test_windows_cpu_limit_uses_job_object_hard_cap_at_25_percent(self):
         calls = []
@@ -441,7 +541,7 @@ class BootstrapLauncherTests(unittest.TestCase):
             def fake_download(**kwargs):
                 calls.append(kwargs)
                 target = Path(kwargs["local_dir"])
-                self.assertEqual(kwargs["repo_id"], "Systran/faster-distil-whisper-large-v3")
+                self.assertEqual(kwargs["repo_id"], "Systran/faster-whisper-small.en")
                 (target / "model.bin").write_bytes(b"model")
                 return str(target)
 
@@ -465,7 +565,7 @@ class BootstrapLauncherTests(unittest.TestCase):
             def fake_download(**kwargs):
                 calls.append(kwargs)
                 target = Path(kwargs["local_dir"])
-                self.assertEqual(kwargs["repo_id"], "Systran/faster-distil-whisper-large-v3")
+                self.assertEqual(kwargs["repo_id"], "Systran/faster-whisper-small.en")
                 (target / "model.bin").write_bytes(b"model")
                 return str(target)
 
@@ -487,7 +587,7 @@ class BootstrapLauncherTests(unittest.TestCase):
             def fake_download(**kwargs):
                 target = Path(kwargs["local_dir"])
                 self.assertFalse((target / "stale.txt").exists())
-                self.assertEqual(kwargs["repo_id"], "Systran/faster-distil-whisper-large-v3")
+                self.assertEqual(kwargs["repo_id"], "Systran/faster-whisper-small.en")
                 (target / "model.bin").write_bytes(b"model")
                 return str(target)
 
@@ -504,7 +604,7 @@ class BootstrapLauncherTests(unittest.TestCase):
             def fake_download(**kwargs):
                 seen_env.append({name: os.environ.get(name) for name in HF_OFFLINE_ENV_VARS})
                 target = Path(kwargs["local_dir"])
-                self.assertEqual(kwargs["repo_id"], "Systran/faster-distil-whisper-large-v3")
+                self.assertEqual(kwargs["repo_id"], "Systran/faster-whisper-small.en")
                 (target / "model.bin").write_bytes(b"model")
                 return str(target)
 
@@ -830,7 +930,7 @@ class BootstrapLauncherTests(unittest.TestCase):
 
             def fake_download(**kwargs):
                 target = Path(kwargs["local_dir"])
-                self.assertEqual(kwargs["repo_id"], "Systran/faster-distil-whisper-large-v3")
+                self.assertEqual(kwargs["repo_id"], "Systran/faster-whisper-small.en")
                 for size in (25, 50, 100):
                     (target / "model.bin").write_bytes(b"x" * size)
                     time.sleep(0.35)

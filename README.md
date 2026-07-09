@@ -2,7 +2,7 @@
 
 Windows desktop app for offline meeting transcription. It records from the laptop microphone and shows live continuous transcript text.
 
-Built for Windows 11 Enterprise laptops with no NVIDIA GPU. First setup can use internet to download packages and default public models; recording/runtime stays local and offline after setup.
+Built for Windows 11 Enterprise laptops. First setup can use internet to download packages and default public models; recording/runtime stays local and offline after setup.
 
 ## Quick Start
 
@@ -59,6 +59,16 @@ dist\OfflineMeetingTranscriber\Run-OfflineMeetingTranscriber.bat
 
 Portable EXE bundles Python and Python packages. If first setup has internet, it downloads default models; otherwise copy model folders into `models\` before use.
 
+### Option D: GPU Trial
+
+Use this separate launcher only for testing GPU acceleration:
+
+```text
+Open Offline Meeting Transcriber GPU Trial.pyw
+```
+
+It creates `OfflineMeetingTranscriberGpuTrial\` beside itself. NVIDIA uses faster-whisper CUDA config if CUDA/cuDNN is available. Intel GPU trial installs OpenVINO GenAI and downloads an OpenVINO Whisper model into `models\openvino-whisper`. AMD installs DirectML runtime for probing, but the current transcription engine is not ONNX-backed yet.
+
 ## What It Does
 
 - Records microphone audio locally.
@@ -97,7 +107,7 @@ X:\SomeFolder\OfflineMeetingTranscriber
 - Important setup messages stay visible for 5 seconds before moving on.
 - When prerequisites finish, setup shows a 5-second launch countdown.
 - After setup closes, the small startup window appears again while the main transcriber loads.
-- Setup downloads `Systran/faster-distil-whisper-large-v3` by default.
+- Setup downloads `Systran/faster-whisper-small.en` by default for CPU realtime behavior.
 - Model folder buttons open/prepare local model locations for manual or optional advanced setup.
 - After setup is marked complete, future double-clicks open the GUI immediately.
 
@@ -268,13 +278,15 @@ $env:LOCAL_WHISPER_APP_ROOT = "D:\Apps\OfflineMeetingTranscriber"
 
 Default one-touch folders:
 
-- `models\faster-whisper`: CTranslate2 faster-whisper model downloaded from `Systran/faster-distil-whisper-large-v3`; must contain `model.bin`.
+- `models\faster-whisper`: CTranslate2 faster-whisper model downloaded from `Systran/faster-whisper-small.en`; must contain `model.bin`.
+- `models\openvino-whisper`: GPU trial OpenVINO model downloaded from `OpenVINO/whisper-small-fp16-ov`; must contain OpenVINO `.xml` model files.
 
 Runtime recording does not download models.
 
 ## Source Files
 
-- `Open Offline Meeting Transcriber.pyw`: self-extracting double-click launcher.
+- `Open Offline Meeting Transcriber.pyw`: self-extracting CPU double-click launcher.
+- `Open Offline Meeting Transcriber GPU Trial.pyw`: separate self-extracting GPU trial launcher.
 - `app/`: runtime source for setup, GUI, engine, and config handling.
 - `resources/`: pip requirement files and config template.
 - `packaging/`: PyInstaller build script/spec, portable BAT, standalone launcher generator.
@@ -285,7 +297,7 @@ Runtime recording does not download models.
 
 ```powershell
 py -3.12 -B -m unittest discover -s tests -v
-py -3.12 -B -m py_compile app\app_config.py app\bootstrap_launcher.py app\meeting_transcriber_gui.py app\transcriber_engine.py packaging\build_standalone_pyw.py "Open Offline Meeting Transcriber.pyw" tests\test_bootstrap_launcher.py tests\test_app_config.py tests\test_engine_core.py tests\test_standalone_launcher.py packaging\local_whisper_transcriber.spec
+py -3.12 -B -m py_compile app\app_config.py app\bootstrap_launcher.py app\meeting_transcriber_gui.py app\transcriber_engine.py packaging\build_standalone_pyw.py "Open Offline Meeting Transcriber.pyw" "Open Offline Meeting Transcriber GPU Trial.pyw" tests\test_bootstrap_launcher.py tests\test_app_config.py tests\test_engine_core.py tests\test_standalone_launcher.py packaging\local_whisper_transcriber.spec
 ```
 
 Expected current result: full test suite passes.

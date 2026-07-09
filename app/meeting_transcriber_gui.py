@@ -22,6 +22,9 @@ SAMPLE_RATE = PORTABLE_DEFAULTS.sample_rate
 CHUNK_SECONDS = PORTABLE_DEFAULTS.chunk_seconds
 OVERLAP_SECONDS = PORTABLE_DEFAULTS.overlap_seconds
 COMPUTE_TYPE = PORTABLE_DEFAULTS.compute_type
+DEVICE = PORTABLE_DEFAULTS.device
+CPU_THREADS = PORTABLE_DEFAULTS.cpu_threads
+NUM_WORKERS = PORTABLE_DEFAULTS.num_workers
 LANGUAGE = PORTABLE_DEFAULTS.language
 
 
@@ -270,6 +273,9 @@ class MainWindow(QMainWindow):
             chunk_seconds=float(CHUNK_SECONDS),
             overlap_seconds=float(OVERLAP_SECONDS),
             compute_type=COMPUTE_TYPE,
+            device=DEVICE,
+            cpu_threads=int(CPU_THREADS),
+            num_workers=int(NUM_WORKERS),
             input_device=self.device_combo.currentData(),
             language=LANGUAGE,
         )
@@ -314,7 +320,7 @@ class MainWindow(QMainWindow):
         if not self.engine or self._stopping:
             return
         self._stopping = True
-        self.status_label.setText("Stopping")
+        self.status_label.setText("Finishing transcription")
         self.record_button.setEnabled(False)
         self.pause_button.setEnabled(False)
         self.stop_button.setEnabled(False)
@@ -440,11 +446,13 @@ class MainWindow(QMainWindow):
         self.status_label.setText("Stopped")
 
     def closeEvent(self, event: Any) -> None:  # pragma: no cover - GUI lifecycle
-        if self.engine:
-            self.status_label.setText("Stopping")
-            engine = self.engine
-            self.engine = None
-            engine.stop()
+        if self.engine or self._stopping:
+            self.status_label.setText("Finishing transcription")
+            self._append_log("Finishing transcription before closing. Wait for Stopped.")
+            if self.engine and not self._stopping:
+                self._stop_recording()
+            event.ignore()
+            return
         event.accept()
 
 

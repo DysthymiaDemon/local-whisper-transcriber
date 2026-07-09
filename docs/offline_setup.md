@@ -66,7 +66,7 @@ python -c "import sounddevice as sd; print(sd.query_devices())"
 
 The normal first-run setup downloads these automatically when internet is available:
 
-- `Systran/faster-whisper-small` into `models\faster-whisper`
+- `Systran/faster-whisper-small.en` into `models\faster-whisper`
 - `speechbrain/spkrec-ecapa-voxceleb` into `models\speechbrain-ecapa`
 
 For air-gapped setup, download them on an internet-connected Windows machine and copy the folders to the laptop. Use CTranslate2/faster-whisper model folders, not OpenAI `.pt` files.
@@ -75,7 +75,7 @@ Recommended CPU start:
 
 ```powershell
 pip install huggingface_hub
-huggingface-cli download Systran/faster-whisper-small `
+huggingface-cli download Systran/faster-whisper-small.en `
   --local-dir models\faster-whisper `
   --local-dir-use-symlinks False
 huggingface-cli download speechbrain/spkrec-ecapa-voxceleb `

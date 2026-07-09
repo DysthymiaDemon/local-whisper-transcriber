@@ -38,13 +38,19 @@ REQUIRED_IMPORTS: dict[str, str] = {
 
 DEFAULT_MODEL_DIRS = ("faster-whisper",)
 OPTIONAL_MODEL_DIRS: tuple[str, ...] = ()
+GPU_TRIAL_MODEL_DIRS = ("openvino-whisper",)
 MODEL_DIRS = DEFAULT_MODEL_DIRS + OPTIONAL_MODEL_DIRS
 MODEL_GUIDES: dict[str, str] = {
     "faster-whisper": (
-        "Default setup downloads Systran/faster-distil-whisper-large-v3 here.\n\n"
+        "Default CPU setup downloads Systran/faster-whisper-small.en here.\n\n"
         "Required file:\n"
         "- model.bin\n\n"
-        "Example source model: Systran/faster-distil-whisper-large-v3\n"
+        "Example source model: Systran/faster-whisper-small.en\n"
+    ),
+    "openvino-whisper": (
+        "GPU trial setup downloads OpenVINO/whisper-small-fp16-ov here for Intel GPU testing.\n\n"
+        "Required files include OpenVINO IR XML/BIN files and tokenizer files.\n\n"
+        "Example source model: OpenVINO/whisper-small-fp16-ov\n"
     ),
 }
 SETUP_MARKER = ".setup_complete"
@@ -52,10 +58,12 @@ IMPORTANT_MESSAGE_SECONDS = 5
 RUNTIME_DIR = ".runtime"
 PACKAGE_DIR = "site-packages"
 RUNTIME_ENV = "LOCAL_WHISPER_RUNTIME_ROOT"
+RUNTIME_APP_FOLDER_ENV = "LOCAL_WHISPER_RUNTIME_APP_FOLDER_NAME"
 RUNTIME_APP_FOLDER_NAME = "OfflineMeetingTranscriberRuntime"
+GPU_TRIAL_ENV = "LOCAL_WHISPER_GPU_TRIAL"
 APP_PUBLISHER = "Ameen Khan"
 APP_VERSION = "local"
-INSTALL_DISK_SPACE_ESTIMATE = "~2.8 GB"
+INSTALL_DISK_SPACE_ESTIMATE = "~1.8 GB"
 NPM_DOTS5_SPINNER_FRAMES = ("⠋", "⠙", "⠚", "⠞", "⠖", "⠦", "⠴", "⠲", "⠳", "⠓")
 HF_OFFLINE_ENV_VARS = ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE")
 HF_PROGRESS_ENV_VARS = ("HF_HUB_DISABLE_PROGRESS_BARS",)
@@ -108,6 +116,13 @@ class StepState(StrEnum):
     ERROR = "error"
 
 
+class GpuVendor(StrEnum):
+    NVIDIA = "nvidia"
+    INTEL = "intel"
+    AMD = "amd"
+    UNKNOWN = "unknown"
+
+
 @dataclass(frozen=True)
 class PipProgressEvent:
     phase: str
@@ -153,6 +168,17 @@ class ModelDownloadSpec:
     target_subdir: str
 
 
+@dataclass(frozen=True)
+class GpuTrialBackend:
+    key: str
+    label: str
+    requirements: tuple[str, ...] = ()
+    imports: Mapping[str, str] | None = None
+    model_downloads: tuple[ModelDownloadSpec, ...] = ()
+    config_overrides: Mapping[str, Any] | None = None
+    note: str = ""
+
+
 class JOBOBJECT_CPU_RATE_CONTROL_INFORMATION(ctypes.Structure):
     _fields_ = [
         ("ControlFlags", ctypes.c_uint32),
@@ -163,21 +189,83 @@ class JOBOBJECT_CPU_RATE_CONTROL_INFORMATION(ctypes.Structure):
 DEFAULT_MODEL_DOWNLOADS = (
     ModelDownloadSpec(
         name="faster-whisper",
-        repo_id="Systran/faster-distil-whisper-large-v3",
+        repo_id="Systran/faster-whisper-small.en",
         target_subdir="models/faster-whisper",
     ),
 )
+
+OPENVINO_MODEL_DOWNLOADS = (
+    ModelDownloadSpec(
+        name="openvino-whisper",
+        repo_id="OpenVINO/whisper-small-fp16-ov",
+        target_subdir="models/openvino-whisper",
+    ),
+)
+
+GPU_TRIAL_BACKEND_NONE = GpuTrialBackend(
+    key="cpu-only",
+    label="No supported GPU trial backend detected",
+    note="No NVIDIA, Intel, or AMD GPU was detected. The trial launcher will use the normal CPU backend.",
+)
+GPU_TRIAL_BACKENDS = {
+    GpuVendor.NVIDIA: GpuTrialBackend(
+        key="nvidia-cuda",
+        label="NVIDIA CUDA faster-whisper",
+        config_overrides={"device": "cuda", "compute_type": "float16"},
+        note=(
+            "Uses the existing CTranslate2 faster-whisper model with device=cuda. "
+            "CUDA/cuDNN runtime libraries must be available on Windows."
+        ),
+    ),
+    GpuVendor.INTEL: GpuTrialBackend(
+        key="intel-openvino",
+        label="Intel OpenVINO WhisperPipeline",
+        requirements=(
+            "--pre",
+            "--extra-index-url https://storage.openvinotoolkit.org/simple/wheels/nightly",
+            "openvino>=2025.2.0",
+            "openvino-tokenizers>=2025.2.0",
+            "openvino-genai>=2025.2.0",
+        ),
+        imports={
+            "openvino": "openvino",
+            "openvino-genai": "openvino_genai",
+        },
+        model_downloads=OPENVINO_MODEL_DOWNLOADS,
+        config_overrides={
+            "whisper_model_dir": "models/openvino-whisper",
+            "device": "openvino:GPU",
+            "compute_type": "fp16",
+        },
+        note="Uses OpenVINO GenAI WhisperPipeline on Intel GPU with an OpenVINO IR model.",
+    ),
+    GpuVendor.AMD: GpuTrialBackend(
+        key="amd-directml",
+        label="AMD DirectML framework probe",
+        requirements=("onnxruntime-directml>=1.19.0",),
+        imports={"onnxruntime-directml": "onnxruntime"},
+        note=(
+            "Installs DirectML runtime for detection/probing. Current transcription engine is not "
+            "ONNX-backed, so AMD GPU transcription is not enabled yet."
+        ),
+    ),
+}
 
 
 def setup_install_summary(package_root: Path | None = None) -> str:
     package_lines = "\n".join(f"- {package}" for package in setup_package_list(package_root))
     model_lines = "\n".join(f"- {model}" for model in setup_model_list())
+    gpu_trial_note = ""
+    if gpu_trial_enabled():
+        backend = active_gpu_trial_backend()
+        gpu_trial_note = f"\nGPU trial backend: {backend.label}\n{backend.note}\n"
     return (
         "Install Offline Meeting Transcriber?\n"
         "Local Windows App\n"
         f"Publisher: {APP_PUBLISHER}\n"
         f"Version: {APP_VERSION}\n\n"
         f"Disk space: {INSTALL_DISK_SPACE_ESTIMATE} for packages and models.\n\n"
+        f"{gpu_trial_note}"
         "Models to install locally:\n"
         f"{model_lines}\n\n"
         "Python packages to install locally:\n"
@@ -189,7 +277,7 @@ def setup_install_summary(package_root: Path | None = None) -> str:
 
 
 def setup_model_list() -> list[str]:
-    return [f"{spec.repo_id} -> {spec.target_subdir.replace('/', os.sep)}" for spec in DEFAULT_MODEL_DOWNLOADS]
+    return [f"{spec.repo_id} -> {spec.target_subdir.replace('/', os.sep)}" for spec in active_model_downloads()]
 
 
 def setup_package_list(package_root: Path | None = None) -> list[str]:
@@ -202,7 +290,136 @@ def setup_package_list(package_root: Path | None = None) -> list[str]:
         line = raw_line.strip()
         if line and not line.startswith("#"):
             packages.append(line)
+    if gpu_trial_enabled():
+        packages.extend(gpu_trial_package_list())
     return packages or ["Python package requirements"]
+
+
+def gpu_trial_enabled() -> bool:
+    return os.environ.get(GPU_TRIAL_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def detect_windows_gpu_names() -> list[str]:
+    commands = [
+        [
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_VideoController | ForEach-Object { $_.Name }",
+        ],
+        ["wmic", "path", "win32_VideoController", "get", "name"],
+    ]
+    for cmd in commands:
+        try:
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+                check=False,
+            )
+        except Exception:
+            continue
+        if result.returncode != 0:
+            continue
+        names = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        names = [name for name in names if name.lower() not in {"name"}]
+        if names:
+            return names
+    return []
+
+
+def detect_gpu_vendors_from_names(names: Iterable[str]) -> list[GpuVendor]:
+    vendors: list[GpuVendor] = []
+    seen: set[GpuVendor] = set()
+    for raw_name in names:
+        name = raw_name.lower()
+        vendor = GpuVendor.UNKNOWN
+        if any(marker in name for marker in ("nvidia", "geforce", "quadro", "rtx", "gtx")):
+            vendor = GpuVendor.NVIDIA
+        elif any(marker in name for marker in ("intel", "iris", "arc graphics")):
+            vendor = GpuVendor.INTEL
+        elif any(marker in name for marker in ("amd", "radeon")):
+            vendor = GpuVendor.AMD
+        if vendor != GpuVendor.UNKNOWN and vendor not in seen:
+            vendors.append(vendor)
+            seen.add(vendor)
+    return vendors
+
+
+def detect_gpu_vendors() -> list[GpuVendor]:
+    return detect_gpu_vendors_from_names(detect_windows_gpu_names())
+
+
+def choose_gpu_trial_backend(vendors: Iterable[GpuVendor] | None = None) -> GpuTrialBackend:
+    vendor_list = list(vendors) if vendors is not None else detect_gpu_vendors()
+    for vendor in (GpuVendor.NVIDIA, GpuVendor.INTEL, GpuVendor.AMD):
+        if vendor in vendor_list:
+            return GPU_TRIAL_BACKENDS[vendor]
+    return GPU_TRIAL_BACKEND_NONE
+
+
+def active_gpu_trial_backend() -> GpuTrialBackend:
+    return choose_gpu_trial_backend() if gpu_trial_enabled() else GPU_TRIAL_BACKEND_NONE
+
+
+def gpu_trial_requirement_lines(vendors: Iterable[GpuVendor] | None = None) -> list[str]:
+    backend = choose_gpu_trial_backend(vendors)
+    return list(backend.requirements)
+
+
+def gpu_trial_package_list(vendors: Iterable[GpuVendor] | None = None) -> list[str]:
+    return [line for line in gpu_trial_requirement_lines(vendors) if line and not line.startswith("--")]
+
+
+def gpu_trial_required_imports(vendors: Iterable[GpuVendor] | None = None) -> dict[str, str]:
+    backend = choose_gpu_trial_backend(vendors)
+    return dict(backend.imports or {})
+
+
+def runtime_required_imports() -> dict[str, str]:
+    required = dict(REQUIRED_IMPORTS)
+    if gpu_trial_enabled():
+        required.update(gpu_trial_required_imports())
+    return required
+
+
+def active_model_downloads() -> tuple[ModelDownloadSpec, ...]:
+    if not gpu_trial_enabled():
+        return DEFAULT_MODEL_DOWNLOADS
+    backend = active_gpu_trial_backend()
+    return backend.model_downloads or DEFAULT_MODEL_DOWNLOADS
+
+
+def active_model_dirs() -> tuple[str, ...]:
+    names = list(MODEL_DIRS)
+    for spec in active_model_downloads():
+        if spec.name not in names:
+            names.append(spec.name)
+    return tuple(names)
+
+
+def write_gpu_trial_requirements(root: Path, backend: GpuTrialBackend | None = None) -> Path | None:
+    backend = backend or active_gpu_trial_backend()
+    if not backend.requirements:
+        return None
+    requirements_path = local_runtime_dir(root) / "gpu-trial-requirements.txt"
+    requirements_path.parent.mkdir(parents=True, exist_ok=True)
+    requirements_path.write_text("\n".join(backend.requirements) + "\n", encoding="utf-8")
+    return requirements_path
+
+
+def pip_requirement_paths(root: Path, package_root: Path | None = None) -> list[Path]:
+    package_root = package_root or installer_source_root()
+    paths = [resource_root(package_root) / "requirements.txt"]
+    if gpu_trial_enabled():
+        extra_path = write_gpu_trial_requirements(root)
+        if extra_path is not None:
+            paths.append(extra_path)
+    return paths
 
 
 def format_duration(seconds: float | None) -> str:
@@ -771,11 +988,12 @@ def local_runtime_dir(root: Path) -> Path:
     configured = os.environ.get(RUNTIME_ENV)
     if configured:
         return Path(configured).expanduser().resolve()
+    runtime_folder_name = os.environ.get(RUNTIME_APP_FOLDER_ENV, RUNTIME_APP_FOLDER_NAME)
     if is_onedrive_path(root):
         local_app_data = os.environ.get("LOCALAPPDATA")
         if local_app_data:
-            return (Path(local_app_data) / RUNTIME_APP_FOLDER_NAME).resolve()
-        return (Path.home() / "AppData" / "Local" / RUNTIME_APP_FOLDER_NAME).resolve()
+            return (Path(local_app_data) / runtime_folder_name).resolve()
+        return (Path.home() / "AppData" / "Local" / runtime_folder_name).resolve()
     return root / RUNTIME_DIR
 
 
@@ -860,11 +1078,45 @@ def missing_runtime_imports(root: Path, required: Mapping[str, str] = REQUIRED_I
     return [item for item in parsed if isinstance(item, str)]
 
 
+def write_gpu_trial_report(root: Path, backend: GpuTrialBackend | None = None) -> Path:
+    backend = backend or active_gpu_trial_backend()
+    names = detect_windows_gpu_names()
+    vendors = detect_gpu_vendors_from_names(names)
+    lines = [
+        "GPU trial report",
+        f"timestamp: {datetime.now().isoformat(timespec='seconds')}",
+        f"detected_gpus: {', '.join(names) if names else 'none'}",
+        f"detected_vendors: {', '.join(vendor.value for vendor in vendors) if vendors else 'none'}",
+        f"selected_backend: {backend.key}",
+        f"selected_backend_label: {backend.label}",
+        f"note: {backend.note or 'none'}",
+    ]
+    report_path = root / "gpu_trial_report.txt"
+    report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return report_path
+
+
+def apply_gpu_trial_config(config_path: Path, backend: GpuTrialBackend | None = None) -> None:
+    if not gpu_trial_enabled():
+        return
+    backend = backend or active_gpu_trial_backend()
+    if not backend.config_overrides:
+        return
+    try:
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    raw.update(dict(backend.config_overrides))
+    config_path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+
+
 def ensure_portable_layout(root: Path, template_root: Path | None = None) -> Path:
     migrate_legacy_onedrive_runtime(root)
     local_runtime_dir(root).mkdir(parents=True, exist_ok=True)
     models = root / "models"
-    for name in MODEL_DIRS:
+    for name in active_model_dirs():
         model_dir = models / name
         model_dir.mkdir(parents=True, exist_ok=True)
         guide = model_dir / "README_MODEL_FILES.txt"
@@ -873,6 +1125,7 @@ def ensure_portable_layout(root: Path, template_root: Path | None = None) -> Pat
     (root / "transcripts").mkdir(parents=True, exist_ok=True)
 
     config_path = root / "config.json"
+    created_config = False
     if not config_path.exists():
         template_path = resource_root(template_root or root) / "config.template.json"
         if template_path.exists():
@@ -887,6 +1140,9 @@ def ensure_portable_layout(root: Path, template_root: Path | None = None) -> Pat
                         "chunk_seconds": 5.0,
                         "overlap_seconds": 0.5,
                         "compute_type": "int8",
+                        "device": "cpu",
+                        "cpu_threads": 0,
+                        "num_workers": 1,
                         "language": "en",
                     },
                     indent=2,
@@ -894,6 +1150,13 @@ def ensure_portable_layout(root: Path, template_root: Path | None = None) -> Pat
                 + "\n",
                 encoding="utf-8",
             )
+        created_config = True
+    if gpu_trial_enabled():
+        backend = active_gpu_trial_backend()
+        write_gpu_trial_requirements(root, backend)
+        write_gpu_trial_report(root, backend)
+        if created_config:
+            apply_gpu_trial_config(config_path, backend)
     return config_path
 
 
@@ -904,12 +1167,14 @@ def _model_folder_ready(root: Path, name: str) -> bool:
 def _model_folder_ready_at(folder: Path, name: str) -> bool:
     if name == "faster-whisper":
         return (folder / "model.bin").is_file()
+    if name == "openvino-whisper":
+        return any(folder.glob("*.xml"))
     return False
 
 
 def model_folder_status(root: Path, include_optional: bool = False) -> dict[str, BootstrapStatus]:
     status: dict[str, BootstrapStatus] = {}
-    model_names = MODEL_DIRS if include_optional else DEFAULT_MODEL_DIRS
+    model_names = active_model_dirs() if include_optional else tuple(spec.name for spec in active_model_downloads())
     for name in model_names:
         ready = _model_folder_ready(root, name)
         status[name] = BootstrapStatus.READY if ready else BootstrapStatus.MISSING
@@ -1242,8 +1507,9 @@ def download_default_models(root: Path, on_event, downloader: Callable[..., str]
         downloader = snapshot_download
 
     downloaded: list[str] = []
-    total = len(DEFAULT_MODEL_DOWNLOADS)
-    for index, spec in enumerate(DEFAULT_MODEL_DOWNLOADS, start=1):
+    model_downloads = active_model_downloads()
+    total = len(model_downloads)
+    for index, spec in enumerate(model_downloads, start=1):
         target = root / spec.target_subdir
         target.mkdir(parents=True, exist_ok=True)
         base_progress = int(((index - 1) / total) * 100)
@@ -1446,7 +1712,7 @@ def close_windows_cpu_limit(process: subprocess.Popen, kernel32: Any | None = No
 
 def run_pip_install(root: Path, on_event, package_root: Path | None = None) -> PipInstallResult:
     package_root = package_root or installer_source_root()
-    requirements_path = resource_root(package_root) / "requirements.txt"
+    requirements_paths = pip_requirement_paths(root, package_root)
     package_dir = local_package_dir(root)
     package_dir.mkdir(parents=True, exist_ok=True)
     cmd = [
@@ -1460,9 +1726,9 @@ def run_pip_install(root: Path, on_event, package_root: Path | None = None) -> P
         "--upgrade",
         "--target",
         str(package_dir),
-        "-r",
-        str(requirements_path),
     ]
+    for requirements_path in requirements_paths:
+        cmd.extend(["-r", str(requirements_path)])
     command = subprocess.list2cmdline(cmd)
     on_event(PipProgressEvent("Running command", command, 0, command))
     process = subprocess.Popen(
@@ -1510,7 +1776,8 @@ def write_setup_error_log(
     )
 
 
-def needs_setup(root: Path, required: Mapping[str, str] = REQUIRED_IMPORTS) -> bool:
+def needs_setup(root: Path, required: Mapping[str, str] | None = None) -> bool:
+    required = required or runtime_required_imports()
     ensure_portable_layout(root, installer_source_root())
     models_missing = any(value == BootstrapStatus.MISSING for value in model_folder_status(root).values())
     return bool(missing_runtime_imports(root, required)) or models_missing or not (root / SETUP_MARKER).exists()
@@ -1531,7 +1798,8 @@ def run_bootstrap() -> int:
 
     ensure_portable_layout(root, package_root)
     update_startup_splash(splash, splash_status, "Checking Python packages...")
-    missing_packages = missing_runtime_imports(root)
+    required_imports = runtime_required_imports()
+    missing_packages = missing_runtime_imports(root, required_imports)
     update_startup_splash(splash, splash_status, "Checking default AI models...")
     models_missing = any(value == BootstrapStatus.MISSING for value in model_folder_status(root).values())
     update_startup_splash(splash, splash_status, "Checking first-time setup status...")
@@ -2070,7 +2338,7 @@ def run_bootstrap() -> int:
 
     def refresh_model_size_estimate() -> None:
         with online_huggingface_download_env(root):
-            sizes = estimate_model_download_sizes(DEFAULT_MODEL_DOWNLOADS, root)
+            sizes = estimate_model_download_sizes(active_model_downloads(), root)
         total = total_known_size(sizes)
         if total:
             message = f"Estimated model download: {format_bytes(total)}"
@@ -2389,7 +2657,7 @@ def run_bootstrap() -> int:
         countdown()
 
     def launch_if_ready() -> None:
-        missing = missing_runtime_imports(root)
+        missing = missing_runtime_imports(root, runtime_required_imports())
         if missing:
             messagebox.showerror("Missing packages", "Install packages first:\n" + "\n".join(missing))
             return
@@ -2420,7 +2688,7 @@ def run_bootstrap() -> int:
             if start_index <= 3:
                 if start_index <= 2:
                     important_message(BOOTSTRAP_STEPS[2], "Checking required Python packages...")
-                missing = missing_runtime_imports(root)
+                missing = missing_runtime_imports(root, runtime_required_imports())
                 if missing:
                     package_word = "package" if len(missing) == 1 else "packages"
                     set_step(BOOTSTRAP_STEPS[2], StepState.DONE, f"{len(missing)} {package_word} to install", 100)
@@ -2437,8 +2705,11 @@ def run_bootstrap() -> int:
                             "--upgrade",
                             "--target",
                             str(local_package_dir(root)),
-                            "-r",
-                            str(resource_root(package_root) / "requirements.txt"),
+                        ]
+                        + [
+                            part
+                            for requirements_path in pip_requirement_paths(root, package_root)
+                            for part in ("-r", str(requirements_path))
                         ]
                     )
 

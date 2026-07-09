@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass, field
 from math import pi
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Optional
 
 
@@ -169,6 +170,21 @@ def _force_offline_mode() -> None:
     os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
 
 
+def default_cpu_thread_count(cpu_count: int | None = None) -> int:
+    count = os.cpu_count() if cpu_count is None else cpu_count
+    if not count or count <= 0:
+        return 4
+    return max(1, min(8, int(count)))
+
+
+def effective_cpu_threads(configured_threads: int, device: str) -> int:
+    if device.lower() != "cpu":
+        return 0
+    if configured_threads > 0:
+        return int(configured_threads)
+    return default_cpu_thread_count()
+
+
 @dataclass(frozen=True)
 class EngineConfig:
     whisper_model_dir: str = r"C:\models\faster-whisper"
@@ -177,6 +193,9 @@ class EngineConfig:
     chunk_seconds: float = 5.0
     overlap_seconds: float = 0.5
     compute_type: str = "int8"
+    device: str = "cpu"
+    cpu_threads: int = 0
+    num_workers: int = 1
     input_device: Optional[int] = None
     language: Optional[str] = "en"
     max_queue_chunks: int = 8
@@ -191,12 +210,25 @@ class EngineConfig:
             errors.append("Overlap seconds cannot be negative.")
         if self.overlap_seconds >= self.chunk_seconds:
             errors.append("Overlap seconds must be smaller than chunk seconds.")
+        if not self.device:
+            errors.append("Whisper device is required.")
+        if self.cpu_threads < 0:
+            errors.append("CPU threads cannot be negative.")
+        if self.num_workers <= 0:
+            errors.append("Whisper workers must be positive.")
         whisper_path = self._validate_folder("Whisper model", self.whisper_model_dir, errors)
-        if whisper_path and not (whisper_path / "model.bin").is_file():
-            errors.append(
-                "Whisper model is incomplete: expected model.bin in "
-                f"{whisper_path}. Copy a CTranslate2 faster-whisper model folder into this path."
-            )
+        if whisper_path:
+            if self.device.lower().startswith("openvino"):
+                if not any(whisper_path.glob("*.xml")):
+                    errors.append(
+                        "Whisper OpenVINO model is incomplete: expected OpenVINO .xml model files in "
+                        f"{whisper_path}."
+                    )
+            elif not (whisper_path / "model.bin").is_file():
+                errors.append(
+                    "Whisper model is incomplete: expected model.bin in "
+                    f"{whisper_path}. Copy a CTranslate2 faster-whisper model folder into this path."
+                )
         return errors
 
     @staticmethod
@@ -321,6 +353,35 @@ def transcription_segment_is_usable(segment: Any, text: str) -> bool:
     return True
 
 
+class OpenVinoWhisperModel:
+    def __init__(self, model_dir: str, device: str):
+        import openvino_genai as ov_genai
+
+        self.model_dir = model_dir
+        self.device = device
+        self.pipeline = ov_genai.WhisperPipeline(model_dir, device)
+
+    def transcribe(self, samples: Any, **kwargs: Any) -> tuple[list[Any], Any]:
+        del kwargs
+        text = str(self.pipeline.generate(samples)).strip()
+        if not text:
+            return [], None
+        duration = 0.0
+        try:
+            duration = len(samples) / 16000.0
+        except Exception:
+            duration = 0.0
+        segment = SimpleNamespace(
+            text=text,
+            start=0.0,
+            end=duration,
+            no_speech_prob=None,
+            avg_logprob=None,
+            compression_ratio=None,
+        )
+        return [segment], None
+
+
 class AtomicTranscriptWriter:
     def __init__(self, path: str):
         self.path = Path(path)
@@ -328,21 +389,49 @@ class AtomicTranscriptWriter:
 
     def refresh(self, rows: list[TranscriptRow]) -> None:
         with self._lock:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            fd, tmp_name = tempfile.mkstemp(
-                prefix=f".{self.path.name}.",
-                suffix=".tmp",
-                dir=str(self.path.parent),
-                text=True,
-            )
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-                    for row in sorted(rows, key=lambda item: (item.start, item.id)):
-                        handle.write(f"[{format_timestamp(row.start)}] {row.text}\n")
-                os.replace(tmp_name, self.path)
-            finally:
-                if os.path.exists(tmp_name):
-                    os.unlink(tmp_name)
+            self._write_atomic(self.path, rows)
+
+    def refresh_with_recovery(self, rows: list[TranscriptRow]) -> Path:
+        try:
+            self.refresh(rows)
+            return self.path
+        except Exception:
+            return self.write_recovery(rows)
+
+    def write_recovery(self, rows: list[TranscriptRow]) -> Path:
+        with self._lock:
+            suffix = self.path.suffix or ".txt"
+            timestamp = time.strftime("%Y%m%d-%H%M%S")
+            recovery = self.path.with_name(f"{self.path.stem}.{timestamp}.recovery{suffix}")
+            index = 1
+            while recovery.exists():
+                recovery = self.path.with_name(
+                    f"{self.path.stem}.{timestamp}-{index}.recovery{suffix}"
+                )
+                index += 1
+            self._write_atomic(recovery, rows)
+            return recovery
+
+    @staticmethod
+    def _write_rows(handle: Any, rows: list[TranscriptRow]) -> None:
+        for row in sorted(rows, key=lambda item: (item.start, item.id)):
+            handle.write(f"[{format_timestamp(row.start)}] {row.text}\n")
+
+    def _write_atomic(self, target: Path, rows: list[TranscriptRow]) -> None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            dir=str(target.parent),
+            text=True,
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+                self._write_rows(handle, rows)
+            os.replace(tmp_name, target)
+        finally:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
 
 
 def format_timestamp(seconds: float) -> str:
@@ -366,9 +455,11 @@ class MeetingTranscriberEngine:
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()
         self._threads: list[threading.Thread] = []
-        self._raw_chunk_queue: queue.Queue[AudioChunk | None] = queue.Queue(config.max_queue_chunks)
-        self._transcription_queue: queue.Queue[AudioChunk | None] = queue.Queue(config.max_queue_chunks)
+        self._raw_chunk_queue: queue.Queue[AudioChunk | None] = queue.Queue()
+        self._transcription_queue: queue.Queue[AudioChunk | None] = queue.Queue()
         self._pending_transcription_chunks: set[int] = set()
+        self._active_transcription_chunk: AudioChunk | None = None
+        self._transcript_save_error_reported = False
         self._audio_block_count = 0
         self._audio_peak_rms = 0.0
         self._audio_chunk_count = 0
@@ -403,8 +494,8 @@ class MeetingTranscriberEngine:
         self._emit("status", {"message": "Stopping"})
         self._stop_event.set()
         for thread in self._threads:
-            thread.join(timeout=30)
-        self.writer.refresh(self.store.snapshot())
+            thread.join()
+        self._save_transcript_snapshot(final=True)
         with self._state_lock:
             diagnostic = microphone_health_message(
                 self._audio_block_count,
@@ -537,31 +628,13 @@ class MeetingTranscriberEngine:
         while True:
             chunk = self._raw_chunk_queue.get()
             if chunk is None:
+                self._emit("status", {"message": "Finishing transcription"})
                 self._transcription_queue.put(None)
                 return
-            dropped = self._drop_stale_transcription_chunks(max_queued=1)
             with self._state_lock:
                 self._pending_transcription_chunks.add(chunk.index)
             self._transcription_queue.put(chunk)
             self._emit_transcription_lag(active=True)
-            if dropped:
-                noun = "chunk" if dropped == 1 else "chunks"
-                self._emit("log", {"message": f"Catching up: skipped {dropped} stale audio {noun}"})
-
-    def _drop_stale_transcription_chunks(self, max_queued: int = 2) -> int:
-        dropped = 0
-        while self._transcription_queue.qsize() > max_queued:
-            try:
-                stale = self._transcription_queue.get_nowait()
-            except queue.Empty:
-                break
-            if stale is None:
-                self._transcription_queue.put(None)
-                break
-            dropped += 1
-            with self._state_lock:
-                self._pending_transcription_chunks.discard(stale.index)
-        return dropped
 
     def _queued_audio_seconds(self) -> float:
         total = 0.0
@@ -573,10 +646,65 @@ class MeetingTranscriberEngine:
         return total
 
     def _emit_transcription_lag(self, active: bool, current_chunk: AudioChunk | None = None) -> None:
-        behind_seconds = self._queued_audio_seconds()
+        chunks: list[AudioChunk] = []
+        with self._transcription_queue.mutex:
+            chunks.extend(
+                item for item in self._transcription_queue.queue if isinstance(item, AudioChunk)
+            )
+        with self._state_lock:
+            active_chunk = self._active_transcription_chunk
+        if active_chunk is not None:
+            chunks.append(active_chunk)
         if current_chunk is not None:
-            behind_seconds += audio_chunk_duration_seconds(current_chunk)
+            chunks.append(current_chunk)
+        behind_seconds = 0.0
+        if chunks:
+            oldest = min(chunk.captured_at for chunk in chunks)
+            behind_seconds = max(0.0, time.monotonic() - oldest)
         self._emit("lag", {"behind_seconds": behind_seconds, "active": active and behind_seconds > 0})
+
+    def _save_transcript_snapshot(self, final: bool = False) -> Path | None:
+        rows = self.store.snapshot()
+        try:
+            self.writer.refresh(rows)
+            return self.writer.path
+        except Exception as exc:
+            if final:
+                try:
+                    recovery_path = self.writer.write_recovery(rows)
+                except Exception as recovery_exc:
+                    self._emit(
+                        "error",
+                        {
+                            "message": (
+                                f"Transcript save failed: {exc}. "
+                                f"Recovery transcript save also failed: {recovery_exc}"
+                            )
+                        },
+                    )
+                    return None
+                self._emit(
+                    "error",
+                    {
+                        "message": (
+                            f"Transcript save failed: {exc}. "
+                            f"Recovery transcript saved to {recovery_path}"
+                        )
+                    },
+                )
+                return recovery_path
+            if not self._transcript_save_error_reported:
+                self._transcript_save_error_reported = True
+                self._emit(
+                    "error",
+                    {
+                        "message": (
+                            f"Transcript save failed: {exc}. "
+                            "Continuing transcription in memory; close apps syncing or opening the transcript file."
+                        )
+                    },
+                )
+            return None
 
     def _transcription_loop(self) -> None:
         try:
@@ -593,6 +721,8 @@ class MeetingTranscriberEngine:
                 self._emit("lag", {"behind_seconds": 0.0, "active": False})
                 return
             try:
+                with self._state_lock:
+                    self._active_transcription_chunk = chunk
                 self._emit_transcription_lag(active=True, current_chunk=chunk)
                 self._emit("log", {"message": f"Transcribing chunk {chunk.index}..."})
                 started_at = time.monotonic()
@@ -618,7 +748,7 @@ class MeetingTranscriberEngine:
                         continue
                     row = self.store.add_transcript(chunk.index, start, end, text)
                     segment_count += 1
-                    self.writer.refresh(self.store.snapshot())
+                    self._save_transcript_snapshot(final=False)
                     print(f"[{format_timestamp(row.start)}] {row.text}", flush=True)
                     self._emit("transcript", {"row": row})
                 if segment_count == 0:
@@ -638,28 +768,38 @@ class MeetingTranscriberEngine:
                 self._emit("error", {"message": f"Transcription failed for chunk {chunk.index}: {exc}"})
             finally:
                 with self._state_lock:
+                    self._active_transcription_chunk = None
                     self._pending_transcription_chunks.discard(chunk.index)
                 self._emit_transcription_lag(active=True)
 
     def _load_whisper_model(self) -> Any:
         _force_offline_mode()
-        from faster_whisper import WhisperModel
 
         if not Path(self.config.whisper_model_dir).exists():
             raise FileNotFoundError(self.config.whisper_model_dir)
+        device = self.config.device.strip()
+        if device.lower().startswith("openvino"):
+            _, _, openvino_device = device.partition(":")
+            return OpenVinoWhisperModel(self.config.whisper_model_dir, openvino_device or "GPU")
+
+        from faster_whisper import WhisperModel
+
+        model_kwargs: dict[str, Any] = {
+            "device": device,
+            "compute_type": self.config.compute_type,
+            "local_files_only": True,
+        }
+        cpu_threads = effective_cpu_threads(self.config.cpu_threads, device)
+        if cpu_threads > 0:
+            model_kwargs["cpu_threads"] = cpu_threads
+        if self.config.num_workers > 0:
+            model_kwargs["num_workers"] = self.config.num_workers
         try:
-            return WhisperModel(
-                self.config.whisper_model_dir,
-                device="cpu",
-                compute_type=self.config.compute_type,
-                local_files_only=True,
-            )
+            return WhisperModel(self.config.whisper_model_dir, **model_kwargs)
         except TypeError:
-            return WhisperModel(
-                self.config.whisper_model_dir,
-                device="cpu",
-                compute_type=self.config.compute_type,
-            )
+            fallback_kwargs = dict(model_kwargs)
+            fallback_kwargs.pop("local_files_only", None)
+            return WhisperModel(self.config.whisper_model_dir, **fallback_kwargs)
 
     def _emit(self, event_type: str, payload: dict[str, Any]) -> None:
         for handler in list(self._event_handlers):

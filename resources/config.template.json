@@ -5,5 +5,8 @@
   "chunk_seconds": 5.0,
   "overlap_seconds": 0.5,
   "compute_type": "int8",
+  "device": "cpu",
+  "cpu_threads": 0,
+  "num_workers": 1,
   "language": "en"
 }

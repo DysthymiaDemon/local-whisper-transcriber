@@ -11,7 +11,7 @@ import zlib
 from pathlib import Path
 
 
-APP_FOLDER_NAME = "OfflineMeetingTranscriber"
+APP_FOLDER_NAME = "OfflineMeetingTranscriberGpuTrial"
 PAYLOAD_SHA256 = "3915ef54b070c7dfc0c8cec123288b1ce2875dd964dcd71bce302dbfb9235d7d"
 PAYLOAD_B64 = """
 eNrMvVlz4tqyLvpf1us+cbcEpqq03wxG9NgIJAQvJwAZkBHNnIAxnLj//Wbm6NVgqua6++xYsWKWkTT6kX1++X/+tYyT9+O/
@@ -919,6 +919,8 @@ def main(argv: list[str] | None = None) -> int:
     os.environ["LOCAL_WHISPER_APP_ROOT"] = str(install_root)
     os.environ["LOCAL_WHISPER_SOURCE_ROOT"] = str(install_root)
     os.environ["LOCAL_WHISPER_LOG_ROOT"] = str(launcher_path.parent)
+    os.environ["LOCAL_WHISPER_GPU_TRIAL"] = "1"
+    os.environ["LOCAL_WHISPER_RUNTIME_APP_FOLDER_NAME"] = "OfflineMeetingTranscriberGpuTrialRuntime"
 
 
     app_dir = str(install_root / "app")

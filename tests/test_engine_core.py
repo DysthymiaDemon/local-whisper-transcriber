@@ -3,6 +3,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
@@ -17,6 +18,8 @@ from transcriber_engine import (
     TranscriptStore,
     audio_chunk_has_activity,
     audio_chunk_duration_seconds,
+    default_cpu_thread_count,
+    effective_cpu_threads,
     microphone_health_message,
     preferred_input_sample_rate,
     resample_audio,
@@ -60,6 +63,23 @@ class AtomicTranscriptWriterTests(unittest.TestCase):
 
         self.assertIn("[00:00:00] Hello team.", content)
         self.assertNotIn("Speaker", content)
+
+    def test_recovery_write_preserves_transcript_when_primary_path_is_locked(self):
+        store = TranscriptStore()
+        store.add_transcript(chunk_index=1, start=0.0, end=2.0, text="Hello team.")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "meeting_transcript.txt")
+            writer = AtomicTranscriptWriter(path)
+
+            with patch.object(writer, "refresh", side_effect=PermissionError("locked")):
+                recovery_path = writer.refresh_with_recovery(store.rows)
+
+            with open(recovery_path, "r", encoding="utf-8") as handle:
+                content = handle.read()
+
+        self.assertTrue(str(recovery_path).endswith(".recovery.txt"))
+        self.assertIn("[00:00:00] Hello team.", content)
 
 
 class InputBlockBufferTests(unittest.TestCase):
@@ -280,6 +300,102 @@ class EngineConfigTests(unittest.TestCase):
         self.assertEqual(config.language, "en")
         self.assertEqual(config.chunk_seconds, 5.0)
         self.assertEqual(config.overlap_seconds, 0.5)
+        self.assertEqual(config.device, "cpu")
+        self.assertEqual(config.compute_type, "int8")
+
+    def test_default_cpu_threads_stays_bounded_for_laptops(self):
+        self.assertEqual(default_cpu_thread_count(2), 2)
+        self.assertEqual(default_cpu_thread_count(16), 8)
+        self.assertEqual(default_cpu_thread_count(None), min(8, os.cpu_count() or 4))
+
+    def test_effective_cpu_threads_preserves_explicit_user_value(self):
+        self.assertEqual(effective_cpu_threads(6, "cpu"), 6)
+        self.assertEqual(effective_cpu_threads(0, "cuda"), 0)
+
+    def test_whisper_model_load_uses_cpu_thread_setting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            whisper = os.path.join(tmp, "whisper")
+            os.mkdir(whisper)
+            open(os.path.join(whisper, "model.bin"), "wb").close()
+            calls = []
+
+            class FakeWhisperModel:
+                def __init__(self, *args, **kwargs):
+                    calls.append((args, kwargs))
+
+            fake_module = type(sys)("faster_whisper")
+            fake_module.WhisperModel = FakeWhisperModel
+            config = EngineConfig(
+                whisper_model_dir=whisper,
+                output_file=os.path.join(tmp, "out.txt"),
+                cpu_threads=6,
+            )
+
+            with patch.dict(sys.modules, {"faster_whisper": fake_module}):
+                MeetingTranscriberEngine(config)._load_whisper_model()
+
+        self.assertEqual(calls[0][1]["device"], "cpu")
+        self.assertEqual(calls[0][1]["cpu_threads"], 6)
+        self.assertEqual(calls[0][1]["compute_type"], "int8")
+
+    def test_whisper_model_load_allows_cuda_trial_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            whisper = os.path.join(tmp, "whisper")
+            os.mkdir(whisper)
+            open(os.path.join(whisper, "model.bin"), "wb").close()
+            calls = []
+
+            class FakeWhisperModel:
+                def __init__(self, *args, **kwargs):
+                    calls.append((args, kwargs))
+
+            fake_module = type(sys)("faster_whisper")
+            fake_module.WhisperModel = FakeWhisperModel
+            config = EngineConfig(
+                whisper_model_dir=whisper,
+                output_file=os.path.join(tmp, "out.txt"),
+                device="cuda",
+                compute_type="float16",
+            )
+
+            with patch.dict(sys.modules, {"faster_whisper": fake_module}):
+                MeetingTranscriberEngine(config)._load_whisper_model()
+
+        self.assertEqual(calls[0][1]["device"], "cuda")
+        self.assertEqual(calls[0][1]["compute_type"], "float16")
+        self.assertNotIn("cpu_threads", calls[0][1])
+
+    def test_openvino_whisper_model_loads_pipeline_and_returns_segment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            test_case = self
+            model_dir = os.path.join(tmp, "openvino")
+            os.mkdir(model_dir)
+            open(os.path.join(model_dir, "openvino_encoder_model.xml"), "w", encoding="utf-8").close()
+            calls = []
+
+            class FakeWhisperPipeline:
+                def __init__(self, path, device):
+                    calls.append((path, device))
+
+                def generate(self, samples):
+                    test_case.assertEqual(samples, [0.1, 0.2])
+                    return " hello "
+
+            fake_module = type(sys)("openvino_genai")
+            fake_module.WhisperPipeline = FakeWhisperPipeline
+            config = EngineConfig(
+                whisper_model_dir=model_dir,
+                output_file=os.path.join(tmp, "out.txt"),
+                device="openvino:GPU",
+                compute_type="fp16",
+            )
+
+            with patch.dict(sys.modules, {"openvino_genai": fake_module}):
+                model = MeetingTranscriberEngine(config)._load_whisper_model()
+                segments, _ = model.transcribe([0.1, 0.2])
+
+        self.assertEqual(calls, [(model_dir, "GPU")])
+        self.assertEqual(segments[0].text, "hello")
 
 
 class TranscriptionBacklogTests(unittest.TestCase):
@@ -298,21 +414,81 @@ class TranscriptionBacklogTests(unittest.TestCase):
 
         self.assertEqual(seconds, 1.0)
 
-    def test_stale_chunks_are_dropped_and_newest_chunks_retained(self):
+    def test_fanout_preserves_all_chunks_when_transcription_backlog_exists(self):
         with tempfile.TemporaryDirectory() as tmp:
             engine = MeetingTranscriberEngine(EngineConfig(output_file=os.path.join(tmp, "out.txt")))
             for index in range(4):
-                engine._transcription_queue.put(AudioChunk(index, float(index), [], 16000))
-                engine._pending_transcription_chunks.add(index)
+                engine._raw_chunk_queue.put(AudioChunk(index, float(index), [0.0] * 16000, 16000))
+            engine._raw_chunk_queue.put(None)
+            events = []
+            engine.on_event(lambda event_type, payload: events.append((event_type, payload)))
 
-            dropped = engine._drop_stale_transcription_chunks(max_queued=2)
+            engine._fanout_loop()
             remaining = []
             while not engine._transcription_queue.empty():
-                remaining.append(engine._transcription_queue.get_nowait().index)
+                item = engine._transcription_queue.get_nowait()
+                remaining.append(None if item is None else item.index)
 
-        self.assertEqual(dropped, 2)
-        self.assertEqual(remaining, [2, 3])
-        self.assertEqual(engine._pending_transcription_chunks, {2, 3})
+        self.assertEqual(remaining, [0, 1, 2, 3, None])
+        self.assertEqual(engine._pending_transcription_chunks, {0, 1, 2, 3})
+        self.assertTrue(any(payload.get("message") == "Finishing transcription" for event_type, payload in events if event_type == "status"))
+        self.assertFalse(any("Catching up: skipped" in payload.get("message", "") for event_type, payload in events if event_type == "log"))
+
+    def test_lag_uses_oldest_pending_capture_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = MeetingTranscriberEngine(EngineConfig(output_file=os.path.join(tmp, "out.txt")))
+            events = []
+            engine.on_event(lambda event_type, payload: events.append((event_type, payload)))
+            engine._transcription_queue.put(AudioChunk(1, 0.0, [0.0] * 16000, 16000, captured_at=70.0))
+            current = AudioChunk(2, 1.0, [0.0] * 16000, 16000, captured_at=90.0)
+
+            with patch("transcriber_engine.time.monotonic", return_value=100.0):
+                engine._emit_transcription_lag(active=True, current_chunk=current)
+
+        lag_events = [payload for event_type, payload in events if event_type == "lag"]
+        self.assertEqual(lag_events[-1]["behind_seconds"], 30.0)
+        self.assertTrue(lag_events[-1]["active"])
+
+    def test_transcript_save_failure_does_not_abort_future_saves(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = MeetingTranscriberEngine(EngineConfig(output_file=os.path.join(tmp, "out.txt")))
+            events = []
+            engine.on_event(lambda event_type, payload: events.append((event_type, payload)))
+            engine.store.add_transcript(1, 0.0, 1.0, "First sentence.")
+            calls = {"count": 0}
+
+            def flaky_refresh(rows):
+                calls["count"] += 1
+                if calls["count"] == 1:
+                    raise PermissionError("locked")
+
+            engine.writer.refresh = flaky_refresh
+
+            engine._save_transcript_snapshot(final=False)
+            engine.store.add_transcript(2, 1.0, 2.0, "Second sentence.")
+            engine._save_transcript_snapshot(final=False)
+
+        messages = [payload.get("message", "") for event_type, payload in events if event_type == "error"]
+        self.assertEqual(calls["count"], 2)
+        self.assertEqual(len([message for message in messages if "Transcript save failed" in message]), 1)
+
+    def test_final_save_failure_writes_recovery_transcript(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = MeetingTranscriberEngine(EngineConfig(output_file=os.path.join(tmp, "meeting_transcript.txt")))
+            events = []
+            engine.on_event(lambda event_type, payload: events.append((event_type, payload)))
+            engine.store.add_transcript(1, 0.0, 1.0, "Recovered sentence.")
+
+            with patch.object(engine.writer, "refresh", side_effect=PermissionError("locked")):
+                recovery_path = engine._save_transcript_snapshot(final=True)
+
+            with open(recovery_path, "r", encoding="utf-8") as handle:
+                content = handle.read()
+
+        messages = [payload.get("message", "") for event_type, payload in events if event_type == "error"]
+        self.assertTrue(str(recovery_path).endswith(".recovery.txt"))
+        self.assertIn("[00:00:00] Recovered sentence.", content)
+        self.assertTrue(any(str(recovery_path) in message for message in messages))
 
 
 class MicMeterGeometryTests(unittest.TestCase):
