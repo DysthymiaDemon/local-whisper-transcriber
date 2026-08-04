@@ -1,0 +1,30 @@
+========================================================================
+timestamp: 2026-08-04T15:35:06
+app_root: C:\Users\p1360560\OneDrive - Singtel\Documents\GitHub\local-whisper-transcriber\OfflineMeetingTranscriber
+message: Install Offline Meeting Transcriber?
+Local Windows App
+Publisher: Ameen Khan
+Version: local
+
+Disk space: ~1.8 GB for packages and models.
+
+Models to install locally:
+- Systran/faster-whisper-small.en -> models\faster-whisper
+
+Python packages to install locally:
+- faster-whisper==1.2.1
+- sounddevice==0.5.5
+- PySide6==6.11.1
+- numpy==2.4.2
+- huggingface_hub>=0.26.0
+- truststore>=0.10.0
+
+Install location:
+- App files, config, models, transcripts: folder beside this launcher
+- Python dependencies: app runtime folder
+------------------------------------------------------------------------
+timestamp: 2026-08-04T15:35:06
+context: Setup
+message: Installer opened
+details:
+  install_log: C:\Users\p1360560\OneDrive - Singtel\Documents\GitHub\local-whisper-transcriber\install_log.txt

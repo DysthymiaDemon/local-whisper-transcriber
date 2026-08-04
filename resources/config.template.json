@@ -8,5 +8,9 @@
   "device": "cpu",
   "cpu_threads": 0,
   "num_workers": 1,
+  "capture_mode": "mic",
+  "system_device_index": null,
+  "input_device": null,
+  "allow_mixed_fallback": false,
   "language": "en"
 }

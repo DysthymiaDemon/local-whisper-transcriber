@@ -4,7 +4,7 @@ import json
 import os
 import sys
 from datetime import datetime
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -111,6 +111,14 @@ def load_portable_config(root: Path | None = None) -> EngineConfig:
         if isinstance(value, str) and value and not Path(value).is_absolute():
             overrides[key] = str(app_root / value)
     return replace(config, **overrides)
+
+
+def save_portable_config(config: EngineConfig, root: Path | None = None) -> Path:
+    app_root = (root or application_root()).resolve()
+    config_path = app_root / CONFIG_FILE_NAME
+    raw = asdict(config)
+    config_path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+    return config_path
 
 
 def append_error_log(

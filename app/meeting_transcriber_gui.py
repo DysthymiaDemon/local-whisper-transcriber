@@ -4,12 +4,21 @@ import sys
 import threading
 from typing import Any
 
-from app_config import append_error_log, application_root, load_portable_config
+from app_config import (
+    append_error_log,
+    application_root,
+    load_portable_config,
+    save_portable_config,
+)
 from transcriber_engine import (
     EngineConfig,
     MeetingTranscriberEngine,
     TranscriptRow,
+    CAPTURE_MODE_LOOPBACK,
+    CAPTURE_MODE_MIC,
+    CAPTURE_MODE_MIXED,
     list_input_devices,
+    list_output_devices,
     rms_to_meter_percent,
 )
 from ui_helpers import meter_bar_geometry
@@ -21,6 +30,9 @@ OUTPUT_FILE = PORTABLE_DEFAULTS.output_file
 SAMPLE_RATE = PORTABLE_DEFAULTS.sample_rate
 CHUNK_SECONDS = PORTABLE_DEFAULTS.chunk_seconds
 OVERLAP_SECONDS = PORTABLE_DEFAULTS.overlap_seconds
+CAPTURE_MODE = PORTABLE_DEFAULTS.capture_mode
+SYSTEM_DEVICE = PORTABLE_DEFAULTS.system_device_index
+ALLOW_MIXED_FALLBACK = PORTABLE_DEFAULTS.allow_mixed_fallback
 COMPUTE_TYPE = PORTABLE_DEFAULTS.compute_type
 DEVICE = PORTABLE_DEFAULTS.device
 CPU_THREADS = PORTABLE_DEFAULTS.cpu_threads
@@ -43,6 +55,7 @@ try:
         QMainWindow,
         QMessageBox,
         QPushButton,
+        QCheckBox,
         QSizePolicy,
         QSplitter,
         QTextEdit,
@@ -119,6 +132,7 @@ class MainWindow(QMainWindow):
         self._stopping = False
         self.bridge = EngineSignalBridge()
         self.bridge.event.connect(self._handle_engine_event)
+        self._output_devices_by_index: dict[int, dict[str, Any]] = {}
         self._behind_seconds = 0.0
         self._spinner_index = 0
         self._spinner_frames = ["|", "/", "-", "\\"]
@@ -198,12 +212,30 @@ class MainWindow(QMainWindow):
         settings = QGroupBox("Settings")
         settings_layout = QFormLayout(settings)
         self.device_combo = QComboBox()
+        self.system_device_combo = QComboBox()
+        self.capture_mode_combo = QComboBox()
+        self.capture_mode_combo.addItem("Microphone", CAPTURE_MODE_MIC)
+        self.capture_mode_combo.addItem("System audio (loopback)", CAPTURE_MODE_LOOPBACK)
+        self.capture_mode_combo.addItem("Mixed (mic + system)", CAPTURE_MODE_MIXED)
+        self.capture_mode_combo.currentIndexChanged.connect(self._update_capture_controls)
+        self.allow_fallback_checkbox = QCheckBox("Allow mixed fallback to single source")
         self.whisper_path = QLineEdit(WHISPER_MODEL_DIR)
         self.output_path = QLineEdit(OUTPUT_FILE)
-        for widget in (self.device_combo, self.whisper_path, self.output_path):
+        for widget in (
+            self.device_combo,
+            self.system_device_combo,
+            self.capture_mode_combo,
+            self.whisper_path,
+            self.output_path,
+            self.allow_fallback_checkbox,
+        ):
             self._allow_field_to_shrink(widget)
 
+        self.capture_mode_combo.setCurrentText("Microphone")
+        settings_layout.addRow("Capture mode", self.capture_mode_combo)
         settings_layout.addRow("Microphone", self.device_combo)
+        settings_layout.addRow("System output", self.system_device_combo)
+        settings_layout.addRow("Mixed fallback", self.allow_fallback_checkbox)
         settings_layout.addRow("Whisper", self._path_row(self.whisper_path, folder=True))
         settings_layout.addRow("Output", self._path_row(self.output_path, folder=False))
         right_layout.addWidget(settings)
@@ -253,10 +285,16 @@ class MainWindow(QMainWindow):
 
     def _load_devices(self) -> None:
         self.device_combo.clear()
+        self._output_devices_by_index = {}
         devices = list_input_devices()
         if not devices:
             self.device_combo.addItem("Default input", None)
+            self.system_device_combo.clear()
+            self.system_device_combo.addItem("Default output", None)
+            self._set_capture_default_values()
+            self._update_capture_controls()
             return
+
         self.device_combo.addItem("Default input", None)
         for device in devices:
             rate = device.get("default_samplerate")
@@ -264,8 +302,91 @@ class MainWindow(QMainWindow):
             suffix = f" - {hostapi}" if hostapi else ""
             rate_text = f" ({int(rate)} Hz)" if rate else ""
             self.device_combo.addItem(f"{device['index']}: {device['name']}{suffix}{rate_text}", device["index"])
+        for item in (None, *[device["index"] for device in devices]):
+            if item is not None and not any(self.device_combo.itemData(i) == item for i in range(self.device_combo.count())):
+                pass
+
+        self.system_device_combo.clear()
+        output_devices = list_output_devices()
+        if not output_devices:
+            self.system_device_combo.addItem("Default output", None)
+            self._update_capture_controls()
+            self._set_capture_default_values()
+            return
+        self.system_device_combo.addItem("Default output", None)
+        for device in output_devices:
+            rate = device.get("default_samplerate")
+            hostapi = device.get("hostapi")
+            suffix = f" - {hostapi}" if hostapi else ""
+            rate_text = f" ({int(rate)} Hz)" if rate else ""
+            index = int(device["index"])
+            self._output_devices_by_index[index] = device
+            wasapi_suffix = " (WASAPI)" if device.get("wasapi") else ""
+            self.system_device_combo.addItem(
+                f"{index}: {device['name']}{suffix}{rate_text}{wasapi_suffix}",
+                index,
+            )
+        self._set_capture_default_values()
+        self._update_capture_controls()
+
+    def _set_capture_default_values(self) -> None:
+        self._set_combo_current_data(self.device_combo, DEVICE)
+        self._set_combo_current_data(self.system_device_combo, SYSTEM_DEVICE)
+        self._set_combo_current_data(self.capture_mode_combo, CAPTURE_MODE)
+        self.allow_fallback_checkbox.setChecked(bool(ALLOW_MIXED_FALLBACK))
+
+    @staticmethod
+    def _set_combo_current_data(combo: QComboBox, value: object) -> None:
+        for index in range(combo.count()):
+            if combo.itemData(index) == value:
+                combo.setCurrentIndex(index)
+                return
+        combo.setCurrentIndex(0)
+
+    def _update_capture_controls(self) -> None:
+        mode = str(self.capture_mode_combo.currentData() or CAPTURE_MODE_MIC).strip().lower()
+        loopback_supported = self._is_loopback_supported()
+        loopback_mode_enabled = loopback_supported
+        self.system_device_combo.setEnabled(mode != CAPTURE_MODE_MIC)
+        self.allow_fallback_checkbox.setEnabled(mode == CAPTURE_MODE_MIXED)
+
+        if not loopback_mode_enabled and mode != CAPTURE_MODE_MIC:
+            self.capture_mode_combo.blockSignals(True)
+            self._set_combo_current_data(self.capture_mode_combo, CAPTURE_MODE_MIC)
+            self.capture_mode_combo.blockSignals(False)
+            self.system_device_combo.setEnabled(False)
+            self.allow_fallback_checkbox.setEnabled(False)
+            self._append_log("Loopback mode is unavailable because no WASAPI output device is detected.")
+
+        selected_system_is_wasapi = self._is_selected_system_device_wasapi()
+        if mode in (CAPTURE_MODE_LOOPBACK, CAPTURE_MODE_MIXED) and not selected_system_is_wasapi:
+            self.system_device_combo.setToolTip("Loopback and mixed modes require a WASAPI output device.")
+        else:
+            self.system_device_combo.setToolTip("")
+
+        if mode == CAPTURE_MODE_MIXED and self.allow_fallback_checkbox.isChecked():
+            if not self.system_device_combo.itemData(self.system_device_combo.currentIndex()):
+                self.allow_fallback_checkbox.setEnabled(False)
+            else:
+                self.allow_fallback_checkbox.setEnabled(True)
+        else:
+            self.allow_fallback_checkbox.setEnabled(mode == CAPTURE_MODE_MIXED)
+
+    def _selected_system_device(self) -> int | None:
+        selected = self.system_device_combo.currentData()
+        return int(selected) if isinstance(selected, int) else None
+
+    def _is_loopback_supported(self) -> bool:
+        return any(bool(device.get("wasapi")) for device in self._output_devices_by_index.values())
+
+    def _is_selected_system_device_wasapi(self) -> bool:
+        device_index = self._selected_system_device()
+        if device_index is None:
+            return False
+        return bool(self._output_devices_by_index.get(device_index, {}).get("wasapi", False))
 
     def _read_config(self) -> EngineConfig:
+        selected_mode = str(self.capture_mode_combo.currentData() or CAPTURE_MODE_MIC)
         return EngineConfig(
             whisper_model_dir=self.whisper_path.text().strip(),
             output_file=self.output_path.text().strip(),
@@ -277,6 +398,9 @@ class MainWindow(QMainWindow):
             cpu_threads=int(CPU_THREADS),
             num_workers=int(NUM_WORKERS),
             input_device=self.device_combo.currentData(),
+            capture_mode=selected_mode,
+            system_device_index=self.system_device_combo.currentData(),
+            allow_mixed_fallback=self.allow_fallback_checkbox.isChecked(),
             language=LANGUAGE,
         )
 
@@ -284,6 +408,7 @@ class MainWindow(QMainWindow):
         if self._stopping:
             return
         config = self._read_config()
+        save_portable_config(config, root=application_root())
         errors = config.validate()
         if errors:
             message = "\n".join(errors)
@@ -328,7 +453,14 @@ class MainWindow(QMainWindow):
         self._update_transcription_state(running=True)
         if not self.spinner_timer.isActive():
             self.spinner_timer.start()
-        for widget in (self.device_combo, self.whisper_path, self.output_path):
+        for widget in (
+            self.device_combo,
+            self.system_device_combo,
+            self.capture_mode_combo,
+            self.allow_fallback_checkbox,
+            self.whisper_path,
+            self.output_path,
+        ):
             widget.setEnabled(False)
         engine = self.engine
 
@@ -435,7 +567,14 @@ class MainWindow(QMainWindow):
             self._update_transcription_state(running=False)
         if not running:
             self.level_meter.set_level(0)
-        for widget in (self.device_combo, self.whisper_path, self.output_path):
+        for widget in (
+            self.device_combo,
+            self.system_device_combo,
+            self.capture_mode_combo,
+            self.allow_fallback_checkbox,
+            self.whisper_path,
+            self.output_path,
+        ):
             widget.setEnabled(not running)
 
     def _finish_engine_stop(self) -> None:

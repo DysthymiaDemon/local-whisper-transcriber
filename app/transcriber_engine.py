@@ -16,6 +16,11 @@ from typing import Any, Callable, Optional
 
 MIC_SILENCE_RMS_THRESHOLD = 0.0001
 DEFAULT_NOISE_FLOOR = 0.0008
+CAPTURE_MODE_MIC = "mic"
+CAPTURE_MODE_LOOPBACK = "loopback"
+CAPTURE_MODE_MIXED = "mixed"
+CAPTURE_SOURCES_MIC = "microphone"
+CAPTURE_SOURCES_LOOPBACK = "loopback"
 
 
 def rms_to_meter_percent(rms: float) -> int:
@@ -52,6 +57,54 @@ def preferred_input_sample_rate(sd: Any, device: Optional[int], target_sample_ra
         return default_rate if default_rate > 0 else int(target_sample_rate)
     except Exception:
         return int(target_sample_rate)
+
+
+def preferred_output_sample_rate(sd: Any, device: Optional[int], target_sample_rate: int) -> int:
+    try:
+        return int(sd.query_devices(device, "output").get("default_samplerate", target_sample_rate))
+    except Exception:
+        return int(target_sample_rate)
+
+
+def is_wasapi_hostapi(sd: Any, device: Optional[int]) -> bool:
+    try:
+        device_info = sd.query_devices(device)
+        hostapis = sd.query_hostapis()
+        hostapi_index = int(device_info.get("hostapi", -1))
+        if 0 <= hostapi_index < len(hostapis):
+            return "wasapi" in str(hostapis[hostapi_index].get("name", "")).lower()
+    except Exception:
+        return False
+    return False
+
+
+def has_wasapi_output_devices(sd: Any) -> bool:
+    try:
+        return any(is_wasapi_hostapi(sd, index) and int(device.get("max_output_channels", 0)) > 0 for index, device in enumerate(sd.query_devices()))
+    except Exception:
+        return False
+
+
+def _resolve_capture_source_label(source: str, source_index: Optional[int], sd: Any) -> str:
+    if source_index is None:
+        return source
+    try:
+        device = sd.query_devices(source_index)
+        return f"{source} ({device.get('name', source_index)})"
+    except Exception:
+        return f"{source} ({source_index})"
+
+def has_wasapi_output_device(device_index: Optional[int]) -> bool:
+    if device_index is None or os.name != "nt":
+        return False
+    try:
+        import sounddevice as sd
+    except Exception:
+        return False
+    try:
+        return is_wasapi_hostapi(sd, device_index)
+    except Exception:
+        return False
 
 
 def resample_audio(samples: Any, source_rate: int, target_rate: int) -> Any:
@@ -197,6 +250,9 @@ class EngineConfig:
     cpu_threads: int = 0
     num_workers: int = 1
     input_device: Optional[int] = None
+    capture_mode: str = CAPTURE_MODE_MIC
+    system_device_index: Optional[int] = None
+    allow_mixed_fallback: bool = False
     language: Optional[str] = "en"
     max_queue_chunks: int = 8
 
@@ -216,6 +272,23 @@ class EngineConfig:
             errors.append("CPU threads cannot be negative.")
         if self.num_workers <= 0:
             errors.append("Whisper workers must be positive.")
+        capture_mode = str(self.capture_mode or "").strip().lower()
+        if capture_mode not in {CAPTURE_MODE_MIC, CAPTURE_MODE_LOOPBACK, CAPTURE_MODE_MIXED}:
+            errors.append(
+                "Capture mode must be one of mic, loopback, or mixed."
+            )
+        if capture_mode in {CAPTURE_MODE_LOOPBACK, CAPTURE_MODE_MIXED}:
+            if not isinstance(self.system_device_index, int):
+                errors.append("System loopback device is required for loopback or mixed capture.")
+            elif not has_wasapi_output_device(self.system_device_index):
+                errors.append(
+                    "Selected loopback device is not WASAPI output. Windows loopback capture requires WASAPI output."
+                )
+        if capture_mode == CAPTURE_MODE_MIXED and not isinstance(self.input_device, int):
+            errors.append("Microphone device is required for mixed capture.")
+        if capture_mode != CAPTURE_MODE_MIC:
+            if os.name != "nt":
+                errors.append("Loopback capture requires Windows platform support.")
         whisper_path = self._validate_folder("Whisper model", self.whisper_model_dir, errors)
         if whisper_path:
             if self.device.lower().startswith("openvino"):
@@ -523,106 +596,311 @@ class MeetingTranscriberEngine:
             self._raw_chunk_queue.put(None)
             return
 
-        block_buffer = InputBlockBuffer()
         model_sample_rate = self.config.sample_rate
-        input_sample_rate = preferred_input_sample_rate(sd, self.config.input_device, model_sample_rate)
-        chunk_samples = int(self.config.chunk_seconds * input_sample_rate)
-        overlap_samples = int(self.config.overlap_seconds * input_sample_rate)
+        capture_mode = str(self.config.capture_mode or "").strip().lower()
+        if capture_mode not in {CAPTURE_MODE_MIC, CAPTURE_MODE_LOOPBACK, CAPTURE_MODE_MIXED}:
+            capture_mode = CAPTURE_MODE_MIC
+
+        specs = []
+        if capture_mode in {CAPTURE_MODE_MIC, CAPTURE_MODE_MIXED}:
+            specs.append((CAPTURE_SOURCES_MIC, self.config.input_device))
+        if capture_mode in {CAPTURE_MODE_LOOPBACK, CAPTURE_MODE_MIXED}:
+            specs.append((CAPTURE_SOURCES_LOOPBACK, self.config.system_device_index))
+
+        if not specs:
+            self._emit(
+                "error",
+                {"message": "No capture source selected. Select microphone, system audio, or mixed capture."},
+            )
+            self._raw_chunk_queue.put(None)
+            return
+
+        chunk_samples = int(self.config.chunk_seconds * model_sample_rate)
+        overlap_samples = int(self.config.overlap_seconds * model_sample_rate)
         keep_samples = max(0, overlap_samples)
-        preprocessor = AudioPreprocessor(input_sample_rate)
-        accumulated = np.empty((0,), dtype=np.float32)
+        step_samples = max(1, chunk_samples - keep_samples)
         chunk_index = 0
         stream_start = time.monotonic()
+        accumulated = np.empty((0,), dtype=np.float32)
 
-        def callback(indata: Any, frames: int, callback_time: Any, status: Any) -> None:
-            if status:
-                self._emit("log", {"message": str(status)})
-            if not self._pause_event.is_set():
-                block_buffer.push_from_callback(indata)
+        source_queues: dict[str, InputBlockBuffer] = {}
+        source_buffers: dict[str, np.ndarray] = {}
+        source_rates: dict[str, int] = {}
+        source_preprocessors: dict[str, AudioPreprocessor] = {}
+        failed_sources: dict[str, str] = {}
+        done_sources: dict[str, str] = {}
+        active_sources = {name for name, _ in specs}
+        capture_threads: list[threading.Thread] = []
+        allow_fallback = bool(self.config.allow_mixed_fallback)
 
-        try:
-            with sd.InputStream(
-                samplerate=input_sample_rate,
-                channels=1,
-                dtype="float32",
-                device=self.config.input_device,
-                callback=callback,
-            ):
+        def emit_level(level: float) -> None:
+            self._emit("level", {"rms": level, "percent": rms_to_meter_percent(level)})
+
+        def emit_chunks() -> None:
+            nonlocal accumulated, chunk_index
+            while accumulated.size >= chunk_samples:
+                start_time = max(
+                    0.0,
+                    (chunk_index * (chunk_samples - keep_samples)) / model_sample_rate,
+                )
+                samples = accumulated[:chunk_samples].copy()
+                with self._state_lock:
+                    self._audio_chunk_count += 1
+                if audio_chunk_has_activity(samples, DEFAULT_NOISE_FLOOR):
+                    self._emit("log", {"message": f"Audio chunk {chunk_index} captured ({self.config.chunk_seconds:.1f}s)"})
+                    self._raw_chunk_queue.put(
+                        AudioChunk(
+                            chunk_index,
+                            start_time,
+                            samples,
+                            model_sample_rate,
+                            captured_at=time.monotonic(),
+                        )
+                    )
+                else:
+                    self._emit("log", {"message": f"No speech detected in chunk {chunk_index}"})
+                chunk_index += 1
+                accumulated = accumulated[chunk_samples - keep_samples :]
+
+        def flush_final() -> None:
+            nonlocal accumulated, chunk_index
+            if accumulated.size <= model_sample_rate // 2:
+                return
+            start_time = max(0.0, time.monotonic() - stream_start - (accumulated.size / model_sample_rate))
+            samples = accumulated.copy()
+            accumulated = np.empty((0,), dtype=np.float32)
+            with self._state_lock:
+                self._audio_chunk_count += 1
+            if audio_chunk_has_activity(samples, DEFAULT_NOISE_FLOOR):
+                self._emit("log", {"message": f"Final audio chunk {chunk_index} captured"})
+                self._raw_chunk_queue.put(
+                    AudioChunk(
+                        chunk_index,
+                        start_time,
+                        samples,
+                        model_sample_rate,
+                        captured_at=time.monotonic(),
+                        is_final=True,
+                    )
+                )
+            else:
+                self._emit("log", {"message": f"No speech detected in final chunk {chunk_index}"})
+
+        def update_mixed_mode() -> bool:
+            nonlocal active_sources
+            if capture_mode != CAPTURE_MODE_MIXED or len(active_sources) <= 1:
+                return True
+
+            degraded = {name for name in active_sources if name in failed_sources or name in done_sources}
+            if not degraded:
+                return True
+
+            if not allow_fallback and not self._stop_event.is_set():
+                self._emit(
+                    "error",
+                    {
+                        "message": (
+                            "Mixed capture source failed and fallback is disabled. "
+                            "Switch to loopback/mic mode or enable mixed fallback."
+                        )
+                    },
+                )
+                for source_name, reason in failed_sources.items():
+                    self._emit("error", {"message": f"{source_name} failed: {reason}"})
+                for source_name, reason in done_sources.items():
+                    if source_name not in failed_sources:
+                        self._emit("error", {"message": f"{source_name} ended: {reason}"})
+                return False
+
+            remaining = [name for name in active_sources if name not in degraded]
+            if len(remaining) == 1:
+                active_sources = {remaining[0]}
+                self._emit(
+                    "log",
+                    {
+                        "message": (
+                            f"Mixed fallback active: continuing with {'microphone' if remaining[0] == CAPTURE_SOURCES_MIC else 'system audio'} only."
+                        )
+                    },
+                )
+                return True
+
+            self._emit("error", {"message": "Both mixed capture sources ended."})
+            return False
+
+        def mix_to_buffer() -> None:
+            nonlocal accumulated
+            if len(active_sources) < 2:
+                return
+            active = list(active_sources)
+            max_len = max((source_buffers[name].size for name in active), default=0)
+            if max_len <= 0:
+                return
+
+            block_len = min(max_len, chunk_samples)
+            block = np.zeros(block_len, dtype=np.float32)
+            for source_name in active:
+                source_audio = source_buffers[source_name]
+                take = min(source_audio.size, block_len)
+                if take <= 0:
+                    continue
+                block[:take] += source_audio[:take].astype(np.float32)
+                source_buffers[source_name] = source_audio[take:]
+
+            block = np.clip(block, -1.1, 1.1)
+            peak = float(np.max(np.abs(block))) if block.size else 0.0
+            if peak > 1.0:
+                block = np.clip(block / peak, -1.0, 1.0)
+
+            accumulated = np.concatenate([accumulated, block])
+
+        def open_capture_stream(source_name: str, device: Optional[int], source_rate: int, q: InputBlockBuffer) -> None:
+            def callback(indata: Any, frames: int, callback_time: Any, status: Any) -> None:
+                del frames
+                del callback_time
+                if status:
+                    self._emit("log", {"message": str(status)})
+                if not self._pause_event.is_set():
+                    q.push_from_callback(indata)
+
+            kwargs: dict[str, Any] = {
+                "samplerate": source_rate,
+                "channels": 1,
+                "dtype": "float32",
+                "device": device,
+                "callback": callback,
+            }
+
+            if source_name == CAPTURE_SOURCES_LOOPBACK:
+                if os.name != "nt":
+                    raise RuntimeError("Loopback capture requires Windows.")
+                if device is not None and not has_wasapi_output_device(device):
+                    raise RuntimeError("Selected loopback device is not WASAPI output.")
+                wasapi_settings = getattr(sd, "WasapiSettings", None)
+                if wasapi_settings is None:
+                    raise RuntimeError("Loopback capture requires WasapiSettings.")
                 try:
-                    device_info = sd.query_devices(self.config.input_device, "input")
-                    device_name = device_info.get("name", self.config.input_device) if isinstance(device_info, dict) else self.config.input_device
-                except Exception:
-                    device_name = self.config.input_device if self.config.input_device is not None else "default input"
-                self._emit("log", {"message": f"Microphone stream opened: {device_name}"})
-                if input_sample_rate != model_sample_rate:
+                    kwargs["extra_settings"] = wasapi_settings(loopback=True)
+                except Exception as exc:
+                    raise RuntimeError(f"Loopback capture unavailable: {exc}") from exc
+
+            self._emit("log", {"message": f"Opening {source_name} stream..."})
+            with sd.InputStream(**kwargs):
+                self._emit(
+                    "log",
+                    {
+                        "message": (
+                            f"{source_name} stream opened: {_resolve_capture_source_label(source_name, device, sd)} "
+                            f"@ {source_rate} Hz"
+                        )
+                    },
+                )
+                if source_name == CAPTURE_SOURCES_LOOPBACK:
                     self._emit(
                         "log",
-                        {
-                            "message": (
-                                f"Microphone sample rate: {input_sample_rate} Hz; "
-                                f"resampling to {model_sample_rate} Hz for Whisper"
-                            )
-                        },
+                        {"message": "Loopback stream active. Ensure meeting output is routed to selected device."},
                     )
                 while not self._stop_event.is_set():
-                    try:
-                        block = block_buffer.pop(timeout=0.2)
-                    except queue.Empty:
-                        continue
-                    mono = np.asarray(block, dtype=np.float32).reshape(-1)
-                    cleaned = preprocessor.process(mono)
-                    level = float(np.sqrt(np.mean(np.square(cleaned)))) if cleaned.size else 0.0
-                    with self._state_lock:
-                        self._audio_block_count += 1
-                        self._audio_peak_rms = max(self._audio_peak_rms, level)
-                    self._emit("level", {"rms": level, "percent": rms_to_meter_percent(level)})
-                    accumulated = np.concatenate([accumulated, cleaned])
-                    while accumulated.size >= chunk_samples:
-                        start_time = max(
-                            0.0,
-                            ((chunk_index * (chunk_samples - keep_samples)) / input_sample_rate),
-                        )
-                        samples = resample_audio(accumulated[:chunk_samples].copy(), input_sample_rate, model_sample_rate)
-                        with self._state_lock:
-                            self._audio_chunk_count += 1
-                        if audio_chunk_has_activity(samples, preprocessor.noise_floor):
-                            self._emit("log", {"message": f"Audio chunk {chunk_index} captured ({self.config.chunk_seconds:.1f}s)"})
-                            self._raw_chunk_queue.put(
-                                AudioChunk(
-                                    chunk_index,
-                                    start_time,
-                                    samples,
-                                    model_sample_rate,
-                                    captured_at=time.monotonic(),
-                                )
-                            )
-                        else:
-                            self._emit("log", {"message": f"No speech detected in chunk {chunk_index}"})
-                        chunk_index += 1
-                        accumulated = accumulated[chunk_samples - keep_samples :]
-                if accumulated.size > input_sample_rate // 2:
-                    start_time = max(0.0, time.monotonic() - stream_start - (accumulated.size / input_sample_rate))
-                    samples = resample_audio(accumulated.copy(), input_sample_rate, model_sample_rate)
-                    with self._state_lock:
-                        self._audio_chunk_count += 1
-                    if audio_chunk_has_activity(samples, preprocessor.noise_floor):
-                        self._emit("log", {"message": f"Final audio chunk {chunk_index} captured"})
-                        self._raw_chunk_queue.put(
-                            AudioChunk(
-                                chunk_index,
-                                start_time,
-                                samples,
-                                model_sample_rate,
-                                captured_at=time.monotonic(),
-                                is_final=True,
-                            )
-                        )
+                    if self._pause_event.is_set():
+                        time.sleep(0.02)
                     else:
-                        self._emit("log", {"message": f"No speech detected in final chunk {chunk_index}"})
+                        time.sleep(0.02)
+
+            q.put(None)
+
+        for source_name, source_device in specs:
+            try:
+                source_rate = preferred_input_sample_rate(sd, source_device, model_sample_rate)
+                if source_name == CAPTURE_SOURCES_LOOPBACK:
+                    source_rate = preferred_output_sample_rate(sd, source_device, model_sample_rate)
+                source_queues[source_name] = InputBlockBuffer()
+                source_buffers[source_name] = np.empty((0,), dtype=np.float32)
+                source_rates[source_name] = source_rate
+                source_preprocessors[source_name] = AudioPreprocessor(source_rate)
+
+                thread = threading.Thread(
+                    target=open_capture_stream,
+                    args=(source_name, source_device, source_rate, source_queues[source_name]),
+                    name=f"capture-{source_name}",
+                    daemon=True,
+                )
+                thread.start()
+                capture_threads.append(thread)
+            except Exception as exc:
+                failed_sources[source_name] = str(exc)
+                active_sources.discard(source_name)
+                self._emit("error", {"message": f"{source_name} could not be started: {exc}"})
+
+        if not active_sources:
+            self._emit("error", {"message": "No active capture sources started."})
+            self._raw_chunk_queue.put(None)
+            return
+
+        if not update_mixed_mode():
+            self._raw_chunk_queue.put(None)
+            return
+
+        try:
+            while not self._stop_event.is_set():
+                for source_name in list(active_sources):
+                    source_queue = source_queues[source_name]
+                    while True:
+                        try:
+                            block = source_queue.pop(timeout=0.02)
+                        except queue.Empty:
+                            break
+                        if block is None:
+                            done_sources[source_name] = "stream closed"
+                            active_sources.discard(source_name)
+                            break
+
+                        samples = np.asarray(block, dtype=np.float32).reshape(-1)
+                        cleaned = source_preprocessors[source_name].process(samples)
+                        level = float(np.sqrt(np.mean(np.square(cleaned)))) if cleaned.size else 0.0
+                        with self._state_lock:
+                            self._audio_block_count += 1
+                            self._audio_peak_rms = max(self._audio_peak_rms, level)
+                        emit_level(level)
+                        source_buffers[source_name] = np.concatenate(
+                            [
+                                source_buffers[source_name],
+                                resample_audio(cleaned, source_rates[source_name], model_sample_rate),
+                            ]
+                        )
+
+                if not update_mixed_mode():
+                    break
+
+                if capture_mode == CAPTURE_MODE_MIXED and len(active_sources) >= 2:
+                    mix_to_buffer()
+                    emit_chunks()
+                elif active_sources:
+                    source_name = next(iter(active_sources))
+                    while source_buffers[source_name].size >= step_samples and not self._stop_event.is_set():
+                        take = min(source_buffers[source_name].size, step_samples)
+                        segment = source_buffers[source_name][:take]
+                        source_buffers[source_name] = source_buffers[source_name][take:]
+                        accumulated = np.concatenate([accumulated, segment.astype(np.float32)])
+                        emit_chunks()
+                else:
+                    break
+
+                if not any(source_buffers.get(name, np.empty((0,), dtype=np.float32)).size for name in active_sources):
+                    time.sleep(0.02)
+
+            if self._stop_event.is_set():
+                flush_final()
         except Exception as exc:  # pragma: no cover - environment-dependent
             self._emit("error", {"message": f"Recording failed: {exc}"})
         finally:
+            for thread in capture_threads:
+                thread.join(timeout=0.5)
+            if not self._stop_event.is_set() and active_sources and not update_mixed_mode():
+                if not any(buf.size for buf in source_buffers.values()):
+                    self._emit("error", {"message": "Mixed capture stopped because a stream ended."})
             self._raw_chunk_queue.put(None)
+
+
 
     def _fanout_loop(self) -> None:
         while True:
@@ -835,3 +1113,37 @@ def list_input_devices() -> list[dict[str, Any]]:
                 }
             )
     return devices
+
+
+def list_output_devices() -> list[dict[str, Any]]:
+    try:
+        import sounddevice as sd
+    except Exception:
+        return []
+
+    devices = []
+    try:
+        hostapis = sd.query_hostapis()
+    except Exception:
+        hostapis = []
+    for index, device in enumerate(sd.query_devices()):
+        if int(device.get("max_output_channels", 0)) > 0:
+            hostapi_index = int(device.get("hostapi", -1))
+            hostapi_name = ""
+            wasapi = False
+            if 0 <= hostapi_index < len(hostapis):
+                hostapi_name = str(hostapis[hostapi_index].get("name", ""))
+                wasapi = "wasapi" in hostapi_name.lower()
+            devices.append(
+                {
+                    "index": index,
+                    "name": device.get("name", f"Output {index}"),
+                    "hostapi": hostapi_name,
+                    "channels": device.get("max_output_channels", 0),
+                    "default_samplerate": device.get("default_samplerate"),
+                    "wasapi": wasapi,
+                }
+            )
+    return devices
+
+

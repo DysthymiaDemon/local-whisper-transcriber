@@ -12,6 +12,7 @@ from transcriber_engine import (
     AudioPreprocessor,
     AtomicTranscriptWriter,
     DuplicateSuppressor,
+    CAPTURE_MODE_LOOPBACK,
     EngineConfig,
     InputBlockBuffer,
     MeetingTranscriberEngine,
@@ -20,6 +21,7 @@ from transcriber_engine import (
     audio_chunk_duration_seconds,
     default_cpu_thread_count,
     effective_cpu_threads,
+    has_wasapi_output_device,
     microphone_health_message,
     preferred_input_sample_rate,
     resample_audio,
@@ -311,6 +313,39 @@ class EngineConfigTests(unittest.TestCase):
     def test_effective_cpu_threads_preserves_explicit_user_value(self):
         self.assertEqual(effective_cpu_threads(6, "cpu"), 6)
         self.assertEqual(effective_cpu_threads(0, "cuda"), 0)
+
+    def test_validate_rejects_loopback_without_wasapi_device(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            whisper = os.path.join(tmp, "whisper")
+            os.mkdir(whisper)
+            open(os.path.join(whisper, "model.bin"), "wb").close()
+            config = EngineConfig(
+                whisper_model_dir=whisper,
+                output_file=os.path.join(tmp, "out.txt"),
+                capture_mode=CAPTURE_MODE_LOOPBACK,
+                system_device_index=3,
+            )
+
+            with patch("transcriber_engine.has_wasapi_output_device", return_value=False):
+                errors = config.validate()
+
+        self.assertTrue(any("WASAPI output" in error for error in errors))
+
+    def test_has_wasapi_output_device_false_on_non_windows(self):
+        with patch("os.name", "posix"):
+            self.assertFalse(has_wasapi_output_device(0))
+
+    def test_has_wasapi_output_device_checks_hostapi_name(self):
+        fake_sd = type(sys)("sounddevice")
+
+        def query_devices(index):
+            return {"hostapi": 1}
+
+        fake_sd.query_devices = query_devices
+        fake_sd.query_hostapis = lambda: [{"name": "MME"}, {"name": "Windows WASAPI"}]
+
+        with patch("os.name", "nt"), patch.dict(sys.modules, {"sounddevice": fake_sd}):
+            self.assertTrue(has_wasapi_output_device(0))
 
     def test_whisper_model_load_uses_cpu_thread_setting(self):
         with tempfile.TemporaryDirectory() as tmp:
