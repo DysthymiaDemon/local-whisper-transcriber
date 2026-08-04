@@ -1,5 +1,5 @@
 ========================================================================
-timestamp: 2026-08-04T15:35:06
+timestamp: 2026-08-04T16:44:51
 app_root: C:\Users\p1360560\OneDrive - Singtel\Documents\GitHub\local-whisper-transcriber\OfflineMeetingTranscriber
 message: Install Offline Meeting Transcriber?
 Local Windows App
@@ -23,7 +23,7 @@ Install location:
 - App files, config, models, transcripts: folder beside this launcher
 - Python dependencies: app runtime folder
 ------------------------------------------------------------------------
-timestamp: 2026-08-04T15:35:06
+timestamp: 2026-08-04T16:44:51
 context: Setup
 message: Installer opened
 details:
