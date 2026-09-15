@@ -1,3 +1,4 @@
+import base64
 import importlib.util
 import shutil
 import subprocess
@@ -63,6 +64,18 @@ class StandaloneLauncherTests(unittest.TestCase):
         self.assertIn('os.environ["LOCAL_WHISPER_GPU_TRIAL"] = "1"', content)
         self.assertIn('os.environ["LOCAL_WHISPER_RUNTIME_APP_FOLDER_NAME"] = "OfflineMeetingTranscriberGpuTrialRuntime"', content)
         self.assertNotIn('APP_FOLDER_NAME = "OfflineMeetingTranscriber"\nPAYLOAD', content)
+
+    def test_gpu_trial_launcher_embeds_large_v3_turbo_int8_model(self):
+        namespace = {"__name__": "embedded_gpu_trial_launcher"}
+        exec(GPU_TRIAL_LAUNCHER_PATH.read_text(encoding="utf-8"), namespace)
+        payload = namespace["decode_payload"]()
+        encoded = payload["files"]["app/bootstrap_launcher.py"]["data"]
+        content = base64.b64decode(encoded).decode("utf-8")
+
+        self.assertIn("OpenVINO/whisper-large-v3-turbo-int8-ov", content)
+        self.assertIn('"compute_type": "int8"', content)
+        self.assertIn('"chunk_seconds": 10.0', content)
+        self.assertNotIn("OpenVINO/whisper-small-fp16-ov", content)
 
     def test_launcher_does_not_force_huggingface_offline_before_bootstrap(self):
         content = LAUNCHER_PATH.read_text(encoding="utf-8")

@@ -67,7 +67,7 @@ Use this separate launcher only for testing GPU acceleration:
 Open Offline Meeting Transcriber GPU Trial.pyw
 ```
 
-It creates `OfflineMeetingTranscriberGpuTrial\` beside itself. NVIDIA uses faster-whisper CUDA config if CUDA/cuDNN is available. Intel GPU trial installs OpenVINO GenAI and downloads an OpenVINO Whisper model into `models\openvino-whisper`. AMD installs DirectML runtime for probing, but the current transcription engine is not ONNX-backed yet.
+It creates `OfflineMeetingTranscriberGpuTrial\` beside itself. NVIDIA uses faster-whisper CUDA config if CUDA/cuDNN is available. Intel GPU trial installs OpenVINO GenAI 2026.1 or newer and downloads the 828 MB `OpenVINO/whisper-large-v3-turbo-int8-ov` model into `models\openvino-whisper`. Intel uses 10-second chunks with 1-second overlap. AMD installs DirectML runtime for probing, but the current transcription engine is not ONNX-backed yet.
 
 ## What It Does
 
@@ -279,7 +279,9 @@ $env:LOCAL_WHISPER_APP_ROOT = "D:\Apps\OfflineMeetingTranscriber"
 Default one-touch folders:
 
 - `models\faster-whisper`: CTranslate2 faster-whisper model downloaded from `Systran/faster-whisper-small.en`; must contain `model.bin`.
-- `models\openvino-whisper`: GPU trial OpenVINO model downloaded from `OpenVINO/whisper-small-fp16-ov`; must contain OpenVINO `.xml` model files.
+- `models\openvino-whisper`: GPU trial OpenVINO model downloaded from `OpenVINO/whisper-large-v3-turbo-int8-ov`; must contain OpenVINO `.xml`, `.bin`, and matching `config.json` files.
+
+Existing Intel GPU Trial installs using the default model path replace the previous Small FP16 model during setup. Download and validation finish in a staging folder before replacement. Setup temporarily uses `models\.openvino-whisper.rollback` and restores it if copying or validation fails. Custom model paths and custom chunk settings remain unchanged.
 
 Runtime recording does not download models.
 

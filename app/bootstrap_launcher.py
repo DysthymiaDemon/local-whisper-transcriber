@@ -48,9 +48,12 @@ MODEL_GUIDES: dict[str, str] = {
         "Example source model: Systran/faster-whisper-small.en\n"
     ),
     "openvino-whisper": (
-        "GPU trial setup downloads OpenVINO/whisper-small-fp16-ov here for Intel GPU testing.\n\n"
+        "GPU trial setup downloads OpenVINO/whisper-large-v3-turbo-int8-ov here for Intel GPU testing.\n\n"
+        "Model size: 828 MB. Requires OpenVINO 2026.1 or newer.\n\n"
         "Required files include OpenVINO IR XML/BIN files and tokenizer files.\n\n"
-        "Example source model: OpenVINO/whisper-small-fp16-ov\n"
+        "Setup replaces a stale default model in place using the temporary "
+        "models/.openvino-whisper.rollback folder and restores it if replacement fails.\n\n"
+        "Source model: OpenVINO/whisper-large-v3-turbo-int8-ov\n"
     ),
 }
 SETUP_MARKER = ".setup_complete"
@@ -61,6 +64,22 @@ RUNTIME_ENV = "LOCAL_WHISPER_RUNTIME_ROOT"
 RUNTIME_APP_FOLDER_ENV = "LOCAL_WHISPER_RUNTIME_APP_FOLDER_NAME"
 RUNTIME_APP_FOLDER_NAME = "OfflineMeetingTranscriberRuntime"
 GPU_TRIAL_ENV = "LOCAL_WHISPER_GPU_TRIAL"
+OPENVINO_MODEL_CONFIG_SIGNATURE = {
+    "d_model": 1280,
+    "encoder_layers": 32,
+    "decoder_layers": 4,
+    "num_mel_bins": 128,
+}
+OPENVINO_REQUIRED_MODEL_FILES = (
+    "openvino_encoder_model.xml",
+    "openvino_encoder_model.bin",
+    "openvino_decoder_model.xml",
+    "openvino_decoder_model.bin",
+    "openvino_tokenizer.xml",
+    "openvino_tokenizer.bin",
+    "openvino_detokenizer.xml",
+    "openvino_detokenizer.bin",
+)
 APP_PUBLISHER = "Ameen Khan"
 APP_VERSION = "local"
 INSTALL_DISK_SPACE_ESTIMATE = "~1.8 GB"
@@ -174,6 +193,7 @@ class GpuTrialBackend:
     label: str
     requirements: tuple[str, ...] = ()
     imports: Mapping[str, str] | None = None
+    minimum_versions: Mapping[str, str] | None = None
     model_downloads: tuple[ModelDownloadSpec, ...] = ()
     config_overrides: Mapping[str, Any] | None = None
     note: str = ""
@@ -197,7 +217,7 @@ DEFAULT_MODEL_DOWNLOADS = (
 OPENVINO_MODEL_DOWNLOADS = (
     ModelDownloadSpec(
         name="openvino-whisper",
-        repo_id="OpenVINO/whisper-small-fp16-ov",
+        repo_id="OpenVINO/whisper-large-v3-turbo-int8-ov",
         target_subdir="models/openvino-whisper",
     ),
 )
@@ -223,21 +243,34 @@ GPU_TRIAL_BACKENDS = {
         requirements=(
             "--pre",
             "--extra-index-url https://storage.openvinotoolkit.org/simple/wheels/nightly",
-            "openvino>=2025.2.0",
-            "openvino-tokenizers>=2025.2.0",
-            "openvino-genai>=2025.2.0",
+            "openvino>=2026.1.0",
+            "openvino-tokenizers>=2026.1.0",
+            "openvino-genai>=2026.1.0",
         ),
         imports={
             "openvino": "openvino",
             "openvino-genai": "openvino_genai",
+            "openvino-tokenizers": "openvino_tokenizers",
+        },
+        minimum_versions={
+            "openvino": "2026.1.0",
+            "openvino-genai": "2026.1.0",
+            "openvino-tokenizers": "2026.1.0",
         },
         model_downloads=OPENVINO_MODEL_DOWNLOADS,
         config_overrides={
             "whisper_model_dir": "models/openvino-whisper",
             "device": "openvino:GPU",
-            "compute_type": "fp16",
+            "compute_type": "int8",
+            "chunk_seconds": 10.0,
+            "overlap_seconds": 1.0,
         },
-        note="Uses OpenVINO GenAI WhisperPipeline on Intel GPU with an OpenVINO IR model.",
+        note=(
+            "Uses OpenVINO GenAI WhisperPipeline on Intel GPU with "
+            "the 828 MB OpenVINO Whisper large-v3-turbo INT8 model. "
+            "Requires OpenVINO 2026.1 or newer. Setup replaces a stale default model "
+            "in place using temporary models/.openvino-whisper.rollback."
+        ),
     ),
     GpuVendor.AMD: GpuTrialBackend(
         key="amd-directml",
@@ -385,6 +418,13 @@ def runtime_required_imports() -> dict[str, str]:
     if gpu_trial_enabled():
         required.update(gpu_trial_required_imports())
     return required
+
+
+def runtime_required_minimum_versions() -> dict[str, str]:
+    if not gpu_trial_enabled():
+        return {}
+    backend = active_gpu_trial_backend()
+    return dict(backend.minimum_versions or {})
 
 
 def active_model_downloads() -> tuple[ModelDownloadSpec, ...]:
@@ -1051,13 +1091,29 @@ def missing_runtime_imports(root: Path, required: Mapping[str, str] = REQUIRED_I
     if not package_path.exists():
         return list(required.keys())
 
-    probe = (
-        "import importlib.util, json, sys; "
-        f"required = {json.dumps(dict(required))}; "
-        "missing = [label for label, module in required.items() if importlib.util.find_spec(module) is None]; "
-        "print(json.dumps(missing)); "
-        "sys.exit(1 if missing else 0)"
-    )
+    minimum_versions = runtime_required_minimum_versions()
+    probe = f"""
+import importlib.metadata as metadata
+import importlib.util
+import json
+import sys
+from packaging.version import InvalidVersion, Version
+
+required = {json.dumps(dict(required))}
+minimum_versions = {json.dumps(minimum_versions)}
+missing = [label for label, module in required.items() if importlib.util.find_spec(module) is None]
+for label, minimum in minimum_versions.items():
+    if label not in required or label in missing:
+        continue
+    try:
+        installed = metadata.version(label)
+        if Version(installed) < Version(minimum):
+            missing.append(label)
+    except (metadata.PackageNotFoundError, InvalidVersion):
+        missing.append(label)
+print(json.dumps(missing))
+sys.exit(1 if missing else 0)
+"""
     env = os.environ.copy()
     existing_pythonpath = env.get("PYTHONPATH")
     env["PYTHONPATH"] = str(package_path) if not existing_pythonpath else str(package_path) + os.pathsep + existing_pythonpath
@@ -1112,6 +1168,41 @@ def apply_gpu_trial_config(config_path: Path, backend: GpuTrialBackend | None = 
     config_path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
 
 
+def migrate_gpu_trial_config(config_path: Path, backend: GpuTrialBackend | None = None) -> bool:
+    if not gpu_trial_enabled():
+        return False
+    backend = backend or active_gpu_trial_backend()
+    if backend.key != "intel-openvino" or not backend.config_overrides:
+        return False
+    try:
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if not isinstance(raw, dict):
+        return False
+    if raw.get("whisper_model_dir") != "models/openvino-whisper":
+        return False
+
+    changed = False
+    if raw.get("compute_type") == "fp16":
+        raw["compute_type"] = backend.config_overrides["compute_type"]
+        changed = True
+    try:
+        uses_old_chunks = (
+            float(raw.get("chunk_seconds")) == 5.0
+            and float(raw.get("overlap_seconds")) == 0.5
+        )
+    except (TypeError, ValueError):
+        uses_old_chunks = False
+    if uses_old_chunks:
+        raw["chunk_seconds"] = backend.config_overrides["chunk_seconds"]
+        raw["overlap_seconds"] = backend.config_overrides["overlap_seconds"]
+        changed = True
+    if changed:
+        config_path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+    return changed
+
+
 def ensure_portable_layout(root: Path, template_root: Path | None = None) -> Path:
     migrate_legacy_onedrive_runtime(root)
     local_runtime_dir(root).mkdir(parents=True, exist_ok=True)
@@ -1157,6 +1248,8 @@ def ensure_portable_layout(root: Path, template_root: Path | None = None) -> Pat
         write_gpu_trial_report(root, backend)
         if created_config:
             apply_gpu_trial_config(config_path, backend)
+        else:
+            migrate_gpu_trial_config(config_path, backend)
     return config_path
 
 
@@ -1164,11 +1257,23 @@ def _model_folder_ready(root: Path, name: str) -> bool:
     return _model_folder_ready_at(root / "models" / name, name)
 
 
+def _openvino_model_matches_expected(folder: Path) -> bool:
+    if not all((folder / filename).is_file() for filename in OPENVINO_REQUIRED_MODEL_FILES):
+        return False
+    try:
+        raw = json.loads((folder / "config.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(raw, dict):
+        return False
+    return all(raw.get(key) == expected for key, expected in OPENVINO_MODEL_CONFIG_SIGNATURE.items())
+
+
 def _model_folder_ready_at(folder: Path, name: str) -> bool:
     if name == "faster-whisper":
         return (folder / "model.bin").is_file()
     if name == "openvino-whisper":
-        return any(folder.glob("*.xml"))
+        return _openvino_model_matches_expected(folder)
     return False
 
 
@@ -1420,9 +1525,33 @@ def prepare_model_download_staging_dir(root: Path, spec: ModelDownloadSpec) -> P
     return staging
 
 
-def copy_staged_model_to_target(staging: Path, target: Path) -> None:
-    target.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(staging, target, dirs_exist_ok=True, ignore=shutil.ignore_patterns(".cache"))
+def model_rollback_path(target: Path) -> Path:
+    return target.parent / f".{target.name}.rollback"
+
+
+def copy_staged_model_to_target(staging: Path, target: Path, model_name: str | None = None) -> None:
+    rollback = model_rollback_path(target)
+    if rollback.exists():
+        raise RuntimeError(f"Model rollback folder already exists: {rollback}")
+
+    had_target = target.exists()
+    if had_target:
+        target.replace(rollback)
+    try:
+        shutil.copytree(staging, target, ignore=shutil.ignore_patterns(".cache"))
+        guide_text = MODEL_GUIDES.get(model_name or "")
+        if guide_text:
+            (target / "README_MODEL_FILES.txt").write_text(guide_text, encoding="utf-8")
+        if model_name and not _model_folder_ready_at(target, model_name):
+            raise RuntimeError(f"Copied model failed validation in {target}")
+    except BaseException:
+        if target.exists():
+            shutil.rmtree(target)
+        if had_target and rollback.exists():
+            rollback.replace(target)
+        raise
+    if rollback.exists():
+        shutil.rmtree(rollback)
 
 
 def verify_downloaded_model(
@@ -1511,6 +1640,9 @@ def download_default_models(root: Path, on_event, downloader: Callable[..., str]
     total = len(model_downloads)
     for index, spec in enumerate(model_downloads, start=1):
         target = root / spec.target_subdir
+        rollback = model_rollback_path(target)
+        if rollback.exists():
+            raise RuntimeError(f"Model rollback folder already exists: {rollback}")
         target.mkdir(parents=True, exist_ok=True)
         base_progress = int(((index - 1) / total) * 100)
         if _model_folder_ready(root, spec.name):
@@ -1547,7 +1679,7 @@ def download_default_models(root: Path, on_event, downloader: Callable[..., str]
                 downloader,
             )
         verify_downloaded_model(root, spec, staging, returned_path)
-        copy_staged_model_to_target(staging, target)
+        copy_staged_model_to_target(staging, target, spec.name)
         verify_downloaded_model(root, spec, target, returned_path)
         downloaded.append(spec.name)
         on_event(PipProgressEvent("Model downloaded", detail, end_progress, detail))

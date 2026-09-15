@@ -53,6 +53,12 @@ from bootstrap_launcher import (
 )
 
 
+def write_complete_openvino_ir(folder: Path, content: str = "model") -> None:
+    for stem in ("encoder_model", "decoder_model", "tokenizer", "detokenizer"):
+        (folder / f"openvino_{stem}.xml").write_text(f"{content} xml", encoding="utf-8")
+        (folder / f"openvino_{stem}.bin").write_bytes(f"{content} weights".encode())
+
+
 class BootstrapLauncherTests(unittest.TestCase):
     def test_import_replaces_missing_pythonw_streams(self):
         script = (
@@ -125,6 +131,26 @@ class BootstrapLauncherTests(unittest.TestCase):
         self.assertIn("- alpha==1.0", summary)
         self.assertIn("- beta>=2.0", summary)
 
+    def test_intel_setup_summary_documents_model_upgrade(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            resources = root / "resources"
+            resources.mkdir()
+            (resources / "requirements.txt").write_text("alpha==1.0\n", encoding="utf-8")
+
+            with patch.dict(os.environ, {"LOCAL_WHISPER_GPU_TRIAL": "1"}, clear=False):
+                with patch.object(
+                    bootstrap_launcher_module,
+                    "detect_windows_gpu_names",
+                    return_value=["Intel(R) Iris(R) Xe Graphics"],
+                ):
+                    summary = setup_install_summary(root)
+
+        self.assertIn("828 MB", summary)
+        self.assertIn("OpenVINO 2026.1", summary)
+        self.assertIn("in place", summary)
+        self.assertIn("models/.openvino-whisper.rollback", summary)
+
     def test_setup_initial_buttons_do_not_include_manual_launch_or_model_shortcuts(self):
         source = (Path(__file__).resolve().parents[1] / "app" / "bootstrap_launcher.py").read_text(encoding="utf-8")
 
@@ -165,16 +191,36 @@ class BootstrapLauncherTests(unittest.TestCase):
         self.assertEqual(nvidia.key, "nvidia-cuda")
         self.assertEqual(nvidia.config_overrides["device"], "cuda")
         self.assertEqual(nvidia.config_overrides["compute_type"], "float16")
+        self.assertNotIn("chunk_seconds", nvidia.config_overrides)
+        self.assertNotIn("overlap_seconds", nvidia.config_overrides)
         self.assertEqual(intel.key, "intel-openvino")
         self.assertTrue(any(requirement.startswith("openvino-genai") for requirement in intel.requirements))
         self.assertEqual(amd.key, "amd-directml")
         self.assertTrue(any(requirement.startswith("onnxruntime-directml") for requirement in amd.requirements))
+
+    def test_intel_gpu_trial_uses_large_v3_turbo_int8_contract(self):
+        intel = choose_gpu_trial_backend([GpuVendor.INTEL])
+
+        self.assertEqual(len(intel.model_downloads), 1)
+        self.assertEqual(
+            intel.model_downloads[0].repo_id,
+            "OpenVINO/whisper-large-v3-turbo-int8-ov",
+        )
+        self.assertEqual(intel.model_downloads[0].target_subdir, "models/openvino-whisper")
+        self.assertEqual(intel.config_overrides["device"], "openvino:GPU")
+        self.assertEqual(intel.config_overrides["compute_type"], "int8")
+        self.assertEqual(intel.config_overrides["chunk_seconds"], 10.0)
+        self.assertEqual(intel.config_overrides["overlap_seconds"], 1.0)
+        self.assertIn("openvino>=2026.1.0", intel.requirements)
+        self.assertIn("openvino-tokenizers>=2026.1.0", intel.requirements)
+        self.assertIn("openvino-genai>=2026.1.0", intel.requirements)
 
     def test_gpu_trial_required_imports_are_selected_by_vendor(self):
         imports = gpu_trial_required_imports([GpuVendor.INTEL])
 
         self.assertIn("openvino", imports)
         self.assertIn("openvino-genai", imports)
+        self.assertIn("openvino-tokenizers", imports)
         self.assertNotIn("onnxruntime-directml", imports)
 
     def test_successful_package_install_marks_package_check_done(self):
@@ -239,12 +285,87 @@ class BootstrapLauncherTests(unittest.TestCase):
             self.assertTrue(report.is_file())
             requirements_content = requirements.read_text(encoding="utf-8")
             report_content = report.read_text(encoding="utf-8")
+            guide_content = (
+                root / "models" / "openvino-whisper" / "README_MODEL_FILES.txt"
+            ).read_text(encoding="utf-8")
 
             self.assertEqual(config["whisper_model_dir"], "models/openvino-whisper")
             self.assertEqual(config["device"], "openvino:GPU")
-            self.assertEqual(config["compute_type"], "fp16")
-            self.assertIn("openvino-genai", requirements_content)
+            self.assertEqual(config["compute_type"], "int8")
+            self.assertEqual(config["chunk_seconds"], 10.0)
+            self.assertEqual(config["overlap_seconds"], 1.0)
+            self.assertIn("openvino-genai>=2026.1.0", requirements_content)
             self.assertIn("selected_backend: intel-openvino", report_content)
+            for content in (report_content, guide_content):
+                self.assertIn("828 MB", content)
+                self.assertIn("OpenVINO 2026.1", content)
+                self.assertIn("in place", content)
+                self.assertIn("models/.openvino-whisper.rollback", content)
+
+    def test_gpu_trial_layout_migrates_untouched_intel_chunk_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "whisper_model_dir": "models/openvino-whisper",
+                        "device": "openvino:GPU",
+                        "compute_type": "fp16",
+                        "chunk_seconds": 5.0,
+                        "overlap_seconds": 0.5,
+                        "language": "en",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.dict(os.environ, {"LOCAL_WHISPER_GPU_TRIAL": "1"}, clear=False):
+                with patch.object(
+                    bootstrap_launcher_module,
+                    "detect_windows_gpu_names",
+                    return_value=["Intel(R) Iris(R) Xe Graphics"],
+                ):
+                    ensure_portable_layout(root)
+
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(config["compute_type"], "int8")
+        self.assertEqual(config["chunk_seconds"], 10.0)
+        self.assertEqual(config["overlap_seconds"], 1.0)
+        self.assertEqual(config["language"], "en")
+
+    def test_gpu_trial_layout_preserves_custom_path_and_chunks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "whisper_model_dir": "D:/models/custom-openvino",
+                        "device": "openvino:GPU",
+                        "compute_type": "fp16",
+                        "chunk_seconds": 12.0,
+                        "overlap_seconds": 3.0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.dict(os.environ, {"LOCAL_WHISPER_GPU_TRIAL": "1"}, clear=False):
+                with patch.object(
+                    bootstrap_launcher_module,
+                    "detect_windows_gpu_names",
+                    return_value=["Intel(R) Iris(R) Xe Graphics"],
+                ):
+                    ensure_portable_layout(root)
+
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(config["whisper_model_dir"], "D:/models/custom-openvino")
+        self.assertEqual(config["compute_type"], "fp16")
+        self.assertEqual(config["chunk_seconds"], 12.0)
+        self.assertEqual(config["overlap_seconds"], 3.0)
 
     def test_local_runtime_paths_stay_under_install_root_without_venv(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -328,6 +449,82 @@ class BootstrapLauncherTests(unittest.TestCase):
             root = Path(tmp)
 
             self.assertEqual(missing_runtime_imports(root, {"json": "json"}), ["json"])
+
+    def test_missing_runtime_imports_reports_outdated_intel_openvino_packages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            package_dir = local_package_dir(root)
+            (package_dir / "openvino").mkdir(parents=True)
+            (package_dir / "openvino" / "__init__.py").write_text("", encoding="utf-8")
+            (package_dir / "openvino_genai.py").write_text("", encoding="utf-8")
+            (package_dir / "openvino_tokenizers.py").write_text("", encoding="utf-8")
+            for distribution in ("openvino", "openvino-genai", "openvino-tokenizers"):
+                metadata_dir = distribution.replace("-", "_")
+                metadata = package_dir / f"{metadata_dir}-2025.4.0.dist-info" / "METADATA"
+                metadata.parent.mkdir()
+                metadata.write_text(
+                    f"Metadata-Version: 2.1\nName: {distribution}\nVersion: 2025.4.0\n",
+                    encoding="utf-8",
+                )
+
+            with patch.dict(os.environ, {"LOCAL_WHISPER_GPU_TRIAL": "1"}, clear=False):
+                with patch.object(
+                    bootstrap_launcher_module,
+                    "detect_windows_gpu_names",
+                    return_value=["Intel(R) Iris(R) Xe Graphics"],
+                ):
+                    missing = missing_runtime_imports(
+                        root,
+                        {
+                            "openvino": "openvino",
+                            "openvino-genai": "openvino_genai",
+                            "openvino-tokenizers": "openvino_tokenizers",
+                        },
+                    )
+
+        self.assertEqual(
+            missing,
+            ["openvino", "openvino-genai", "openvino-tokenizers"],
+        )
+
+    def test_missing_runtime_imports_accepts_compatible_intel_openvino_packages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            package_dir = local_package_dir(root)
+            (package_dir / "openvino").mkdir(parents=True)
+            (package_dir / "openvino" / "__init__.py").write_text("", encoding="utf-8")
+            (package_dir / "openvino_genai.py").write_text("", encoding="utf-8")
+            (package_dir / "openvino_tokenizers.py").write_text("", encoding="utf-8")
+            versions = {
+                "openvino": "2026.1.0",
+                "openvino-genai": "2026.2.0",
+                "openvino-tokenizers": "2026.1.1",
+            }
+            for distribution, version in versions.items():
+                metadata_dir = distribution.replace("-", "_")
+                metadata = package_dir / f"{metadata_dir}-{version}.dist-info" / "METADATA"
+                metadata.parent.mkdir()
+                metadata.write_text(
+                    f"Metadata-Version: 2.1\nName: {distribution}\nVersion: {version}\n",
+                    encoding="utf-8",
+                )
+
+            with patch.dict(os.environ, {"LOCAL_WHISPER_GPU_TRIAL": "1"}, clear=False):
+                with patch.object(
+                    bootstrap_launcher_module,
+                    "detect_windows_gpu_names",
+                    return_value=["Intel(R) Iris(R) Xe Graphics"],
+                ):
+                    missing = missing_runtime_imports(
+                        root,
+                        {
+                            "openvino": "openvino",
+                            "openvino-genai": "openvino_genai",
+                            "openvino-tokenizers": "openvino_tokenizers",
+                        },
+                    )
+
+        self.assertEqual(missing, [])
 
     def test_run_pip_install_uses_target_package_dir_without_venv(self):
         from bootstrap_launcher import run_pip_install
@@ -508,6 +705,109 @@ class BootstrapLauncherTests(unittest.TestCase):
 
         self.assertEqual(set(status), {"faster-whisper"})
 
+    def test_intel_model_status_rejects_previous_small_fp16_signature(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model_dir = root / "models" / "openvino-whisper"
+            model_dir.mkdir(parents=True)
+            write_complete_openvino_ir(model_dir)
+            (model_dir / "config.json").write_text(
+                json.dumps(
+                    {
+                        "d_model": 768,
+                        "encoder_layers": 12,
+                        "decoder_layers": 12,
+                        "num_mel_bins": 80,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.dict(os.environ, {"LOCAL_WHISPER_GPU_TRIAL": "1"}, clear=False):
+                with patch.object(
+                    bootstrap_launcher_module,
+                    "detect_windows_gpu_names",
+                    return_value=["Intel(R) Iris(R) Xe Graphics"],
+                ):
+                    status = model_folder_status(root)
+
+        self.assertEqual(status["openvino-whisper"], BootstrapStatus.MISSING)
+
+    def test_intel_model_status_accepts_large_v3_turbo_int8_signature(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model_dir = root / "models" / "openvino-whisper"
+            model_dir.mkdir(parents=True)
+            write_complete_openvino_ir(model_dir)
+            (model_dir / "config.json").write_text(
+                json.dumps(
+                    {
+                        "d_model": 1280,
+                        "encoder_layers": 32,
+                        "decoder_layers": 4,
+                        "num_mel_bins": 128,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.dict(os.environ, {"LOCAL_WHISPER_GPU_TRIAL": "1"}, clear=False):
+                with patch.object(
+                    bootstrap_launcher_module,
+                    "detect_windows_gpu_names",
+                    return_value=["Intel(R) Iris(R) Xe Graphics"],
+                ):
+                    status = model_folder_status(root)
+
+        self.assertEqual(status["openvino-whisper"], BootstrapStatus.READY)
+
+    def test_intel_model_status_rejects_signature_with_only_encoder_ir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model_dir = root / "models" / "openvino-whisper"
+            model_dir.mkdir(parents=True)
+            (model_dir / "openvino_encoder_model.xml").write_text("xml", encoding="utf-8")
+            (model_dir / "openvino_encoder_model.bin").write_bytes(b"weights")
+            (model_dir / "config.json").write_text(
+                json.dumps(
+                    {
+                        "d_model": 1280,
+                        "encoder_layers": 32,
+                        "decoder_layers": 4,
+                        "num_mel_bins": 128,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.dict(os.environ, {"LOCAL_WHISPER_GPU_TRIAL": "1"}, clear=False):
+                with patch.object(
+                    bootstrap_launcher_module,
+                    "detect_windows_gpu_names",
+                    return_value=["Intel(R) Iris(R) Xe Graphics"],
+                ):
+                    status = model_folder_status(root)
+
+        self.assertEqual(status["openvino-whisper"], BootstrapStatus.MISSING)
+
+    def test_intel_model_status_rejects_partial_or_malformed_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model_dir = root / "models" / "openvino-whisper"
+            model_dir.mkdir(parents=True)
+            (model_dir / "openvino_encoder_model.xml").write_text("xml", encoding="utf-8")
+            (model_dir / "config.json").write_text("not json", encoding="utf-8")
+
+            with patch.dict(os.environ, {"LOCAL_WHISPER_GPU_TRIAL": "1"}, clear=False):
+                with patch.object(
+                    bootstrap_launcher_module,
+                    "detect_windows_gpu_names",
+                    return_value=["Intel(R) Iris(R) Xe Graphics"],
+                ):
+                    status = model_folder_status(root)
+
+        self.assertEqual(status["openvino-whisper"], BootstrapStatus.MISSING)
+
     def test_missing_model_setup_message_blocks_launch(self):
         message = missing_model_setup_message(["faster-whisper"])
 
@@ -530,6 +830,283 @@ class BootstrapLauncherTests(unittest.TestCase):
             )
 
         self.assertEqual(downloaded, [])
+        self.assertEqual(calls, [])
+
+    def test_intel_model_downloader_replaces_small_model_in_place(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "models" / "openvino-whisper"
+            target.mkdir(parents=True)
+            write_complete_openvino_ir(target, "old")
+            (target / "config.json").write_text(
+                json.dumps(
+                    {
+                        "d_model": 768,
+                        "encoder_layers": 12,
+                        "decoder_layers": 12,
+                        "num_mel_bins": 80,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (target / "small-only.txt").write_text("legacy", encoding="utf-8")
+            calls = []
+
+            def fake_download(**kwargs):
+                calls.append(kwargs)
+                staging = Path(kwargs["local_dir"])
+                write_complete_openvino_ir(staging, "turbo")
+                (staging / "config.json").write_text(
+                    json.dumps(
+                        {
+                            "d_model": 1280,
+                            "encoder_layers": 32,
+                            "decoder_layers": 4,
+                            "num_mel_bins": 128,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return str(staging)
+
+            with patch.dict(os.environ, {"LOCAL_WHISPER_GPU_TRIAL": "1"}, clear=False):
+                with patch.object(
+                    bootstrap_launcher_module,
+                    "detect_windows_gpu_names",
+                    return_value=["Intel(R) Iris(R) Xe Graphics"],
+                ), patch.object(
+                    bootstrap_launcher_module,
+                    "fetch_model_repo_size",
+                    return_value=None,
+                ):
+                    downloaded = download_default_models(root, lambda event: None, downloader=fake_download)
+
+            installed = json.loads((target / "config.json").read_text(encoding="utf-8"))
+            rollback = target.parent / ".openvino-whisper.rollback"
+            small_only_exists = (target / "small-only.txt").exists()
+            rollback_exists = rollback.exists()
+
+        self.assertEqual(downloaded, ["openvino-whisper"])
+        self.assertEqual(calls[0]["repo_id"], "OpenVINO/whisper-large-v3-turbo-int8-ov")
+        self.assertEqual(installed["decoder_layers"], 4)
+        self.assertFalse(small_only_exists)
+        self.assertFalse(rollback_exists)
+
+    def test_intel_model_downloader_skips_manually_copied_turbo_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "models" / "openvino-whisper"
+            target.mkdir(parents=True)
+            write_complete_openvino_ir(target)
+            (target / "config.json").write_text(
+                json.dumps(
+                    {
+                        "d_model": 1280,
+                        "encoder_layers": 32,
+                        "decoder_layers": 4,
+                        "num_mel_bins": 128,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            calls = []
+
+            with patch.dict(os.environ, {"LOCAL_WHISPER_GPU_TRIAL": "1"}, clear=False):
+                with patch.object(
+                    bootstrap_launcher_module,
+                    "detect_windows_gpu_names",
+                    return_value=["Intel(R) Iris(R) Xe Graphics"],
+                ):
+                    downloaded = download_default_models(
+                        root,
+                        lambda event: None,
+                        downloader=lambda **kwargs: calls.append(kwargs),
+                    )
+
+        self.assertEqual(downloaded, [])
+        self.assertEqual(calls, [])
+
+    def test_intel_model_replacement_restores_small_model_when_copy_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "models" / "openvino-whisper"
+            target.mkdir(parents=True)
+            old_config = {
+                "d_model": 768,
+                "encoder_layers": 12,
+                "decoder_layers": 12,
+                "num_mel_bins": 80,
+            }
+            write_complete_openvino_ir(target, "old")
+            (target / "config.json").write_text(json.dumps(old_config), encoding="utf-8")
+
+            def fake_download(**kwargs):
+                staging = Path(kwargs["local_dir"])
+                write_complete_openvino_ir(staging, "turbo")
+                (staging / "config.json").write_text(
+                    json.dumps(
+                        {
+                            "d_model": 1280,
+                            "encoder_layers": 32,
+                            "decoder_layers": 4,
+                            "num_mel_bins": 128,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return str(staging)
+
+            def failing_copytree(source, destination, **kwargs):
+                del source, kwargs
+                destination = Path(destination)
+                destination.mkdir(parents=True, exist_ok=True)
+                (destination / "config.json").write_text('{"decoder_layers": 4}', encoding="utf-8")
+                raise OSError("simulated copy failure")
+
+            with patch.dict(os.environ, {"LOCAL_WHISPER_GPU_TRIAL": "1"}, clear=False):
+                with patch.object(
+                    bootstrap_launcher_module,
+                    "detect_windows_gpu_names",
+                    return_value=["Intel(R) Iris(R) Xe Graphics"],
+                ), patch.object(
+                    bootstrap_launcher_module,
+                    "fetch_model_repo_size",
+                    return_value=None,
+                ), patch.object(
+                    bootstrap_launcher_module.shutil,
+                    "copytree",
+                    side_effect=failing_copytree,
+                ):
+                    with self.assertRaisesRegex(OSError, "simulated copy failure"):
+                        download_default_models(root, lambda event: None, downloader=fake_download)
+
+            restored = json.loads((target / "config.json").read_text(encoding="utf-8"))
+            rollback = target.parent / ".openvino-whisper.rollback"
+            rollback_exists = rollback.exists()
+
+        self.assertEqual(restored, old_config)
+        self.assertFalse(rollback_exists)
+
+    def test_intel_model_replacement_restores_small_model_when_verification_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "models" / "openvino-whisper"
+            target.mkdir(parents=True)
+            old_config = {
+                "d_model": 768,
+                "encoder_layers": 12,
+                "decoder_layers": 12,
+                "num_mel_bins": 80,
+            }
+            write_complete_openvino_ir(target, "old")
+            (target / "config.json").write_text(json.dumps(old_config), encoding="utf-8")
+
+            def fake_download(**kwargs):
+                staging = Path(kwargs["local_dir"])
+                write_complete_openvino_ir(staging, "turbo")
+                (staging / "config.json").write_text(
+                    json.dumps(
+                        {
+                            "d_model": 1280,
+                            "encoder_layers": 32,
+                            "decoder_layers": 4,
+                            "num_mel_bins": 128,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return str(staging)
+
+            def corrupting_copytree(source, destination, **kwargs):
+                del kwargs
+                source = Path(source)
+                destination = Path(destination)
+                destination.mkdir(parents=True)
+                for source_file in source.iterdir():
+                    if source_file.name != "openvino_detokenizer.bin":
+                        (destination / source_file.name).write_bytes(source_file.read_bytes())
+                return destination
+
+            with patch.dict(os.environ, {"LOCAL_WHISPER_GPU_TRIAL": "1"}, clear=False):
+                with patch.object(
+                    bootstrap_launcher_module,
+                    "detect_windows_gpu_names",
+                    return_value=["Intel(R) Iris(R) Xe Graphics"],
+                ), patch.object(
+                    bootstrap_launcher_module,
+                    "fetch_model_repo_size",
+                    return_value=None,
+                ), patch.object(
+                    bootstrap_launcher_module.shutil,
+                    "copytree",
+                    side_effect=corrupting_copytree,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "failed validation"):
+                        download_default_models(root, lambda event: None, downloader=fake_download)
+
+            restored = json.loads((target / "config.json").read_text(encoding="utf-8"))
+            rollback_exists = (target.parent / ".openvino-whisper.rollback").exists()
+
+        self.assertEqual(restored, old_config)
+        self.assertFalse(rollback_exists)
+
+    def test_intel_model_replacement_aborts_when_rollback_folder_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "models" / "openvino-whisper"
+            target.mkdir(parents=True)
+            write_complete_openvino_ir(target, "old")
+            (target / "config.json").write_text(
+                json.dumps(
+                    {
+                        "d_model": 768,
+                        "encoder_layers": 12,
+                        "decoder_layers": 12,
+                        "num_mel_bins": 80,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            rollback = target.parent / ".openvino-whisper.rollback"
+            rollback.mkdir()
+            (rollback / "keep.txt").write_text("recovery", encoding="utf-8")
+            calls = []
+
+            def fake_download(**kwargs):
+                calls.append(kwargs)
+                staging = Path(kwargs["local_dir"])
+                write_complete_openvino_ir(staging, "turbo")
+                (staging / "config.json").write_text(
+                    json.dumps(
+                        {
+                            "d_model": 1280,
+                            "encoder_layers": 32,
+                            "decoder_layers": 4,
+                            "num_mel_bins": 128,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return str(staging)
+
+            with patch.dict(os.environ, {"LOCAL_WHISPER_GPU_TRIAL": "1"}, clear=False):
+                with patch.object(
+                    bootstrap_launcher_module,
+                    "detect_windows_gpu_names",
+                    return_value=["Intel(R) Iris(R) Xe Graphics"],
+                ), patch.object(
+                    bootstrap_launcher_module,
+                    "fetch_model_repo_size",
+                    return_value=None,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "rollback folder already exists"):
+                        download_default_models(root, lambda event: None, downloader=fake_download)
+
+            old_model_remains = json.loads((target / "config.json").read_text(encoding="utf-8"))
+            rollback_content = (rollback / "keep.txt").read_text(encoding="utf-8")
+
+        self.assertEqual(old_model_remains["decoder_layers"], 12)
+        self.assertEqual(rollback_content, "recovery")
         self.assertEqual(calls, [])
 
     def test_model_downloader_calls_snapshot_for_missing_default_models(self):
