@@ -32,6 +32,7 @@ class StandaloneLauncherTests(unittest.TestCase):
         self.assertIn("app/bootstrap_launcher.py", files)
         self.assertIn("app/meeting_transcriber_gui.py", files)
         self.assertIn("app/transcriber_engine.py", files)
+        self.assertIn("app/file_transcriber.py", files)
         self.assertIn("app/ui_helpers.py", files)
         self.assertIn("resources/requirements.txt", files)
         self.assertIn("resources/config.template.json", files)

@@ -32,6 +32,7 @@ REQUIRED_IMPORTS: dict[str, str] = {
     "PySide6": "PySide6",
     "sounddevice": "sounddevice",
     "faster-whisper": "faster_whisper",
+    "av": "av",
     "huggingface_hub": "huggingface_hub",
     "truststore": "truststore",
 }

@@ -71,6 +71,24 @@ It creates `OfflineMeetingTranscriberGpuTrial\` beside itself. NVIDIA uses faste
 
 ## What It Does
 
+### Transcribe a saved meeting
+
+Click **Transcribe File**, choose an MP4 recording, and select where to save its
+text transcript. The picker starts in Downloads and suggests a `.txt` file beside
+the recording. Existing output files require overwrite confirmation.
+
+Transcription uses your configured local Whisper model and backend. Complete
+model and runtime setup first; processing does not download models or upload
+recordings. PyAV decodes the first audio track locally, in bounded chunks, without
+creating a WAV copy. The source recording is never modified.
+
+Progress shows processed audio time and percentage when duration is available.
+Text appears and saves incrementally. **Stop** finishes the current chunk and
+saves the partial transcript; remaining audio is skipped. Pause is unavailable
+for files. Closing the window cancels the file job and waits for safe completion.
+Live recording and file transcription cannot run together. File output selection
+does not change your live-recording output setting.
+
 - Records microphone audio locally.
 - Transcribes with `faster-whisper` on CPU using INT8 quantization.
 - Shows live continuous transcript text.

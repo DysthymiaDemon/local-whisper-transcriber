@@ -1051,33 +1051,7 @@ class MeetingTranscriberEngine:
                 self._emit_transcription_lag(active=True)
 
     def _load_whisper_model(self) -> Any:
-        _force_offline_mode()
-
-        if not Path(self.config.whisper_model_dir).exists():
-            raise FileNotFoundError(self.config.whisper_model_dir)
-        device = self.config.device.strip()
-        if device.lower().startswith("openvino"):
-            _, _, openvino_device = device.partition(":")
-            return OpenVinoWhisperModel(self.config.whisper_model_dir, openvino_device or "GPU")
-
-        from faster_whisper import WhisperModel
-
-        model_kwargs: dict[str, Any] = {
-            "device": device,
-            "compute_type": self.config.compute_type,
-            "local_files_only": True,
-        }
-        cpu_threads = effective_cpu_threads(self.config.cpu_threads, device)
-        if cpu_threads > 0:
-            model_kwargs["cpu_threads"] = cpu_threads
-        if self.config.num_workers > 0:
-            model_kwargs["num_workers"] = self.config.num_workers
-        try:
-            return WhisperModel(self.config.whisper_model_dir, **model_kwargs)
-        except TypeError:
-            fallback_kwargs = dict(model_kwargs)
-            fallback_kwargs.pop("local_files_only", None)
-            return WhisperModel(self.config.whisper_model_dir, **fallback_kwargs)
+        return load_whisper_model(self.config)
 
     def _emit(self, event_type: str, payload: dict[str, Any]) -> None:
         for handler in list(self._event_handlers):
@@ -1085,6 +1059,36 @@ class MeetingTranscriberEngine:
                 handler(event_type, payload)
             except Exception:
                 continue
+
+
+def load_whisper_model(config: EngineConfig) -> Any:
+    _force_offline_mode()
+
+    if not Path(config.whisper_model_dir).exists():
+        raise FileNotFoundError(config.whisper_model_dir)
+    device = config.device.strip()
+    if device.lower().startswith("openvino"):
+        _, _, openvino_device = device.partition(":")
+        return OpenVinoWhisperModel(config.whisper_model_dir, openvino_device or "GPU")
+
+    from faster_whisper import WhisperModel
+
+    model_kwargs: dict[str, Any] = {
+        "device": device,
+        "compute_type": config.compute_type,
+        "local_files_only": True,
+    }
+    cpu_threads = effective_cpu_threads(config.cpu_threads, device)
+    if cpu_threads > 0:
+        model_kwargs["cpu_threads"] = cpu_threads
+    if config.num_workers > 0:
+        model_kwargs["num_workers"] = config.num_workers
+    try:
+        return WhisperModel(config.whisper_model_dir, **model_kwargs)
+    except TypeError:
+        fallback_kwargs = dict(model_kwargs)
+        fallback_kwargs.pop("local_files_only", None)
+        return WhisperModel(config.whisper_model_dir, **fallback_kwargs)
 
 
 def list_input_devices() -> list[dict[str, Any]]:

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import sys
 import threading
+from pathlib import Path
 from typing import Any
+from file_transcriber import FileTranscriptionWorker
 
 from app_config import (
     append_error_log,
@@ -129,6 +131,8 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Offline Meeting Transcriber")
         self.resize(1040, 720)
         self.engine: MeetingTranscriberEngine | None = None
+        self.file_worker: FileTranscriptionWorker | None = None
+        self._close_after_file = False
         self._stopping = False
         self.bridge = EngineSignalBridge()
         self.bridge.event.connect(self._handle_engine_event)
@@ -200,6 +204,11 @@ class MainWindow(QMainWindow):
         button_row.addWidget(self.stop_button)
         button_row.addWidget(self.copy_button)
         controls_layout.addLayout(button_row)
+        self.file_button = QPushButton("Transcribe File")
+        self.file_button.clicked.connect(self._start_file_transcription)
+        controls_layout.addWidget(self.file_button)
+        self.file_progress_label = QLabel("")
+        controls_layout.addWidget(self.file_progress_label)
 
         status_row = QFormLayout()
         self.status_label = QLabel("Idle")
@@ -286,7 +295,11 @@ class MainWindow(QMainWindow):
     def _load_devices(self) -> None:
         self.device_combo.clear()
         self._output_devices_by_index = {}
-        devices = list_input_devices()
+        try:
+            devices = list_input_devices()
+        except Exception as exc:
+            devices = []
+            self._append_log(f"Audio device discovery failed; file transcription remains available: {exc}")
         if not devices:
             self.device_combo.addItem("Default input", None)
             self.system_device_combo.clear()
@@ -307,7 +320,11 @@ class MainWindow(QMainWindow):
                 pass
 
         self.system_device_combo.clear()
-        output_devices = list_output_devices()
+        try:
+            output_devices = list_output_devices()
+        except Exception as exc:
+            output_devices = []
+            self._append_log(f"Output device discovery failed: {exc}")
         if not output_devices:
             self.system_device_combo.addItem("Default output", None)
             self._update_capture_controls()
@@ -405,7 +422,7 @@ class MainWindow(QMainWindow):
         )
 
     def _start_recording(self) -> None:
-        if self._stopping:
+        if self._stopping or self.engine or self.file_worker:
             return
         config = self._read_config()
         save_portable_config(config, root=application_root())
@@ -431,6 +448,39 @@ class MainWindow(QMainWindow):
         self._stopping = False
         self._set_running(True)
 
+    def _start_file_transcription(self) -> None:
+        if self.engine or self.file_worker or self._stopping:
+            return
+        source, _ = QFileDialog.getOpenFileName(
+            self, "Select meeting recording", str(Path.home() / "Downloads"), "MP4 recordings (*.mp4)"
+        )
+        if not source:
+            return
+        output, _ = QFileDialog.getSaveFileName(
+            self, "Save transcript", str(Path(source).with_suffix(".txt")), "Text files (*.txt)"
+        )
+        if not output:
+            return
+        if Path(source).resolve() == Path(output).resolve():
+            QMessageBox.critical(self, "Invalid output", "Output must differ from the source recording.")
+            return
+        self.transcript_text.clear()
+        self.file_progress_label.setText("Preparing recording")
+        self.file_worker = FileTranscriptionWorker(
+            self._read_config(), source, output,
+            lambda event, payload: self.bridge.event.emit(event, payload),
+        )
+        self._set_running(True)
+        self.pause_button.setEnabled(False)
+        self.status_label.setText("Transcribing file")
+        try:
+            self.file_worker.start()
+        except Exception as exc:
+            self.file_worker = None
+            self._set_running(False)
+            self.status_label.setText("File transcription failed")
+            self._append_log(str(exc))
+
     def _toggle_pause(self) -> None:
         if not self.engine:
             return
@@ -442,6 +492,12 @@ class MainWindow(QMainWindow):
             self.pause_button.setText("Pause")
 
     def _stop_recording(self) -> None:
+        if self.file_worker:
+            self.file_worker.cancel()
+            self._stopping = True
+            self.stop_button.setEnabled(False)
+            self.status_label.setText("Finishing current file chunk")
+            return
         if not self.engine or self._stopping:
             return
         self._stopping = True
@@ -497,7 +553,15 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(1500, restore)
 
     def _handle_engine_event(self, event_type: str, payload: dict[str, Any]) -> None:
-        if event_type == "status":
+        if event_type == "file_progress":
+            processed, total = payload["processed"], payload["total"]
+            text = f"{processed:.1f}s processed"
+            if total:
+                text = f"{min(processed, total):.1f}s / {total:.1f}s ({min(100, processed / total * 100):.0f}%)"
+            self.file_progress_label.setText(text)
+        elif event_type == "file_finished":
+            self._finish_file_when_stopped(payload)
+        elif event_type == "status":
             self.status_label.setText(str(payload.get("message", "")))
         elif event_type == "level":
             rms = float(payload.get("rms", 0.0))
@@ -530,6 +594,19 @@ class MainWindow(QMainWindow):
         self.transcript_text.setTextCursor(cursor)
         self.transcript_text.ensureCursorVisible()
 
+    def _finish_file_when_stopped(self, payload: dict[str, Any]) -> None:
+        if self.file_worker and self.file_worker.thread and self.file_worker.thread.is_alive():
+            QTimer.singleShot(25, lambda: self._finish_file_when_stopped(payload))
+            return
+        self.file_worker = None
+        self._stopping = False
+        self._set_running(False)
+        self.status_label.setText(f"File transcription {payload['outcome']}")
+        if payload.get("output_path"):
+            self._append_log(f"Transcript saved: {payload['output_path']}")
+        if self._close_after_file:
+            self.close()
+
     def _append_log(self, message: str) -> None:
         if message:
             self.log_box.append(message)
@@ -540,6 +617,9 @@ class MainWindow(QMainWindow):
             self._update_transcription_state(running=True)
 
     def _update_transcription_state(self, running: bool) -> None:
+        if self.file_worker:
+            self.transcription_state_label.setText("Transcribing saved recording locally")
+            return
         if not running:
             self.transcription_state_label.setText("Idle, 0s behind")
             return
@@ -553,6 +633,7 @@ class MainWindow(QMainWindow):
             return f"error_log.txt (failed to write: {exc})"
 
     def _set_running(self, running: bool) -> None:
+        self.file_button.setEnabled(not running)
         self.record_button.setEnabled(not running)
         self.pause_button.setEnabled(running)
         self.stop_button.setEnabled(running)
@@ -585,6 +666,11 @@ class MainWindow(QMainWindow):
         self.status_label.setText("Stopped")
 
     def closeEvent(self, event: Any) -> None:  # pragma: no cover - GUI lifecycle
+        if self.file_worker:
+            self._close_after_file = True
+            self._stop_recording()
+            event.ignore()
+            return
         if self.engine or self._stopping:
             self.status_label.setText("Finishing transcription")
             self._append_log("Finishing transcription before closing. Wait for Stopped.")
