@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import threading
+import time
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +25,7 @@ from transcriber_engine import (
     CAPTURE_MODE_MIXED,
     list_input_devices,
     list_output_devices,
+    preload_whisper_model,
     rms_to_meter_percent,
 )
 from ui_helpers import meter_bar_geometry
@@ -185,6 +187,7 @@ class MainWindow(QMainWindow):
 
         self._load_devices()
         self._set_running(False)
+        self._start_model_preload()
         if CONFIG_LOAD_PROBLEM:
             log_path = self._write_error_log("Configuration file ignored", CONFIG_LOAD_PROBLEM)
             self._append_log(f"{CONFIG_LOAD_PROBLEM}. Using default settings. Details saved to {log_path}")
@@ -229,6 +232,11 @@ class MainWindow(QMainWindow):
         centered.addLayout(column, 6)
         centered.addStretch(1)
         layout.addLayout(centered)
+        self.model_status_label = QLabel("")
+        self.model_status_label.setObjectName("modelStatus")
+        self.model_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addSpacing(18)
+        layout.addWidget(self.model_status_label)
         layout.addStretch(3)
         # Keep keyboard access to the buttons without drawing a focus ring on one of them at start-up.
         page.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -282,6 +290,9 @@ class MainWindow(QMainWindow):
         self.record_button = QPushButton("Record")
         self.pause_button = QPushButton("Pause")
         self.stop_button = QPushButton("Stop")
+        self.record_button.setObjectName("recordButton")
+        self.pause_button.setObjectName("pauseButton")
+        self.stop_button.setObjectName("stopButton")
         self.copy_button = QPushButton("Copy")
         self.record_button.clicked.connect(self._start_recording)
         self.pause_button.clicked.connect(self._toggle_pause)
@@ -367,6 +378,33 @@ class MainWindow(QMainWindow):
         self.log_box.setMaximumHeight(120)
         root_layout.addWidget(self.log_box)
         return root
+
+    def _start_model_preload(self) -> None:
+        """Load and warm up the speech model in the background so Record starts transcribing at once."""
+        config = self._read_config()
+        model_errors = [error for error in config.validate() if "model" in error.lower()]
+        if model_errors:
+            self._set_model_status("Speech model not found. Run setup or set Advanced > Model folder.")
+            return
+        self._set_model_status("Loading speech model in the background...")
+
+        def preload() -> None:
+            started = time.monotonic()
+            try:
+                preload_whisper_model(config)
+            except Exception as exc:
+                self.bridge.event.emit("model_status", {"ready": False, "message": f"Speech model failed to load: {exc}"})
+                return
+            seconds = time.monotonic() - started
+            self.bridge.event.emit(
+                "model_status", {"ready": True, "message": f"Speech model ready ({seconds:.0f}s to load)"}
+            )
+
+        threading.Thread(target=preload, name="model-preload", daemon=True).start()
+
+    def _set_model_status(self, message: str) -> None:
+        self.model_status_label.setText(message)
+        self._append_log(message)
 
     def _toggle_advanced(self, expanded: bool) -> None:
         self.advanced_panel.setVisible(expanded)
@@ -679,6 +717,11 @@ class MainWindow(QMainWindow):
                 self._append_log(f"{message}\nError details saved to {log_path}")
         elif event_type == "log":
             self._append_log(str(payload.get("message", "")))
+        elif event_type == "model_status":
+            message = str(payload.get("message", ""))
+            self._set_model_status(message)
+            if not payload.get("ready"):
+                self._write_error_log("Speech model preload", message)
         elif event_type == "fatal":
             if self.engine and not self._stopping:
                 self._stop_recording()

@@ -395,6 +395,39 @@ class EngineConfigTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertTrue(calls[0]["local_files_only"])
 
+    def test_model_is_loaded_once_and_warmed_once(self):
+        from transcriber_engine import clear_whisper_model_cache, load_whisper_model, preload_whisper_model
+
+        self.addCleanup(clear_whisper_model_cache)
+        with tempfile.TemporaryDirectory() as tmp:
+            whisper = os.path.join(tmp, "whisper")
+            os.mkdir(whisper)
+            write_model_files(whisper)
+            created = []
+
+            class FakeWhisperModel:
+                def __init__(self, *args, **kwargs):
+                    created.append(self)
+                    self.transcribe_calls = 0
+
+                def transcribe(self, samples, **kwargs):
+                    self.transcribe_calls += 1
+                    return iter([]), None
+
+            fake_module = type(sys)("faster_whisper")
+            fake_module.WhisperModel = FakeWhisperModel
+            config = EngineConfig(whisper_model_dir=whisper, output_file=os.path.join(tmp, "out.txt"))
+
+            with patch.dict(sys.modules, {"faster_whisper": fake_module}):
+                first = preload_whisper_model(config)
+                second = preload_whisper_model(config)
+                third = load_whisper_model(config)
+
+        self.assertEqual(len(created), 1)
+        self.assertIs(first, second)
+        self.assertIs(first, third)
+        self.assertEqual(first.transcribe_calls, 1)
+
     def test_model_file_path_is_not_treated_as_model_folder(self):
         with tempfile.TemporaryDirectory() as tmp:
             model_file = os.path.join(tmp, "model.bin")

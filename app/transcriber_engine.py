@@ -1040,7 +1040,8 @@ class MeetingTranscriberEngine:
 
     def _transcription_loop(self) -> None:
         try:
-            self._emit("log", {"message": "Loading Whisper model..."})
+            if not whisper_model_is_loaded(self.config):
+                self._emit("log", {"message": "Loading Whisper model..."})
             model = self._load_whisper_model()
             self._emit("log", {"message": "Whisper model ready"})
         except Exception as exc:
@@ -1118,9 +1119,72 @@ class MeetingTranscriberEngine:
                 continue
 
 
-def load_whisper_model(config: EngineConfig) -> Any:
-    _force_offline_mode()
+_model_cache: dict[tuple[Any, ...], Any] = {}
+_warmed_models: set[tuple[Any, ...]] = set()
+_model_cache_lock = threading.Lock()
 
+
+def _model_cache_key(config: EngineConfig) -> tuple[Any, ...]:
+    device = config.device.strip()
+    return (
+        str(Path(config.whisper_model_dir).resolve()),
+        device.lower(),
+        config.compute_type,
+        effective_cpu_threads(config.cpu_threads, device),
+        config.num_workers,
+    )
+
+
+def load_whisper_model(config: EngineConfig) -> Any:
+    """Return the loaded model for this config, loading it only once per app session.
+
+    Loading distil-large-v3.5 takes about 10 seconds on a laptop CPU, so the GUI preloads it at start-up
+    and every recording or file job reuses the same instance.
+    """
+    _force_offline_mode()
+    key = _model_cache_key(config)
+    with _model_cache_lock:
+        model = _model_cache.get(key)
+        if model is None:
+            model = _create_whisper_model(config)
+            _model_cache[key] = model
+        return model
+
+
+def preload_whisper_model(config: EngineConfig) -> Any:
+    """Load the model and run one short silent transcription so the first real chunk is not slowed by warm-up."""
+    import numpy as np
+
+    model = load_whisper_model(config)
+    key = _model_cache_key(config)
+    with _model_cache_lock:
+        if key in _warmed_models:
+            return model
+    segments, _info = model.transcribe(
+        np.zeros(16_000, dtype=np.float32),
+        language=config.language,
+        vad_filter=False,
+        beam_size=1,
+        condition_on_previous_text=False,
+    )
+    list(segments)
+    with _model_cache_lock:
+        _warmed_models.add(key)
+    return model
+
+
+def whisper_model_is_loaded(config: EngineConfig) -> bool:
+    with _model_cache_lock:
+        return _model_cache_key(config) in _model_cache
+
+
+def clear_whisper_model_cache() -> None:
+    with _model_cache_lock:
+        _model_cache.clear()
+        _warmed_models.clear()
+
+
+def _create_whisper_model(config: EngineConfig) -> Any:
     if not Path(config.whisper_model_dir).is_dir():
         raise FileNotFoundError(f"Whisper model folder not found: {config.whisper_model_dir}")
     device = config.device.strip()

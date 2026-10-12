@@ -16,7 +16,9 @@ class FileGuiTests(unittest.TestCase):
         cls.application = QApplication.instance() or QApplication([])
 
     def setUp(self):
-        with patch.object(gui, "list_input_devices", side_effect=RuntimeError("no device")):
+        with patch.object(gui, "list_input_devices", side_effect=RuntimeError("no device")), patch.object(
+            gui.MainWindow, "_start_model_preload"
+        ):
             self.window = gui.MainWindow()
         self.addCleanup(self.cleanup_window)
 
@@ -156,6 +158,39 @@ class FileGuiTests(unittest.TestCase):
         for text in ("Hello team.", "Next item.", ""):
             self.window._append_transcript(row(text))
         self.assertEqual(self.window.transcript_text.toPlainText(), "Hello team. Next item.")
+
+    def test_model_preload_runs_in_background_and_reports_ready(self):
+        with patch.object(gui.EngineConfig, "validate", return_value=[]), patch.object(
+            gui, "preload_whisper_model"
+        ) as preload:
+            self.window._start_model_preload()
+            for _ in range(100):
+                self.application.processEvents()
+                if "ready" in self.window.model_status_label.text():
+                    break
+                import time
+
+                time.sleep(0.01)
+        preload.assert_called_once()
+        self.assertIn("Speech model ready", self.window.model_status_label.text())
+
+    def test_model_preload_is_skipped_when_model_folder_is_missing(self):
+        with patch.object(
+            gui.EngineConfig, "validate", return_value=["Whisper model path does not exist: C:/missing"]
+        ), patch.object(gui, "preload_whisper_model") as preload:
+            self.window._start_model_preload()
+        preload.assert_not_called()
+        self.assertIn("not found", self.window.model_status_label.text())
+
+    def test_record_pause_stop_have_their_own_colours(self):
+        self.assertEqual(
+            [self.window.record_button.objectName(), self.window.pause_button.objectName(), self.window.stop_button.objectName()],
+            ["recordButton", "pauseButton", "stopButton"],
+        )
+        from ui_theme import APP_STYLESHEET
+
+        for name in ("recordButton", "pauseButton", "stopButton"):
+            self.assertIn(f"QPushButton#{name} {{", APP_STYLESHEET)
 
     def test_close_requests_cancel_and_waits(self):
         worker = self.start_file()

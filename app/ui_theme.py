@@ -24,6 +24,18 @@ BUTTON_HOVER_TEXT = "#FFFFFF"
 DISABLED_BACKGROUND = "#EEF2F6"
 DISABLED_TEXT = "#9AA8B8"
 RECORD_RED = "#D93025"
+RECORD_LIGHT = "#D4F5D4"
+RECORD_BORDER = "#A8DDA8"
+RECORD_TEXT = "#1E5631"
+RECORD_DARK = "#2E7D32"
+PAUSE_LIGHT = "#FFF4C2"
+PAUSE_BORDER = "#EED98A"
+PAUSE_TEXT = "#6B5300"
+PAUSE_DARK = "#B98900"
+STOP_LIGHT = "#FFD9D9"
+STOP_BORDER = "#F0AEAE"
+STOP_TEXT = "#7A1C1C"
+STOP_DARK = "#C62828"
 TITLE_BLUE = "#24508F"
 CARD_BORDER = "#C9DAEC"
 
@@ -76,6 +88,70 @@ QPushButton#homeAction:hover, QPushButton#homeAction:pressed {{
     background: {BUTTON_HOVER};
     border-color: {BUTTON_HOVER};
     color: {BUTTON_HOVER_TEXT};
+}}
+QPushButton#recordButton {{
+    background: {RECORD_LIGHT};
+    border-color: {RECORD_BORDER};
+    color: {RECORD_TEXT};
+}}
+QPushButton#recordButton:hover, QPushButton#recordButton:pressed {{
+    background: {RECORD_DARK};
+    border-color: {RECORD_DARK};
+    color: #FFFFFF;
+}}
+QPushButton#recordButton:disabled {{
+    background: #EEF6EE;
+    border-color: #EEF6EE;
+    color: #A9BFA9;
+}}
+QPushButton#pauseButton {{
+    background: {PAUSE_LIGHT};
+    border-color: {PAUSE_BORDER};
+    color: {PAUSE_TEXT};
+}}
+QPushButton#pauseButton:hover, QPushButton#pauseButton:pressed {{
+    background: {PAUSE_DARK};
+    border-color: {PAUSE_DARK};
+    color: #FFFFFF;
+}}
+QPushButton#pauseButton:disabled {{
+    background: #FBF7E8;
+    border-color: #FBF7E8;
+    color: #C4B98F;
+}}
+QPushButton#stopButton {{
+    background: {STOP_LIGHT};
+    border-color: {STOP_BORDER};
+    color: {STOP_TEXT};
+}}
+QPushButton#stopButton:hover, QPushButton#stopButton:pressed {{
+    background: {STOP_DARK};
+    border-color: {STOP_DARK};
+    color: #FFFFFF;
+}}
+QPushButton#stopButton:disabled {{
+    background: #FBEEEE;
+    border-color: #FBEEEE;
+    color: #CDA4A4;
+}}
+QCheckBox::indicator {{
+    width: 15px;
+    height: 15px;
+    border: 1px solid {BUTTON_BORDER};
+    border-radius: 4px;
+    background: #FFFFFF;
+}}
+QCheckBox::indicator:checked {{
+    background: {BUTTON_HOVER};
+    border-color: {BUTTON_HOVER};
+}}
+QCheckBox::indicator:disabled {{
+    background: {DISABLED_BACKGROUND};
+    border-color: {DISABLED_BACKGROUND};
+}}
+QLabel#modelStatus {{
+    color: #5B6F86;
+    font-size: 10pt;
 }}
 QGroupBox {{
     background: #FFFFFF;
