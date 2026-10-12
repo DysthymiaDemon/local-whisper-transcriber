@@ -56,6 +56,66 @@ from bootstrap_launcher import (
 )
 
 
+RESOURCES = Path(__file__).resolve().parents[1] / "resources"
+
+
+def read_requirement_lines(path: Path) -> list[str]:
+    lines = [line.strip() for line in path.read_text(encoding="utf-8").splitlines()]
+    return [line for line in lines if line and not line.startswith("#")]
+
+
+def read_lock(path: Path) -> dict[str, tuple[str, str]]:
+    """{normalized name: (version, hash)} from a lock file; fails on any unpinned or unhashed line."""
+    import re
+
+    locked = {}
+    for line in read_requirement_lines(path):
+        match = re.fullmatch(r"([a-z0-9-]+)==([^\s]+) --hash=sha256:([0-9a-f]{64})", line)
+        if match is None:
+            raise AssertionError(f"Lock line is not pinned and hashed: {line}")
+        locked[match.group(1)] = (match.group(2), match.group(3))
+    return locked
+
+
+class RequirementLockTests(unittest.TestCase):
+    def test_every_locked_package_is_pinned_and_hashed(self):
+        for name in ("requirements.lock.txt", "requirements-openvino.lock.txt"):
+            with self.subTest(lock=name):
+                self.assertTrue(read_lock(RESOURCES / name))
+
+    def test_locks_cover_every_direct_requirement_at_the_same_version(self):
+        import re
+
+        for source, lock in (
+            ("requirements.txt", "requirements.lock.txt"),
+            ("requirements-openvino.txt", "requirements-openvino.lock.txt"),
+        ):
+            locked = read_lock(RESOURCES / lock)
+            for line in read_requirement_lines(RESOURCES / source):
+                name, version = line.split("==")
+                with self.subTest(requirement=line):
+                    self.assertEqual(locked[re.sub(r"[-_.]+", "-", name).lower()][0], version)
+
+    def test_openvino_lock_does_not_repeat_or_change_base_packages(self):
+        base = read_lock(RESOURCES / "requirements.lock.txt")
+        openvino = read_lock(RESOURCES / "requirements-openvino.lock.txt")
+
+        self.assertFalse(set(base) & set(openvino))
+
+    def test_lock_paths_follow_the_active_backend(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cpu = bootstrap_launcher_module.pip_requirement_paths(root, RESOURCES.parent)
+            with intel_backend():
+                intel = bootstrap_launcher_module.pip_requirement_paths(root, RESOURCES.parent)
+
+        self.assertEqual([path.name for path in cpu], ["requirements.lock.txt"])
+        self.assertEqual(
+            [path.name for path in intel], ["requirements.lock.txt", "requirements-openvino.lock.txt"]
+        )
+        self.assertTrue(all(path.is_file() for path in intel))
+
+
 @contextmanager
 def intel_backend():
     """Select the Intel OpenVINO backend for this setup run, as run_bootstrap does on an Intel laptop."""
@@ -181,8 +241,10 @@ class DefaultBackendTests(unittest.TestCase):
 
     def test_openvino_packages_come_from_pypi_pinned(self):
         intel = bootstrap_launcher_module.INTEL_OPENVINO_BACKEND
-        self.assertFalse(any(line.startswith("--") for line in intel.requirements))
-        self.assertTrue(all("==" in line for line in intel.requirements))
+        lines = read_requirement_lines(RESOURCES / intel.requirements_file)
+        self.assertTrue(lines)
+        self.assertFalse(any(line.startswith("--") for line in lines))
+        self.assertTrue(all("==" in line for line in lines))
 
     def test_display_adapters_come_from_win32_api(self):
         class FakeUser32:
@@ -407,9 +469,10 @@ class BootstrapLauncherTests(unittest.TestCase):
         self.assertEqual(intel.config_overrides["compute_type"], "int8")
         self.assertEqual(intel.config_overrides["chunk_seconds"], 10.0)
         self.assertEqual(intel.config_overrides["overlap_seconds"], 1.0)
-        self.assertIn("openvino==2026.4.1", intel.requirements)
-        self.assertIn("openvino-tokenizers==2026.4.1.0", intel.requirements)
-        self.assertIn("openvino-genai==2026.4.1.0", intel.requirements)
+        requirements = read_requirement_lines(RESOURCES / intel.requirements_file)
+        self.assertIn("openvino==2026.4.1", requirements)
+        self.assertIn("openvino-tokenizers==2026.4.1.0", requirements)
+        self.assertIn("openvino-genai==2026.4.1.0", requirements)
 
     def test_openvino_imports_are_required_only_on_the_intel_backend(self):
         cpu_imports = bootstrap_launcher_module.runtime_required_imports()
@@ -484,10 +547,7 @@ class BootstrapLauncherTests(unittest.TestCase):
                     config_path = ensure_portable_layout(root)
 
             config = json.loads(config_path.read_text(encoding="utf-8"))
-            requirements = local_runtime_dir(root) / "backend-requirements.txt"
-            self.assertTrue(requirements.is_file())
             self.assertFalse((root / "gpu_trial_report.txt").exists())
-            requirements_content = requirements.read_text(encoding="utf-8")
             guide_content = (
                 root / "models" / "openvino-whisper" / "README_MODEL_FILES.txt"
             ).read_text(encoding="utf-8")
@@ -497,7 +557,6 @@ class BootstrapLauncherTests(unittest.TestCase):
             self.assertEqual(config["compute_type"], "int8")
             self.assertEqual(config["chunk_seconds"], 10.0)
             self.assertEqual(config["overlap_seconds"], 1.0)
-            self.assertIn("openvino-genai==2026.4.1.0", requirements_content)
             self.assertIn("828 MB", guide_content)
             self.assertIn("OpenVINO 2026.1", guide_content)
             self.assertIn("in place", guide_content)
@@ -754,6 +813,10 @@ class BootstrapLauncherTests(unittest.TestCase):
             self.assertIn("--target", captured["cmd"])
             self.assertIn(str(root / ".runtime" / "site-packages"), captured["cmd"])
             self.assertNotIn("venv", captured["cmd"])
+            for flag in ("--require-hashes", "--only-binary=:all:", "--no-deps"):
+                self.assertIn(flag, captured["cmd"])
+            requirement_args = [captured["cmd"][i + 1] for i, item in enumerate(captured["cmd"]) if item == "-r"]
+            self.assertEqual(requirement_args, [str(resources / "requirements.lock.txt")])
 
     def test_run_pip_install_adds_backend_requirements_for_intel(self):
         from bootstrap_launcher import run_pip_install
@@ -791,7 +854,8 @@ class BootstrapLauncherTests(unittest.TestCase):
 
         self.assertEqual(result.code, 0)
         self.assertEqual(len(requirement_args), 2)
-        self.assertTrue(requirement_args[-1].endswith("backend-requirements.txt"))
+        self.assertTrue(requirement_args[0].endswith("requirements.lock.txt"))
+        self.assertTrue(requirement_args[-1].endswith("requirements-openvino.lock.txt"))
 
     def test_windows_cpu_limit_uses_job_object_hard_cap_at_25_percent(self):
         calls = []

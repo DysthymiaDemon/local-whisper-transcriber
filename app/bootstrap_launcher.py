@@ -79,6 +79,7 @@ APP_PUBLISHER = "Ameen Khan"
 APP_VERSION = "local"
 INSTALL_DISK_SPACE_ESTIMATE = "~2.9 GB"
 MODEL_SOURCE_FILE = "MODEL_SOURCE.json"
+BASE_REQUIREMENTS_FILE = "requirements.txt"
 FASTER_WHISPER_ALLOW_PATTERNS = (
     "model.bin",
     "config.json",
@@ -196,7 +197,7 @@ class ModelDownloadSpec:
 class SpeechBackend:
     key: str
     label: str
-    requirements: tuple[str, ...] = ()
+    requirements_file: str = ""
     imports: Mapping[str, str] | None = None
     minimum_versions: Mapping[str, str] | None = None
     model_downloads: tuple[ModelDownloadSpec, ...] = ()
@@ -238,11 +239,7 @@ CPU_BACKEND = SpeechBackend(
 INTEL_OPENVINO_BACKEND = SpeechBackend(
     key="intel-openvino",
     label="Intel OpenVINO WhisperPipeline",
-    requirements=(
-        "openvino==2026.4.1",
-        "openvino-tokenizers==2026.4.1.0",
-        "openvino-genai==2026.4.1.0",
-    ),
+    requirements_file="requirements-openvino.txt",
     imports={
         "openvino": "openvino",
         "openvino-genai": "openvino_genai",
@@ -303,18 +300,30 @@ def setup_model_size_hint() -> str:
     return "Estimated model download: " + (" + ".join(sizes) if sizes else "shown when download starts")
 
 
+def requirement_input_paths(package_root: Path | None = None) -> list[Path]:
+    """Human-edited requirement files for this install: the base list plus the active backend's list."""
+    resources = resource_root(package_root or installer_source_root())
+    paths = [resources / BASE_REQUIREMENTS_FILE]
+    backend = active_backend()
+    if backend.requirements_file:
+        paths.append(resources / backend.requirements_file)
+    return paths
+
+
+def requirement_lock_path(requirements_path: Path) -> Path:
+    """requirements.txt -> requirements.lock.txt, written by packaging/lock_requirements.py."""
+    return requirements_path.with_name(requirements_path.stem + ".lock.txt")
+
+
 def setup_package_list(package_root: Path | None = None) -> list[str]:
-    package_root = package_root or installer_source_root()
-    requirements_path = resource_root(package_root) / "requirements.txt"
-    if not requirements_path.exists():
-        return ["Python package requirements"]
     packages: list[str] = []
-    for raw_line in requirements_path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if line and not line.startswith("#"):
-            packages.append(line)
-    if backend_active():
-        packages.extend(line for line in active_backend().requirements if not line.startswith("--"))
+    for requirements_path in requirement_input_paths(package_root):
+        if not requirements_path.exists():
+            continue
+        for raw_line in requirements_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if line and not line.startswith(("#", "-")):
+                packages.append(line)
     return packages or ["Python package requirements"]
 
 
@@ -503,24 +512,33 @@ def active_model_dirs() -> tuple[str, ...]:
     return tuple(names)
 
 
-def write_backend_requirements(root: Path, backend: SpeechBackend | None = None) -> Path | None:
-    backend = backend or active_backend()
-    if not backend.requirements:
-        return None
-    requirements_path = local_runtime_dir(root) / "backend-requirements.txt"
-    requirements_path.parent.mkdir(parents=True, exist_ok=True)
-    requirements_path.write_text("\n".join(backend.requirements) + "\n", encoding="utf-8")
-    return requirements_path
-
-
 def pip_requirement_paths(root: Path, package_root: Path | None = None) -> list[Path]:
-    package_root = package_root or installer_source_root()
-    paths = [resource_root(package_root) / "requirements.txt"]
-    if backend_active():
-        extra_path = write_backend_requirements(root)
-        if extra_path is not None:
-            paths.append(extra_path)
-    return paths
+    """Hash-locked files pip installs from. Every package, including transitive ones, is pinned and hashed."""
+    del root
+    return [requirement_lock_path(path) for path in requirement_input_paths(package_root)]
+
+
+def pip_install_command(root: Path, package_root: Path | None = None) -> list[str]:
+    cmd = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--no-cache-dir",
+        "--progress-bar",
+        "on",
+        "--upgrade",
+        # Supply-chain guard: only the exact wheels recorded in the lock files, nothing built from source,
+        # and no dependency resolution beyond the lock.
+        "--require-hashes",
+        "--only-binary=:all:",
+        "--no-deps",
+        "--target",
+        str(local_package_dir(root)),
+    ]
+    for requirements_path in pip_requirement_paths(root, package_root):
+        cmd.extend(["-r", str(requirements_path)])
+    return cmd
 
 
 def format_duration(seconds: float | None) -> str:
@@ -1290,7 +1308,6 @@ def ensure_portable_layout(root: Path, template_root: Path | None = None) -> Pat
         created_config = True
     if backend_active():
         backend = active_backend()
-        write_backend_requirements(root, backend)
         if created_config:
             # Fresh install on an Intel GPU laptop: start on the GPU model straight away.
             apply_backend_config(config_path, backend)
@@ -1984,23 +2001,8 @@ def terminate_active_pip() -> None:
 
 def run_pip_install(root: Path, on_event, package_root: Path | None = None) -> PipInstallResult:
     package_root = package_root or installer_source_root()
-    requirements_paths = pip_requirement_paths(root, package_root)
-    package_dir = local_package_dir(root)
-    package_dir.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        sys.executable,
-        "-m",
-        "pip",
-        "install",
-        "--no-cache-dir",
-        "--progress-bar",
-        "on",
-        "--upgrade",
-        "--target",
-        str(package_dir),
-    ]
-    for requirements_path in requirements_paths:
-        cmd.extend(["-r", str(requirements_path)])
+    local_package_dir(root).mkdir(parents=True, exist_ok=True)
+    cmd = pip_install_command(root, package_root)
     command = subprocess.list2cmdline(cmd)
     on_event(PipProgressEvent("Running command", command, 0, command))
     process = subprocess.Popen(
@@ -2974,25 +2976,7 @@ def run_bootstrap() -> int:
                     package_word = "package" if len(missing) == 1 else "packages"
                     set_step(BOOTSTRAP_STEPS[2], StepState.DONE, f"{len(missing)} {package_word} to install", 100)
                     set_step(BOOTSTRAP_STEPS[3], StepState.RUNNING, "Installing missing packages", 0)
-                    command = subprocess.list2cmdline(
-                        [
-                            sys.executable,
-                            "-m",
-                            "pip",
-                            "install",
-                            "--no-cache-dir",
-                            "--progress-bar",
-                            "on",
-                            "--upgrade",
-                            "--target",
-                            str(local_package_dir(root)),
-                        ]
-                        + [
-                            part
-                            for requirements_path in pip_requirement_paths(root, package_root)
-                            for part in ("-r", str(requirements_path))
-                        ]
-                    )
+                    command = subprocess.list2cmdline(pip_install_command(root, package_root))
 
                     def show_command() -> None:
                         set_command_text("Running command:\n" + command)
