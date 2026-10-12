@@ -485,33 +485,109 @@ def transcription_segment_is_usable(segment: Any, text: str) -> bool:
     return True
 
 
+OPENVINO_CACHE_DIR_NAME = ".ov_cache"
+
+
+def _transcript_segment(text: str, start: float, end: float) -> SimpleNamespace:
+    return SimpleNamespace(
+        text=text,
+        start=start,
+        end=end,
+        no_speech_prob=None,
+        avg_logprob=None,
+        compression_ratio=None,
+    )
+
+
+SENTENCE_ENDINGS = (".", "?", "!")
+MERGE_GAP_SECONDS = 1.0
+MERGE_MAX_WORDS = 30
+
+
+def merge_timestamped_pieces(pieces: list[tuple[str, float, float]]) -> list[SimpleNamespace]:
+    """Join OpenVINO's word-level timestamp chunks into sentence-sized transcript rows.
+
+    A row ends at sentence punctuation, at a pause longer than MERGE_GAP_SECONDS, or after MERGE_MAX_WORDS words.
+    """
+    rows: list[SimpleNamespace] = []
+    words: list[str] = []
+    row_start = row_end = 0.0
+    for text, start, end in pieces:
+        if words and (start - row_end > MERGE_GAP_SECONDS or len(words) >= MERGE_MAX_WORDS):
+            rows.append(_transcript_segment(" ".join(words), row_start, row_end))
+            words = []
+        if not words:
+            row_start = start
+        words.append(text)
+        row_end = end
+        if text.endswith(SENTENCE_ENDINGS):
+            rows.append(_transcript_segment(" ".join(words), row_start, row_end))
+            words = []
+    if words:
+        rows.append(_transcript_segment(" ".join(words), row_start, row_end))
+    return rows
+
+
 class OpenVinoWhisperModel:
-    def __init__(self, model_dir: str, device: str):
+    """OpenVINO GenAI Whisper on the Intel GPU, falling back to the OpenVINO CPU device with the same model."""
+
+    def __init__(self, model_dir: str, device: str, language: Optional[str] = "en"):
         import openvino_genai as ov_genai
 
         self.model_dir = model_dir
+        self.language = language
         self.device = device
-        self.pipeline = ov_genai.WhisperPipeline(model_dir, device)
+        self.fallback_reason = ""
+        try:
+            self.pipeline = self._create_pipeline(ov_genai, model_dir, device)
+        except Exception as exc:
+            if device.upper() == "CPU":
+                raise
+            self.fallback_reason = f"OpenVINO {device} unavailable ({exc}); using the CPU instead."
+            self.device = "CPU"
+            self.pipeline = self._create_pipeline(ov_genai, model_dir, "CPU")
+
+    @staticmethod
+    def _create_pipeline(ov_genai: Any, model_dir: str, device: str) -> Any:
+        # Compiling the model for the GPU takes about 30 seconds; the cache makes later starts much faster.
+        cache_dir = Path(model_dir) / OPENVINO_CACHE_DIR_NAME
+        try:
+            cache_dir.mkdir(exist_ok=True)
+            return ov_genai.WhisperPipeline(model_dir, device, CACHE_DIR=str(cache_dir))
+        except (TypeError, OSError):
+            return ov_genai.WhisperPipeline(model_dir, device)
 
     def transcribe(self, samples: Any, **kwargs: Any) -> tuple[list[Any], Any]:
-        del kwargs
-        text = str(self.pipeline.generate(samples)).strip()
-        if not text:
-            return [], None
-        duration = 0.0
+        language = kwargs.get("language", self.language)
+        options: dict[str, Any] = {"task": "transcribe", "return_timestamps": True}
+        if language:
+            # large-v3-turbo is multilingual; pinning the language stops drift into other languages.
+            options["language"] = f"<|{language}|>"
+        try:
+            result = self.pipeline.generate(samples, **options)
+        except (TypeError, RuntimeError):
+            result = self.pipeline.generate(samples)
         try:
             duration = len(samples) / 16000.0
         except Exception:
             duration = 0.0
-        segment = SimpleNamespace(
-            text=text,
-            start=0.0,
-            end=duration,
-            no_speech_prob=None,
-            avg_logprob=None,
-            compression_ratio=None,
-        )
-        return [segment], None
+
+        pieces = []
+        for chunk in getattr(result, "chunks", None) or []:
+            text = str(getattr(chunk, "text", "")).strip()
+            if not text:
+                continue
+            start = float(getattr(chunk, "start_ts", 0.0) or 0.0)
+            end = float(getattr(chunk, "end_ts", -1.0))
+            pieces.append((text, start, end if end >= 0 else duration))
+        if pieces:
+            return merge_timestamped_pieces(pieces), None
+
+        texts = getattr(result, "texts", None)
+        text = (str(texts[0]) if texts else str(result)).strip()
+        if not text:
+            return [], None
+        return [_transcript_segment(text, 0.0, duration)], None
 
 
 class AtomicTranscriptWriter:
@@ -1190,7 +1266,7 @@ def _create_whisper_model(config: EngineConfig) -> Any:
     device = config.device.strip()
     if device.lower().startswith("openvino"):
         _, _, openvino_device = device.partition(":")
-        return OpenVinoWhisperModel(config.whisper_model_dir, openvino_device or "GPU")
+        return OpenVinoWhisperModel(config.whisper_model_dir, openvino_device or "GPU", config.language)
 
     from faster_whisper import WhisperModel
 

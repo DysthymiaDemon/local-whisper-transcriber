@@ -588,6 +588,85 @@ class EngineConfigTests(unittest.TestCase):
         self.assertEqual(segments[0].text, "hello")
 
 
+class OpenVinoWrapperTests(unittest.TestCase):
+    def make_module(self, pipeline_class):
+        module = type(sys)("openvino_genai")
+        module.WhisperPipeline = pipeline_class
+        return module
+
+    def test_gpu_failure_falls_back_to_openvino_cpu(self):
+        from transcriber_engine import OpenVinoWhisperModel
+
+        devices = []
+
+        class Pipeline:
+            def __init__(self, path, device, **kwargs):
+                devices.append(device)
+                if device == "GPU":
+                    raise RuntimeError("GPU plugin failed")
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(sys.modules, {"openvino_genai": self.make_module(Pipeline)}):
+            model = OpenVinoWhisperModel(tmp, "GPU")
+
+        self.assertEqual(devices, ["GPU", "CPU"])
+        self.assertEqual(model.device, "CPU")
+        self.assertIn("GPU plugin failed", model.fallback_reason)
+
+    def test_timestamped_chunks_become_segments_and_language_is_pinned(self):
+        from types import SimpleNamespace
+        from transcriber_engine import OpenVinoWhisperModel
+
+        options = {}
+
+        class Pipeline:
+            def __init__(self, path, device, **kwargs):
+                self.kwargs = kwargs
+
+            def generate(self, samples, **kwargs):
+                options.update(kwargs)
+                return SimpleNamespace(
+                    chunks=[
+                        SimpleNamespace(text=" Hello team. ", start_ts=0.4, end_ts=2.0),
+                        SimpleNamespace(text="Next item.", start_ts=2.5, end_ts=-1.0),
+                    ],
+                    texts=["Hello team. Next item."],
+                )
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(sys.modules, {"openvino_genai": self.make_module(Pipeline)}):
+            model = OpenVinoWhisperModel(tmp, "GPU", "en")
+            cache_requested = "CACHE_DIR" in model.pipeline.kwargs
+            segments, _ = model.transcribe([0.0] * 16000 * 4)
+
+        self.assertTrue(cache_requested)
+        self.assertEqual(options["language"], "<|en|>")
+        self.assertTrue(options["return_timestamps"])
+        self.assertEqual([(s.text, s.start, s.end) for s in segments], [("Hello team.", 0.4, 2.0), ("Next item.", 2.5, 4.0)])
+
+    def test_word_level_chunks_merge_into_sentences(self):
+        from transcriber_engine import merge_timestamped_pieces
+
+        rows = merge_timestamped_pieces(
+            [
+                ("Maybe", 2.08, 2.56),
+                ("we'll start", 2.56, 3.80),
+                ("it now.", 3.80, 4.10),
+                ("Marketing", 4.62, 5.04),
+                ("is live", 5.04, 5.32),
+                ("Don't kill", 7.74, 9.66),
+                ("yourself.", 9.66, 10.0),
+            ]
+        )
+
+        self.assertEqual(
+            [(row.text, row.start, row.end) for row in rows],
+            [
+                ("Maybe we'll start it now.", 2.08, 4.10),
+                ("Marketing is live", 4.62, 5.32),
+                ("Don't kill yourself.", 7.74, 10.0),
+            ],
+        )
+
+
 class TranscriptionBacklogTests(unittest.TestCase):
     def test_audio_chunk_duration_uses_sample_count_and_rate(self):
         chunk = AudioChunk(1, 0.0, [0.0] * 32000, 16000)

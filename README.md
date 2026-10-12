@@ -16,7 +16,7 @@ You need Python 3.12 (64-bit). On a managed laptop, install it from the company 
 1. Copy `Open Offline Meeting Transcriber.pyw` to a folder of your choice.
 2. Double-click it. It creates an `OfflineMeetingTranscriber` folder next to itself.
 3. The setup window lists what it will install. Click **Install**.
-4. Setup installs the Python packages and downloads the speech model (about 1.5 GB). This is the only step that uses the internet.
+4. Setup installs the Python packages and downloads the speech model: 828 MB on Intel GPU laptops, 1.5 GB otherwise. This is the only step that uses the internet.
 5. When setup finishes, Meeting Scribe opens. Later launches open it straight away.
 
 ## Using the app
@@ -50,28 +50,56 @@ Transcript lines look like this:
 
 The **Advanced** section in the recording window holds the model folder and the transcript file name. Most people never need to change them.
 
-## Speech model
+## Speech engine
 
-The default model is [`distil-whisper/distil-large-v3.5-ct2`](https://huggingface.co/distil-whisper/distil-large-v3.5). It is English-only, MIT-licensed and about 1.5 GB. It is as accurate as Whisper large-v3 (7.1% average word error rate on short-form audio) but much faster, so it runs on a laptop CPU.
+Meeting Scribe picks the speech engine for the laptop when setup runs.
 
-The model folder must contain:
+| Laptop | Engine | Model | Download |
+|---|---|---|---|
+| Intel GPU (Iris Xe, Arc) | OpenVINO on the GPU | [`OpenVINO/whisper-large-v3-turbo-int8-ov`](https://huggingface.co/OpenVINO/whisper-large-v3-turbo-int8-ov) | 828 MB model plus OpenVINO packages |
+| Anything else | faster-whisper on the CPU | [`distil-whisper/distil-large-v3.5-ct2`](https://huggingface.co/distil-whisper/distil-large-v3.5) | 1.5 GB model |
 
-- `model.bin`
-- `config.json`
-- `tokenizer.json`
-- `vocabulary.json` or `vocabulary.txt`
-- `preprocessor_config.json` (required for this model, which uses 128 mel bins)
+Results on the target i5-1345U laptop with the 15-minute Security Data Platform recording:
 
-The app refuses to load an incomplete folder, because faster-whisper would otherwise try to download a missing tokenizer from the internet.
+| | Intel GPU (large-v3-turbo) | CPU (distil-large-v3.5) |
+|---|---|---|
+| Whole recording | 107 s | 346 s |
+| Live chunk | about 3 s per 10 s chunk | about 9 s per 15 s chunk |
+| Live chunk size | 10 s with 1 s overlap | 15 s with 1.5 s overlap |
+| Text delay while recording | about 13 s | about 15 to 25 s |
 
-Live recording works in 15-second chunks with 1.5 seconds of overlap, so text appears about 15 to 25 seconds behind speech. Whisper pads every chunk to 30 seconds, so each chunk takes about 9 seconds on an i5-1345U laptop CPU, whatever its length. With 10-second chunks the app could not keep up; 15-second chunks leave about 4 seconds of headroom. Saved recordings use 28-second windows. A 15-minute meeting takes about 6 minutes to transcribe.
+The GPU engine was also more accurate on that meeting, with better punctuation and names. It leaves the CPU free for Teams.
 
-### Upgrading from the older model
+Whisper pads every chunk to 30 seconds, so a chunk costs about the same whatever its length. That is why the CPU engine needs longer chunks to keep up.
 
-Earlier versions used `Systran/faster-whisper-small.en`. When you launch the new version, setup offers **Upgrade speech model?**:
+### Start-up
 
-- **Install** downloads the new model once and replaces the old one. If anything fails, the old model is restored.
-- **Use current model** opens the app with the model you already have. Setup asks again on the next launch.
+The app loads the speech model in the background as soon as it opens. The home screen shows "Speech model ready" when it is done, so Record starts transcribing at once.
+
+The first start on the GPU compiles the model, which takes about 30 seconds. The compiled model is cached in `models\openvino-whisper\.ov_cache`, so later starts take a few seconds.
+
+If the GPU driver fails, the OpenVINO engine runs the same model on the CPU, and the home screen says so.
+
+To force the CPU engine on an Intel laptop, set the environment variable `LOCAL_WHISPER_FORCE_CPU=1` before setup.
+
+### Required model files
+
+Setup checks that the model folder is complete. The app never loads a partial folder, because faster-whisper would otherwise download a missing tokenizer from the internet.
+
+- **CPU model:** `model.bin`, `config.json`, `tokenizer.json`, `vocabulary.json` or `vocabulary.txt`, and `preprocessor_config.json`.
+- **GPU model:** the OpenVINO encoder, decoder, tokenizer and detokenizer `.xml` and `.bin` files.
+
+### Upgrading an existing install
+
+When you launch the new version on an existing install, setup can show one of two prompts:
+
+- **Use your Intel GPU?** appears on Intel laptops still on the CPU engine.
+- **Upgrade speech model?** appears on other laptops still on the older `Systran/faster-whisper-small.en`.
+
+Both prompts offer the same two choices:
+
+- **Install** downloads the new engine or model once, then switches. If a model download fails, the old model is restored.
+- **Use current model** opens the app with what you have, fully offline. Setup asks again on the next launch.
 
 If you set your own model folder in `config.json`, it is never replaced.
 
@@ -79,7 +107,7 @@ If you set your own model folder in `config.json`, it is never replaced.
 
 | Phase | Network use |
 |---|---|
-| Setup, after you click **Install** | `pip` downloads the packages in `resources\requirements.txt`. Hugging Face downloads the speech model with no login token. |
+| Setup, after you click **Install** | `pip` downloads the packages in `resources\requirements.txt`, plus pinned OpenVINO packages from PyPI on Intel GPU laptops. Hugging Face downloads the speech model with no login token. |
 | Setup window open, before **Install** | None. |
 | Running the app | None. |
 
@@ -116,9 +144,9 @@ When something fails, check `error_log.txt`. It records the error and the file p
 
 ## GPU trial
 
-`Open Offline Meeting Transcriber GPU Trial.pyw` is a separate launcher for testing GPU acceleration. It uses its own `OfflineMeetingTranscriberGpuTrial` folder.
+`Open Offline Meeting Transcriber GPU Trial.pyw` is a separate launcher for testing other GPUs. It uses its own `OfflineMeetingTranscriberGpuTrial` folder. Intel GPUs no longer need it, because the main launcher uses them by default.
 
-- **Intel GPUs** use OpenVINO GenAI 2026.1 or newer with the 828 MB `OpenVINO/whisper-large-v3-turbo-int8-ov` model.
+- **Intel GPUs** use the same OpenVINO engine as the main launcher.
 - **NVIDIA GPUs** use the default model through CUDA, if CUDA and cuDNN are installed.
 - **AMD GPUs** only install the DirectML runtime for probing. The transcription engine does not use it yet.
 

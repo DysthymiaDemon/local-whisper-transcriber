@@ -156,6 +156,72 @@ class ModelUpgradeTests(unittest.TestCase):
         self.assertEqual(status["faster-whisper"], BootstrapStatus.MISSING)
 
 
+class DefaultBackendTests(unittest.TestCase):
+    def setUp(self):
+        self.addCleanup(bootstrap_launcher_module.set_install_backend, None)
+
+    def test_intel_gpu_is_default_and_others_stay_on_cpu(self):
+        choose = bootstrap_launcher_module.choose_default_backend
+        none = bootstrap_launcher_module.GPU_TRIAL_BACKEND_NONE
+        with patch.dict(os.environ, {"LOCAL_WHISPER_FORCE_CPU": ""}):
+            self.assertEqual(choose([GpuVendor.INTEL]).key, "intel-openvino")
+            self.assertIs(choose([GpuVendor.NVIDIA]), none)
+            self.assertIs(choose([]), none)
+        with patch.dict(os.environ, {"LOCAL_WHISPER_FORCE_CPU": "1"}):
+            self.assertIs(choose([GpuVendor.INTEL]), none)
+
+    def test_openvino_packages_come_from_pypi_pinned(self):
+        intel = bootstrap_launcher_module.GPU_TRIAL_BACKENDS[GpuVendor.INTEL]
+        self.assertFalse(any(line.startswith("--") for line in intel.requirements))
+        self.assertTrue(all("==" in line for line in intel.requirements))
+
+    def test_display_adapters_come_from_win32_api(self):
+        class FakeUser32:
+            def EnumDisplayDevicesW(self, device, index, info_ptr, flags):
+                names = ["Intel(R) Iris(R) Xe Graphics", "Intel(R) Iris(R) Xe Graphics", "DisplayLink USB Device"]
+                if index >= len(names):
+                    return 0
+                info_ptr._obj.DeviceString = names[index]
+                return 1
+
+        names = bootstrap_launcher_module.enumerate_display_adapters(FakeUser32())
+
+        self.assertEqual(names, ["Intel(R) Iris(R) Xe Graphics", "DisplayLink USB Device"])
+
+    def test_fresh_install_on_intel_starts_on_gpu_model(self):
+        intel = bootstrap_launcher_module.GPU_TRIAL_BACKENDS[GpuVendor.INTEL]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bootstrap_launcher_module.set_install_backend(intel)
+            ensure_portable_layout(root)
+            config = json.loads((root / "config.json").read_text(encoding="utf-8"))
+            downloads = [spec.name for spec in bootstrap_launcher_module.active_model_downloads()]
+            imports = bootstrap_launcher_module.runtime_required_imports()
+
+        self.assertEqual(config["device"], "openvino:GPU")
+        self.assertEqual(config["whisper_model_dir"], "models/openvino-whisper")
+        self.assertEqual(downloads, ["openvino-whisper"])
+        self.assertIn("openvino-genai", imports)
+
+    def test_existing_cpu_install_is_left_on_cpu_until_upgrade(self):
+        intel = bootstrap_launcher_module.GPU_TRIAL_BACKENDS[GpuVendor.INTEL]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ensure_portable_layout(root)
+            bootstrap_launcher_module.set_install_backend(bootstrap_launcher_module.GPU_TRIAL_BACKEND_NONE)
+            ensure_portable_layout(root)
+            config = json.loads((root / "config.json").read_text(encoding="utf-8"))
+            on_default_cpu = bootstrap_launcher_module.config_uses_default_cpu_model(root)
+            uses_gpu = bootstrap_launcher_module.config_uses_backend(root, intel)
+            bootstrap_launcher_module.apply_gpu_trial_config(root / "config.json", intel)
+            switched = bootstrap_launcher_module.config_uses_backend(root, intel)
+
+        self.assertEqual(config["device"], "cpu")
+        self.assertTrue(on_default_cpu)
+        self.assertFalse(uses_gpu)
+        self.assertTrue(switched)
+
+
 class InstallerNetworkTests(unittest.TestCase):
     def test_crashed_import_probe_reports_everything_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -347,9 +413,9 @@ class BootstrapLauncherTests(unittest.TestCase):
         self.assertEqual(intel.config_overrides["compute_type"], "int8")
         self.assertEqual(intel.config_overrides["chunk_seconds"], 10.0)
         self.assertEqual(intel.config_overrides["overlap_seconds"], 1.0)
-        self.assertIn("openvino>=2026.1.0", intel.requirements)
-        self.assertIn("openvino-tokenizers>=2026.1.0", intel.requirements)
-        self.assertIn("openvino-genai>=2026.1.0", intel.requirements)
+        self.assertIn("openvino==2026.4.1", intel.requirements)
+        self.assertIn("openvino-tokenizers==2026.4.1.0", intel.requirements)
+        self.assertIn("openvino-genai==2026.4.1.0", intel.requirements)
 
     def test_gpu_trial_required_imports_are_selected_by_vendor(self):
         imports = gpu_trial_required_imports([GpuVendor.INTEL])
@@ -430,7 +496,7 @@ class BootstrapLauncherTests(unittest.TestCase):
             self.assertEqual(config["compute_type"], "int8")
             self.assertEqual(config["chunk_seconds"], 10.0)
             self.assertEqual(config["overlap_seconds"], 1.0)
-            self.assertIn("openvino-genai>=2026.1.0", requirements_content)
+            self.assertIn("openvino-genai==2026.4.1.0", requirements_content)
             self.assertIn("selected_backend: intel-openvino", report_content)
             for content in (report_content, guide_content):
                 self.assertIn("828 MB", content)

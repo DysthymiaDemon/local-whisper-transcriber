@@ -391,13 +391,18 @@ class MainWindow(QMainWindow):
         def preload() -> None:
             started = time.monotonic()
             try:
-                preload_whisper_model(config)
+                model = preload_whisper_model(config)
             except Exception as exc:
                 self.bridge.event.emit("model_status", {"ready": False, "message": f"Speech model failed to load: {exc}"})
                 return
             seconds = time.monotonic() - started
+            where = "on the Intel GPU" if config.device.lower().startswith("openvino") else "on the CPU"
+            fallback = getattr(model, "fallback_reason", "")
+            if isinstance(fallback, str) and fallback:
+                where = "on the CPU (Intel GPU unavailable)"
+                self.bridge.event.emit("log", {"message": fallback})
             self.bridge.event.emit(
-                "model_status", {"ready": True, "message": f"Speech model ready ({seconds:.0f}s to load)"}
+                "model_status", {"ready": True, "message": f"Speech model ready {where} ({seconds:.0f}s to load)"}
             )
 
         threading.Thread(target=preload, name="model-preload", daemon=True).start()
