@@ -421,7 +421,7 @@ class MainWindow(QMainWindow):
             return False
         self._loaded_model_config = config
         self._set_model_state(MODEL_STARTING)
-        self._set_model_status("Starting speech model...")
+        self._set_model_status("Starting speech model (checking model files)...")
         if not self._model_folder_is_setup_managed(config.whisper_model_dir):
             self._append_log(
                 f"Custom model folder {config.whisper_model_dir}: its files were not checked against the approved "

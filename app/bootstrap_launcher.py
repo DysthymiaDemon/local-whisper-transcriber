@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import importlib.util
 import json
 import os
@@ -27,6 +26,14 @@ if sys.stderr is None:
     sys.stderr = open(os.devnull, "w", encoding="utf-8")
 
 from app_config import append_error_log, application_root, error_log_root, source_root
+import model_integrity
+from model_integrity import (
+    MODEL_MANIFEST_FILE,
+    MODEL_SOURCE_FILE,
+    file_sha256,
+    read_model_source_details,
+    write_model_source,
+)
 from transcriber_engine import OPENVINO_REQUIRED_MODEL_FILES, faster_whisper_missing_files
 
 
@@ -79,8 +86,6 @@ OPENVINO_MODEL_CONFIG_SIGNATURE = {
 APP_PUBLISHER = "Ameen Khan"
 APP_VERSION = "local"
 INSTALL_DISK_SPACE_ESTIMATE = "~2.9 GB"
-MODEL_SOURCE_FILE = "MODEL_SOURCE.json"
-MODEL_MANIFEST_FILE = "model_manifest.json"
 BASE_REQUIREMENTS_FILE = "requirements.txt"
 # OpenVINO model-converter telemetry: never needed here, and left out of the lock files.
 UNWANTED_PACKAGE_PATTERNS = ("openvino_telemetry", "openvino_telemetry-*.dist-info")
@@ -1368,65 +1373,22 @@ def _model_folder_ready_at(folder: Path, name: str) -> bool:
     return False
 
 
-def read_model_source_details(folder: Path) -> tuple[str | None, str | None]:
-    """(repo_id, revision) from the MODEL_SOURCE.json marker; revision is None for markers written before pinning."""
-    try:
-        raw = json.loads((folder / MODEL_SOURCE_FILE).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None, None
-    if not isinstance(raw, dict):
-        return None, None
-    repo_id = raw.get("repo_id")
-    revision = raw.get("revision")
-    return (repo_id if isinstance(repo_id, str) else None, revision if isinstance(revision, str) else None)
-
-
 def read_model_source(folder: Path) -> str | None:
     return read_model_source_details(folder)[0]
 
 
-def write_model_source(folder: Path, repo_id: str, revision: str = "") -> None:
-    marker: dict[str, str] = {"repo_id": repo_id}
-    if revision:
-        marker["revision"] = revision
-    (folder / MODEL_SOURCE_FILE).write_text(json.dumps(marker, indent=2) + "\n", encoding="utf-8")
-
-
 def load_model_manifest(package_root: Path | None = None) -> dict[str, Any]:
     """Approved model revisions and file digests, written by packaging/lock_models.py."""
-    path = resource_root(package_root) / MODEL_MANIFEST_FILE
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(raw, dict):
-        raise RuntimeError(f"Model manifest is not a JSON object: {path}")
-    return raw
+    return model_integrity.load_model_manifest(resource_root(package_root))
 
 
 def model_manifest_entry(repo_id: str) -> dict[str, Any]:
-    entry = load_model_manifest().get(repo_id)
-    files = entry.get("files") if isinstance(entry, dict) else None
-    if not isinstance(entry, dict) or not isinstance(entry.get("revision"), str) or not isinstance(files, dict) or not files:
-        raise RuntimeError(f"No approved revision for {repo_id} in {MODEL_MANIFEST_FILE}; refusing to download it.")
-    return entry
-
-
-def file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+    return model_integrity.manifest_entry(load_model_manifest(), repo_id)
 
 
 def verify_model_digests(folder: Path, repo_id: str) -> list[str]:
     """Problems found comparing the model files in folder with the approved digests; empty when every file matches."""
-    problems: list[str] = []
-    for rel_path, expected in sorted(model_manifest_entry(repo_id)["files"].items()):
-        path = folder / rel_path
-        if not path.is_file():
-            problems.append(f"missing: {rel_path}")
-        elif file_sha256(path) != str(expected).lower():
-            problems.append(f"changed: {rel_path}")
-    return problems
+    return model_integrity.verify_files(folder, model_manifest_entry(repo_id))
 
 
 def _configured_model_dir(root: Path) -> Path | None:

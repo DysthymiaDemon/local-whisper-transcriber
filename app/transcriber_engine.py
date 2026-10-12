@@ -1266,6 +1266,10 @@ def load_whisper_model(config: EngineConfig) -> Any:
     with _model_cache_lock:
         model = _model_cache.get(key)
         if model is None:
+            # Every fresh load re-checks a setup-managed model against the approved digests (TM-004).
+            from model_integrity import verify_managed_model
+
+            verify_managed_model(config.whisper_model_dir)
             model = _create_whisper_model(config)
             _model_cache[key] = model
         return model
