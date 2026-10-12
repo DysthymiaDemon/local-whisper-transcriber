@@ -1,2 +1,5 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# The launcher is published with a SHA-256 checksum, so its bytes (LF line endings) must not change on checkout.
+*.pyw -text

@@ -72,6 +72,19 @@ class StandaloneLauncherTests(unittest.TestCase):
 
         self.assertIn('os.environ["LOCAL_WHISPER_LOG_ROOT"] = str(launcher_path.parent)', content)
 
+    def test_readme_publishes_the_current_launcher_checksum(self):
+        generator = load_generator()
+        digest = generator.launcher_sha256(generator.generate(PROJECT_ROOT))
+        readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+
+        self.assertIn(f"`Open Offline Meeting Transcriber.pyw` SHA-256: `{digest}`", readme)
+
+    def test_launcher_bytes_are_not_changed_by_git_line_endings(self):
+        attributes = (PROJECT_ROOT / ".gitattributes").read_text(encoding="utf-8")
+
+        self.assertIn("*.pyw -text", attributes)
+        self.assertNotIn(b"\r\n", LAUNCHER_PATH.read_bytes())
+
     def test_no_gpu_trial_launcher_is_generated(self):
         generator = load_generator()
 

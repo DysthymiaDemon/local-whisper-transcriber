@@ -14,26 +14,33 @@ Use 64-bit Python 3.12 from the company software portal. The `.pyw` launcher nee
 
 Use the same Windows architecture and Python version as the laptop.
 
+Download exactly the wheels in the hash lock. Add `-r .\resources\requirements-openvino.lock.txt` on Intel GPU laptops.
+
 ```powershell
 mkdir wheelhouse
-py -3.12 -m pip download -r .\resources\requirements.txt -d wheelhouse
+py -3.12 -m pip download --require-hashes --only-binary=:all: --no-deps `
+  -r .\resources\requirements.lock.txt -d wheelhouse
 ```
 
-On the laptop, install the wheels into the app's private package folder. This is the folder setup would use:
+On the laptop, install the wheels into the app's private package folder. This is the folder setup would use. pip checks every wheel against the lock again, so a file changed on the way is refused:
 
 ```powershell
 py -3.12 -m pip install --no-index --find-links wheelhouse `
+  --require-hashes --only-binary=:all: --no-deps `
   --target "$env:LOCALAPPDATA\OfflineMeetingTranscriberRuntime\site-packages" `
-  -r .\resources\requirements.txt
+  -r .\resources\requirements.lock.txt
 ```
 
 If the install folder is not inside OneDrive, use `OfflineMeetingTranscriber\.runtime\site-packages` as the target instead.
 
 ## 3. Download the speech model on an internet-connected machine
 
+Download the commit pinned in `resources\model_manifest.json`:
+
 ```powershell
 py -3.12 -m pip install huggingface_hub
 huggingface-cli download distil-whisper/distil-large-v3.5-ct2 `
+  --revision 9793ccc07920e0f830e1dba0343efcdf0ef8c903 `
   --local-dir faster-whisper `
   --include "model.bin" "config.json" "tokenizer.json" "vocabulary.*" "preprocessor_config.json"
 ```
@@ -53,6 +60,8 @@ Add a `MODEL_SOURCE.json` file so setup does not offer to download the model aga
   "repo_id": "distil-whisper/distil-large-v3.5-ct2"
 }
 ```
+
+On the next launch, setup checks every file against the SHA-256 values in `resources\model_manifest.json`, once. If they match, it adds the pinned `revision` to `MODEL_SOURCE.json`. If any file differs, setup offers to download the approved model again.
 
 ## 4. Microphone check
 

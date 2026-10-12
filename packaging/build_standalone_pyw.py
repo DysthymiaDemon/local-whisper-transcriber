@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 import textwrap
 import zlib
 from pathlib import Path
@@ -10,6 +11,8 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 OUTPUT_FILE = PROJECT_ROOT / "Open Offline Meeting Transcriber.pyw"
+README_FILE = PROJECT_ROOT / "README.md"
+README_CHECKSUM_PATTERN = re.compile(r"(`Open Offline Meeting Transcriber\.pyw` SHA-256: `)[0-9a-f]{64}(`)")
 PAYLOAD_DIRS = ("app", "resources")
 APP_FOLDER_NAME = "OfflineMeetingTranscriber"
 TEXT_SUFFIXES = {".py", ".txt", ".json", ".md", ".toml", ".cfg", ".ini"}
@@ -179,9 +182,25 @@ def write_launcher(root: Path = PROJECT_ROOT, output_file: Path | None = None) -
     return target
 
 
+def launcher_sha256(content: str) -> str:
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def update_readme_checksum(digest: str, readme: Path = README_FILE) -> None:
+    """Keep the published launcher checksum in README.md in step with the launcher."""
+    raw = readme.read_bytes().decode("utf-8")
+    updated, count = README_CHECKSUM_PATTERN.subn(lambda match: match.group(1) + digest + match.group(2), raw)
+    if count != 1:
+        raise RuntimeError(f"Expected one launcher SHA-256 line in {readme}, found {count}.")
+    readme.write_bytes(updated.encode("utf-8"))
+
+
 def main() -> int:
     target = write_launcher()
+    digest = launcher_sha256(target.read_text(encoding="utf-8"))
+    update_readme_checksum(digest)
     print(f"Wrote {target}")
+    print(f"SHA-256 {digest} (README.md updated)")
     return 0
 
 

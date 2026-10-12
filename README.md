@@ -13,7 +13,7 @@ It is built for managed corporate Windows 11 laptops:
 
 You need Python 3.12 (64-bit). On a managed laptop, install it from the company software portal.
 
-1. Copy `Open Offline Meeting Transcriber.pyw` to a folder of your choice.
+1. Copy `Open Offline Meeting Transcriber.pyw` to a folder of your choice. If you received the file from someone else rather than from this repository, check it first (see [Checking the launcher](#checking-the-launcher)).
 2. Double-click it. It creates an `OfflineMeetingTranscriber` folder next to itself.
 3. The setup window lists what it will install. Click **Install**.
 4. Setup installs the Python packages and downloads the speech model: 828 MB on Intel GPU laptops, 1.5 GB otherwise. This is the only step that uses the internet.
@@ -107,7 +107,7 @@ If you set your own model folder in `config.json`, it is never replaced.
 
 | Phase | Network use |
 |---|---|
-| Setup, after you click **Install** | `pip` downloads the packages in `resources\requirements.txt`, plus pinned OpenVINO packages from PyPI on Intel GPU laptops. Hugging Face downloads the speech model with no login token. |
+| Setup, after you click **Install** | `pip` downloads the exact wheels listed in `resources\requirements.lock.txt`, plus `resources\requirements-openvino.lock.txt` on Intel GPU laptops. Hugging Face downloads the speech model at a pinned commit, with no login token. |
 | Setup window open, before **Install** | None. |
 | Running the app | None. |
 
@@ -117,7 +117,28 @@ How the app stays offline after setup:
 - It loads models with `local_files_only=True` and only from a complete local folder.
 - It blocks Python network connections to anything other than this laptop (loopback). An attempt fails with "Network access is disabled after setup".
 
+- It decodes saved recordings in a separate process that cannot start other programs, is capped at 2 GB of memory, and only lets FFmpeg read local files.
+
 The Python block cannot stop code in native libraries. If IT wants an operating-system guarantee, an outbound Windows Firewall rule for `pythonw.exe` can block everything after setup.
+
+### What setup checks
+
+- **Packages:** every package, including dependencies, is pinned to one version and one SHA-256 hash in the `.lock.txt` files. pip installs with `--require-hashes --only-binary=:all: --no-deps`, so it refuses a changed file, anything built from source, and any package not in the lock.
+- **Models:** `resources\model_manifest.json` pins each model to a Hugging Face commit and lists the SHA-256 of every file. Setup downloads that commit and refuses a download whose files do not match. A model folder you set yourself under **Advanced** is not checked, and the log says so.
+
+### Checking the launcher
+
+The launcher's checksum changes with every release:
+
+`Open Offline Meeting Transcriber.pyw` SHA-256: `9dc7d4f69bedea10f244a9e262cdd95f6acea3fd1954a2f790bc7276a4a4e297`
+
+To check a copy, run this in a terminal in its folder, and compare the result with the line above as published in this repository:
+
+```text
+certutil -hashfile "Open Offline Meeting Transcriber.pyw" SHA256
+```
+
+The launcher also checks its own embedded files. That check only catches damage, not a deliberately replaced launcher, so get the file from the repository or another channel your IT team approves.
 
 ### Corporate HTTPS inspection
 
@@ -162,14 +183,27 @@ Source runtime data defaults to `C:\Users\<you>\Apps\OfflineMeetingTranscriber`.
 Source layout:
 
 - `app/`: setup, GUI, theme, offline guard, engine and config code.
-- `resources/`: pinned requirements and the config template.
-- `packaging/`: the standalone `.pyw` generator and the PyInstaller build.
+- `resources/`: requirements, their hash locks, the model manifest and the config template.
+- `packaging/`: the standalone `.pyw` generator, the lock generators and the PyInstaller build.
 - `tests/`: unit tests.
+- `docs/threat-model.md`: the security threat model and what has been fixed.
 
-The `.pyw` launchers embed `app/` and `resources/`. After changing anything there, regenerate both launchers and commit them:
+The `.pyw` launcher embeds `app/` and `resources/`. After changing anything there, regenerate it and commit it. This also updates the checksum in this README:
 
 ```powershell
 py -3.12 packaging\build_standalone_pyw.py
+```
+
+After changing `resources\requirements.txt` or `resources\requirements-openvino.txt`, regenerate the hash locks on a Windows machine with Python 3.12, review the diff, then rebuild the launcher:
+
+```powershell
+py -3.12 packaging\lock_requirements.py
+```
+
+To move to a newer model revision, regenerate the model manifest (this needs the network), review the diff, then rebuild the launcher:
+
+```powershell
+py -3.12 packaging\lock_models.py
 ```
 
 Run the tests:
