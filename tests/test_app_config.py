@@ -97,8 +97,8 @@ class PortableConfigTests(unittest.TestCase):
         self.assertEqual(config.whisper_model_dir, os.path.join(tmp, "models", "faster-whisper"))
         self.assertEqual(config.output_file, os.path.join(tmp, "transcripts", "meeting_transcript.txt"))
         self.assertEqual(config.language, "en")
-        self.assertEqual(config.chunk_seconds, 10.0)
-        self.assertEqual(config.overlap_seconds, 1.0)
+        self.assertEqual(config.chunk_seconds, 15.0)
+        self.assertEqual(config.overlap_seconds, 1.5)
 
     def test_config_file_overrides_portable_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -156,8 +156,8 @@ class PortableConfigTests(unittest.TestCase):
 
             config = load_portable_config(root)
 
-        self.assertEqual(config.chunk_seconds, 10.0)
-        self.assertEqual(config.overlap_seconds, 1.0)
+        self.assertEqual(config.chunk_seconds, 15.0)
+        self.assertEqual(config.overlap_seconds, 1.5)
         self.assertFalse(hasattr(config, "diarization_backend"))
 
     def test_previous_transcription_defaults_migrate_to_current_latency(self):
@@ -175,8 +175,8 @@ class PortableConfigTests(unittest.TestCase):
 
             config = load_portable_config(root)
 
-        self.assertEqual(config.chunk_seconds, 10.0)
-        self.assertEqual(config.overlap_seconds, 1.0)
+        self.assertEqual(config.chunk_seconds, 15.0)
+        self.assertEqual(config.overlap_seconds, 1.5)
 
     def test_previous_short_latency_defaults_migrate_to_current_accuracy_latency(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -193,11 +193,11 @@ class PortableConfigTests(unittest.TestCase):
 
             config = load_portable_config(root)
 
-        self.assertEqual(config.chunk_seconds, 10.0)
-        self.assertEqual(config.overlap_seconds, 1.0)
+        self.assertEqual(config.chunk_seconds, 15.0)
+        self.assertEqual(config.overlap_seconds, 1.5)
 
 
-    def test_generated_five_second_defaults_migrate_to_ten_second_chunks(self):
+    def test_generated_five_second_defaults_migrate_to_fifteen_second_chunks(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "config.json").write_text(
@@ -206,7 +206,7 @@ class PortableConfigTests(unittest.TestCase):
 
             config = load_portable_config(root)
 
-        self.assertEqual((config.chunk_seconds, config.overlap_seconds), (10.0, 1.0))
+        self.assertEqual((config.chunk_seconds, config.overlap_seconds), (15.0, 1.5))
 
     def test_broken_config_falls_back_to_defaults_with_message(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -218,7 +218,7 @@ class PortableConfigTests(unittest.TestCase):
 
         self.assertEqual(config, default_portable_config(root))
         self.assertIn("config.json", problem)
-        self.assertEqual(typed_config.chunk_seconds, 10.0)
+        self.assertEqual(typed_config.chunk_seconds, 15.0)
         self.assertIn("chunk_seconds", typed_problem)
 
     def test_save_writes_complete_json_without_leftover_temp_files(self):
@@ -229,7 +229,7 @@ class PortableConfigTests(unittest.TestCase):
             saved = json.loads(path.read_text(encoding="utf-8"))
             leftovers = [item.name for item in root.iterdir() if item.suffix == ".tmp"]
 
-        self.assertEqual(saved["chunk_seconds"], 10.0)
+        self.assertEqual(saved["chunk_seconds"], 15.0)
         self.assertEqual(leftovers, [])
 
 

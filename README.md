@@ -64,7 +64,7 @@ The model folder must contain:
 
 The app refuses to load an incomplete folder, because faster-whisper would otherwise try to download a missing tokenizer from the internet.
 
-Live recording works in 10-second chunks with 1 second of overlap, so text appears about 10 seconds behind speech. Saved recordings use 28-second windows, which is faster and more accurate.
+Live recording works in 15-second chunks with 1.5 seconds of overlap, so text appears about 15 to 25 seconds behind speech. Whisper pads every chunk to 30 seconds, so each chunk takes about 9 seconds on an i5-1345U laptop CPU, whatever its length. With 10-second chunks the app could not keep up; 15-second chunks leave about 4 seconds of headroom. Saved recordings use 28-second windows. A 15-minute meeting takes about 6 minutes to transcribe.
 
 ### Upgrading from the older model
 

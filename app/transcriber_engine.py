@@ -299,8 +299,8 @@ class EngineConfig:
     whisper_model_dir: str = r"C:\models\faster-whisper"
     output_file: str = "meeting_transcript.txt"
     sample_rate: int = 16_000
-    chunk_seconds: float = 10.0
-    overlap_seconds: float = 1.0
+    chunk_seconds: float = 15.0
+    overlap_seconds: float = 1.5
     compute_type: str = "int8"
     device: str = "cpu"
     cpu_threads: int = 0

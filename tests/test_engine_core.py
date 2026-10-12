@@ -422,8 +422,8 @@ class EngineConfigTests(unittest.TestCase):
         config = EngineConfig()
 
         self.assertEqual(config.language, "en")
-        self.assertEqual(config.chunk_seconds, 10.0)
-        self.assertEqual(config.overlap_seconds, 1.0)
+        self.assertEqual(config.chunk_seconds, 15.0)
+        self.assertEqual(config.overlap_seconds, 1.5)
         self.assertEqual(config.device, "cpu")
         self.assertEqual(config.compute_type, "int8")
 
