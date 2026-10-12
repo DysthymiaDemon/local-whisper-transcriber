@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import sys
 import threading
+from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from file_transcriber import FileTranscriptionWorker
@@ -9,9 +11,10 @@ from file_transcriber import FileTranscriptionWorker
 from app_config import (
     append_error_log,
     application_root,
-    load_portable_config,
+    load_portable_config_safely,
     save_portable_config,
 )
+from offline_guard import enforce_offline
 from transcriber_engine import (
     EngineConfig,
     MeetingTranscriberEngine,
@@ -26,13 +29,14 @@ from transcriber_engine import (
 from ui_helpers import meter_bar_geometry
 
 
-PORTABLE_DEFAULTS = load_portable_config()
+PORTABLE_DEFAULTS, CONFIG_LOAD_PROBLEM = load_portable_config_safely()
 WHISPER_MODEL_DIR = PORTABLE_DEFAULTS.whisper_model_dir
 OUTPUT_FILE = PORTABLE_DEFAULTS.output_file
 SAMPLE_RATE = PORTABLE_DEFAULTS.sample_rate
 CHUNK_SECONDS = PORTABLE_DEFAULTS.chunk_seconds
 OVERLAP_SECONDS = PORTABLE_DEFAULTS.overlap_seconds
 CAPTURE_MODE = PORTABLE_DEFAULTS.capture_mode
+INPUT_DEVICE = PORTABLE_DEFAULTS.input_device
 SYSTEM_DEVICE = PORTABLE_DEFAULTS.system_device_index
 ALLOW_MIXED_FALLBACK = PORTABLE_DEFAULTS.allow_mixed_fallback
 COMPUTE_TYPE = PORTABLE_DEFAULTS.compute_type
@@ -40,6 +44,12 @@ DEVICE = PORTABLE_DEFAULTS.device
 CPU_THREADS = PORTABLE_DEFAULTS.cpu_threads
 NUM_WORKERS = PORTABLE_DEFAULTS.num_workers
 LANGUAGE = PORTABLE_DEFAULTS.language
+
+MEETING_FILE_FILTER = (
+    "Meeting recordings (*.mp4 *.m4a *.mp3 *.wav *.webm *.mkv *.mov *.aac *.wma);;All files (*.*)"
+)
+HOME_PAGE = 0
+SESSION_PAGE = 1
 
 
 try:
@@ -60,9 +70,20 @@ try:
         QCheckBox,
         QSizePolicy,
         QSplitter,
+        QStackedWidget,
         QTextEdit,
+        QToolButton,
         QVBoxLayout,
         QWidget,
+    )
+    from ui_theme import (
+        APP_NAME,
+        APP_STYLESHEET,
+        GradientBackground,
+        HoverIconButton,
+        add_soft_shadow,
+        draw_icon,
+        TITLE_BLUE,
     )
 except ImportError as exc:  # pragma: no cover - depends on local GUI deps
     print(
@@ -71,6 +92,14 @@ except ImportError as exc:  # pragma: no cover - depends on local GUI deps
         file=sys.stderr,
     )
     raise SystemExit(1) from exc
+
+
+def session_output_path(configured: str, now: datetime | None = None) -> str:
+    """Give each recording its own transcript file so earlier meetings are never overwritten."""
+    path = Path(configured)
+    stamp = (now or datetime.now()).strftime("%Y-%m-%d_%H%M%S")
+    suffix = path.suffix or ".txt"
+    return str(path.with_name(f"{path.stem}_{stamp}{suffix}"))
 
 
 class EngineSignalBridge(QObject):
@@ -113,7 +142,7 @@ class MicLevelMeter(QWidget):
             active = index < active_segments
             ratio = (index + 1) / segments
             if not active:
-                color = QColor("#d8d8dc")
+                color = QColor("#d8e3ef")
             elif ratio <= 0.60:
                 color = QColor("#4ac11f")
             elif ratio <= 0.82:
@@ -121,14 +150,15 @@ class MicLevelMeter(QWidget):
             else:
                 color = QColor("#d93025")
             painter.fillRect(left, top, bar_width, bar_height, color)
-            painter.setPen(QPen(QColor("#8b8b8b"), 1))
+            painter.setPen(QPen(QColor("#9fb4cc"), 1))
             painter.drawRect(left, top, bar_width, bar_height)
 
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Offline Meeting Transcriber")
+        self.setWindowTitle(APP_NAME)
+        self.setWindowIcon(draw_icon("mic", TITLE_BLUE, 64))
         self.resize(1040, 720)
         self.engine: MeetingTranscriberEngine | None = None
         self.file_worker: FileTranscriptionWorker | None = None
@@ -146,36 +176,94 @@ class MainWindow(QMainWindow):
         self.spinner_timer.setInterval(160)
         self.spinner_timer.timeout.connect(self._tick_spinner)
 
-        self._build_ui()
+        self.pages = QStackedWidget()
+        self.setCentralWidget(self.pages)
+        self.pages.addWidget(self._build_home_page())
+        self.pages.addWidget(self._build_session_page())
+        self.pages.setCurrentIndex(HOME_PAGE)
+        QTimer.singleShot(0, self._home_page.setFocus)
+
         self._load_devices()
         self._set_running(False)
+        if CONFIG_LOAD_PROBLEM:
+            log_path = self._write_error_log("Configuration file ignored", CONFIG_LOAD_PROBLEM)
+            self._append_log(f"{CONFIG_LOAD_PROBLEM}. Using default settings. Details saved to {log_path}")
 
-    def _build_ui(self) -> None:
+    def _build_home_page(self) -> QWidget:
+        page = GradientBackground()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(28, 22, 28, 28)
+
+        header = QHBoxLayout()
+        header.setSpacing(10)
+        logo = QLabel()
+        logo.setPixmap(draw_icon("mic", TITLE_BLUE, 32).pixmap(32, 32))
+        title = QLabel(APP_NAME)
+        title.setObjectName("appTitle")
+        header.addWidget(logo)
+        header.addWidget(title)
+        header.addStretch(1)
+        layout.addLayout(header)
+        layout.addStretch(2)
+
+        self.home_record_button = HoverIconButton("Record and Transcribe This Meeting", "record")
+        self.home_file_button = HoverIconButton("Transcribe Existing Meeting", "folder_mic")
+        self.home_close_button = HoverIconButton("Close This App", "close")
+        self.home_record_button.clicked.connect(self._open_recording_session)
+        self.home_file_button.clicked.connect(self._open_existing_meeting)
+        self.home_close_button.clicked.connect(self._close_app)
+
+        column = QVBoxLayout()
+        column.setSpacing(20)
+        for button in (self.home_record_button, self.home_file_button, self.home_close_button):
+            button.setObjectName("homeAction")
+            button.setMinimumHeight(64)
+            button.setMinimumWidth(460)
+            button.setMaximumWidth(640)
+            button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            add_soft_shadow(button)
+            column.addWidget(button)
+
+        centered = QHBoxLayout()
+        centered.addStretch(1)
+        centered.addLayout(column, 6)
+        centered.addStretch(1)
+        layout.addLayout(centered)
+        layout.addStretch(3)
+        # Keep keyboard access to the buttons without drawing a focus ring on one of them at start-up.
+        page.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self._home_page = page
+        return page
+
+    def _build_session_page(self) -> QWidget:
         root = QWidget()
+        root.setObjectName("sessionPage")
         root_layout = QVBoxLayout(root)
         root_layout.setContentsMargins(14, 14, 14, 14)
         root_layout.setSpacing(10)
-        self.setCentralWidget(root)
+
+        top_bar = QHBoxLayout()
+        self.home_button = QPushButton("Home")
+        self.home_button.setIcon(draw_icon("mic", TITLE_BLUE, 18))
+        self.home_button.clicked.connect(self._show_home)
+        session_title = QLabel(APP_NAME)
+        session_title.setStyleSheet(f"color: {TITLE_BLUE}; font-size: 13pt; font-weight: 600;")
+        top_bar.addWidget(self.home_button)
+        top_bar.addSpacing(8)
+        top_bar.addWidget(session_title)
+        top_bar.addStretch(1)
+        root_layout.addLayout(top_bar)
 
         main_splitter = QSplitter(Qt.Orientation.Horizontal)
         main_splitter.setChildrenCollapsible(False)
         root_layout.addWidget(main_splitter, 1)
 
         self.transcript_text = QTextEdit()
+        self.transcript_text.setObjectName("transcript")
         self.transcript_text.setReadOnly(True)
         self.transcript_text.setAcceptRichText(False)
         self.transcript_text.setLineWrapMode(QTextEdit.WidgetWidth)
         self.transcript_text.setPlaceholderText("Transcription appears here...")
-        self.transcript_text.setStyleSheet(
-            "QTextEdit {"
-            "background: #2b2b2b;"
-            "color: #f2f2f2;"
-            "border: 1px solid #444;"
-            "padding: 14px;"
-            "font: 14px 'Segoe UI';"
-            "selection-background-color: #174ea6;"
-            "}"
-        )
         main_splitter.addWidget(self.transcript_text)
 
         right_panel = QWidget()
@@ -227,6 +315,7 @@ class MainWindow(QMainWindow):
         self.capture_mode_combo.addItem("System audio (loopback)", CAPTURE_MODE_LOOPBACK)
         self.capture_mode_combo.addItem("Mixed (mic + system)", CAPTURE_MODE_MIXED)
         self.capture_mode_combo.currentIndexChanged.connect(self._update_capture_controls)
+        self.system_device_combo.currentIndexChanged.connect(self._update_capture_controls)
         self.allow_fallback_checkbox = QCheckBox("Allow mixed fallback to single source")
         self.whisper_path = QLineEdit(WHISPER_MODEL_DIR)
         self.output_path = QLineEdit(OUTPUT_FILE)
@@ -240,13 +329,26 @@ class MainWindow(QMainWindow):
         ):
             self._allow_field_to_shrink(widget)
 
-        self.capture_mode_combo.setCurrentText("Microphone")
         settings_layout.addRow("Capture mode", self.capture_mode_combo)
         settings_layout.addRow("Microphone", self.device_combo)
         settings_layout.addRow("System output", self.system_device_combo)
         settings_layout.addRow("Mixed fallback", self.allow_fallback_checkbox)
-        settings_layout.addRow("Whisper", self._path_row(self.whisper_path, folder=True))
-        settings_layout.addRow("Output", self._path_row(self.output_path, folder=False))
+
+        self.advanced_toggle = QToolButton()
+        self.advanced_toggle.setObjectName("advancedToggle")
+        self.advanced_toggle.setText("Advanced")
+        self.advanced_toggle.setCheckable(True)
+        self.advanced_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.advanced_toggle.setArrowType(Qt.ArrowType.RightArrow)
+        self.advanced_toggle.toggled.connect(self._toggle_advanced)
+        self.advanced_panel = QWidget()
+        advanced_layout = QFormLayout(self.advanced_panel)
+        advanced_layout.setContentsMargins(0, 0, 0, 0)
+        advanced_layout.addRow("Model folder", self._path_row(self.whisper_path, folder=True))
+        advanced_layout.addRow("Transcript file", self._path_row(self.output_path, folder=False))
+        self.advanced_panel.setVisible(False)
+        settings_layout.addRow(self.advanced_toggle)
+        settings_layout.addRow(self.advanced_panel)
         right_layout.addWidget(settings)
         right_layout.addStretch(1)
 
@@ -260,9 +362,31 @@ class MainWindow(QMainWindow):
         root_layout.addLayout(footer_row)
 
         self.log_box = QTextEdit()
+        self.log_box.setObjectName("log")
         self.log_box.setReadOnly(True)
         self.log_box.setMaximumHeight(120)
         root_layout.addWidget(self.log_box)
+        return root
+
+    def _toggle_advanced(self, expanded: bool) -> None:
+        self.advanced_panel.setVisible(expanded)
+        self.advanced_toggle.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
+
+    def _open_recording_session(self) -> None:
+        self.pages.setCurrentIndex(SESSION_PAGE)
+
+    def _open_existing_meeting(self) -> None:
+        if self._start_file_transcription():
+            self.pages.setCurrentIndex(SESSION_PAGE)
+
+    def _close_app(self) -> None:
+        self.close()
+
+    def _show_home(self) -> None:
+        if self.engine or self.file_worker or self._stopping:
+            return
+        self.pages.setCurrentIndex(HOME_PAGE)
+        self._home_page.setFocus()
 
     @staticmethod
     def _allow_field_to_shrink(widget: QWidget) -> None:
@@ -292,62 +416,43 @@ class MainWindow(QMainWindow):
         if selected:
             line_edit.setText(selected)
 
+    @staticmethod
+    def _device_label(device: dict[str, Any]) -> str:
+        rate = device.get("default_samplerate")
+        hostapi = device.get("hostapi")
+        suffix = f" - {hostapi}" if hostapi else ""
+        rate_text = f" ({int(rate)} Hz)" if rate else ""
+        return f"{device['index']}: {device['name']}{suffix}{rate_text}"
+
     def _load_devices(self) -> None:
         self.device_combo.clear()
+        self.system_device_combo.clear()
         self._output_devices_by_index = {}
         try:
             devices = list_input_devices()
         except Exception as exc:
             devices = []
             self._append_log(f"Audio device discovery failed; file transcription remains available: {exc}")
-        if not devices:
-            self.device_combo.addItem("Default input", None)
-            self.system_device_combo.clear()
-            self.system_device_combo.addItem("Default output", None)
-            self._set_capture_default_values()
-            self._update_capture_controls()
-            return
-
         self.device_combo.addItem("Default input", None)
         for device in devices:
-            rate = device.get("default_samplerate")
-            hostapi = device.get("hostapi")
-            suffix = f" - {hostapi}" if hostapi else ""
-            rate_text = f" ({int(rate)} Hz)" if rate else ""
-            self.device_combo.addItem(f"{device['index']}: {device['name']}{suffix}{rate_text}", device["index"])
-        for item in (None, *[device["index"] for device in devices]):
-            if item is not None and not any(self.device_combo.itemData(i) == item for i in range(self.device_combo.count())):
-                pass
+            self.device_combo.addItem(self._device_label(device), device["index"])
 
-        self.system_device_combo.clear()
         try:
             output_devices = list_output_devices()
         except Exception as exc:
             output_devices = []
             self._append_log(f"Output device discovery failed: {exc}")
-        if not output_devices:
-            self.system_device_combo.addItem("Default output", None)
-            self._update_capture_controls()
-            self._set_capture_default_values()
-            return
         self.system_device_combo.addItem("Default output", None)
         for device in output_devices:
-            rate = device.get("default_samplerate")
-            hostapi = device.get("hostapi")
-            suffix = f" - {hostapi}" if hostapi else ""
-            rate_text = f" ({int(rate)} Hz)" if rate else ""
             index = int(device["index"])
             self._output_devices_by_index[index] = device
             wasapi_suffix = " (WASAPI)" if device.get("wasapi") else ""
-            self.system_device_combo.addItem(
-                f"{index}: {device['name']}{suffix}{rate_text}{wasapi_suffix}",
-                index,
-            )
+            self.system_device_combo.addItem(f"{self._device_label(device)}{wasapi_suffix}", index)
         self._set_capture_default_values()
         self._update_capture_controls()
 
     def _set_capture_default_values(self) -> None:
-        self._set_combo_current_data(self.device_combo, DEVICE)
+        self._set_combo_current_data(self.device_combo, INPUT_DEVICE)
         self._set_combo_current_data(self.system_device_combo, SYSTEM_DEVICE)
         self._set_combo_current_data(self.capture_mode_combo, CAPTURE_MODE)
         self.allow_fallback_checkbox.setChecked(bool(ALLOW_MIXED_FALLBACK))
@@ -362,32 +467,21 @@ class MainWindow(QMainWindow):
 
     def _update_capture_controls(self) -> None:
         mode = str(self.capture_mode_combo.currentData() or CAPTURE_MODE_MIC).strip().lower()
-        loopback_supported = self._is_loopback_supported()
-        loopback_mode_enabled = loopback_supported
-        self.system_device_combo.setEnabled(mode != CAPTURE_MODE_MIC)
-        self.allow_fallback_checkbox.setEnabled(mode == CAPTURE_MODE_MIXED)
-
-        if not loopback_mode_enabled and mode != CAPTURE_MODE_MIC:
+        if not self._is_loopback_supported() and mode != CAPTURE_MODE_MIC:
             self.capture_mode_combo.blockSignals(True)
             self._set_combo_current_data(self.capture_mode_combo, CAPTURE_MODE_MIC)
             self.capture_mode_combo.blockSignals(False)
-            self.system_device_combo.setEnabled(False)
-            self.allow_fallback_checkbox.setEnabled(False)
+            mode = CAPTURE_MODE_MIC
             self._append_log("Loopback mode is unavailable because no WASAPI output device is detected.")
 
-        selected_system_is_wasapi = self._is_selected_system_device_wasapi()
-        if mode in (CAPTURE_MODE_LOOPBACK, CAPTURE_MODE_MIXED) and not selected_system_is_wasapi:
+        self.system_device_combo.setEnabled(mode != CAPTURE_MODE_MIC)
+        if mode in (CAPTURE_MODE_LOOPBACK, CAPTURE_MODE_MIXED) and not self._is_selected_system_device_wasapi():
             self.system_device_combo.setToolTip("Loopback and mixed modes require a WASAPI output device.")
         else:
             self.system_device_combo.setToolTip("")
 
-        if mode == CAPTURE_MODE_MIXED and self.allow_fallback_checkbox.isChecked():
-            if not self.system_device_combo.itemData(self.system_device_combo.currentIndex()):
-                self.allow_fallback_checkbox.setEnabled(False)
-            else:
-                self.allow_fallback_checkbox.setEnabled(True)
-        else:
-            self.allow_fallback_checkbox.setEnabled(mode == CAPTURE_MODE_MIXED)
+        fallback_possible = mode == CAPTURE_MODE_MIXED and self._selected_system_device() is not None
+        self.allow_fallback_checkbox.setEnabled(fallback_possible)
 
     def _selected_system_device(self) -> int | None:
         selected = self.system_device_combo.currentData()
@@ -421,20 +515,27 @@ class MainWindow(QMainWindow):
             language=LANGUAGE,
         )
 
+    def _save_settings(self, config: EngineConfig) -> None:
+        try:
+            save_portable_config(config, root=application_root())
+        except Exception as exc:
+            self._append_log(f"Settings could not be saved; recording continues: {exc}")
+
     def _start_recording(self) -> None:
         if self._stopping or self.engine or self.file_worker:
             return
         config = self._read_config()
-        save_portable_config(config, root=application_root())
         errors = config.validate()
         if errors:
             message = "\n".join(errors)
             log_path = self._write_error_log("Configuration error", message, {"errors": errors})
             QMessageBox.critical(self, "Configuration error", f"{message}\n\nError details saved to {log_path}")
             return
+        self._save_settings(config)
 
+        session_config = replace(config, output_file=session_output_path(config.output_file))
         self.transcript_text.clear()
-        self.engine = MeetingTranscriberEngine(config)
+        self.engine = MeetingTranscriberEngine(session_config)
         self.engine.on_event(lambda event_type, payload: self.bridge.event.emit(event_type, payload))
         try:
             self.engine.start()
@@ -445,25 +546,26 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Start failed", f"{message}\n\nError details saved to {log_path}")
             self.engine = None
             return
+        self._append_log(f"Saving transcript to {session_config.output_file}")
         self._stopping = False
         self._set_running(True)
 
-    def _start_file_transcription(self) -> None:
+    def _start_file_transcription(self) -> bool:
         if self.engine or self.file_worker or self._stopping:
-            return
+            return False
         source, _ = QFileDialog.getOpenFileName(
-            self, "Select meeting recording", str(Path.home() / "Downloads"), "MP4 recordings (*.mp4)"
+            self, "Select meeting recording", str(Path.home() / "Downloads"), MEETING_FILE_FILTER
         )
         if not source:
-            return
+            return False
         output, _ = QFileDialog.getSaveFileName(
             self, "Save transcript", str(Path(source).with_suffix(".txt")), "Text files (*.txt)"
         )
         if not output:
-            return
+            return False
         if Path(source).resolve() == Path(output).resolve():
             QMessageBox.critical(self, "Invalid output", "Output must differ from the source recording.")
-            return
+            return False
         self.transcript_text.clear()
         self.file_progress_label.setText("Preparing recording")
         self.file_worker = FileTranscriptionWorker(
@@ -480,6 +582,7 @@ class MainWindow(QMainWindow):
             self._set_running(False)
             self.status_label.setText("File transcription failed")
             self._append_log(str(exc))
+        return True
 
     def _toggle_pause(self) -> None:
         if not self.engine:
@@ -509,14 +612,7 @@ class MainWindow(QMainWindow):
         self._update_transcription_state(running=True)
         if not self.spinner_timer.isActive():
             self.spinner_timer.start()
-        for widget in (
-            self.device_combo,
-            self.system_device_combo,
-            self.capture_mode_combo,
-            self.allow_fallback_checkbox,
-            self.whisper_path,
-            self.output_path,
-        ):
+        for widget in self._settings_widgets():
             widget.setEnabled(False)
         engine = self.engine
 
@@ -593,10 +689,14 @@ class MainWindow(QMainWindow):
         text = row.text.strip()
         if not text:
             return
-        cursor = self.transcript_text.textCursor()
+        document = self.transcript_text.document()
+        cursor = QTextCursor(document)
         cursor.movePosition(QTextCursor.End)
-        existing = self.transcript_text.toPlainText()
-        separator = "" if not existing or existing.endswith((" ", "\n")) else " "
+        separator = ""
+        if not document.isEmpty():
+            # QTextDocument stores line breaks as U+2029 paragraph separators.
+            last_char = document.characterAt(document.characterCount() - 2)
+            separator = "" if last_char in (" ", "\n", "\u2029") else " "
         cursor.insertText(separator + text)
         self.transcript_text.setTextCursor(cursor)
         self.transcript_text.ensureCursorVisible()
@@ -639,9 +739,20 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # pragma: no cover - logging must not block UI
             return f"error_log.txt (failed to write: {exc})"
 
+    def _settings_widgets(self) -> tuple[QWidget, ...]:
+        return (
+            self.device_combo,
+            self.system_device_combo,
+            self.capture_mode_combo,
+            self.allow_fallback_checkbox,
+            self.whisper_path,
+            self.output_path,
+        )
+
     def _set_running(self, running: bool) -> None:
         self.file_button.setEnabled(not running)
         self.record_button.setEnabled(not running)
+        self.home_button.setEnabled(not running)
         self.pause_button.setEnabled(running)
         self.stop_button.setEnabled(running)
         self.pause_button.setText("Pause")
@@ -653,17 +764,11 @@ class MainWindow(QMainWindow):
         else:
             self.spinner_timer.stop()
             self._update_transcription_state(running=False)
-        if not running:
             self.level_meter.set_level(0)
-        for widget in (
-            self.device_combo,
-            self.system_device_combo,
-            self.capture_mode_combo,
-            self.allow_fallback_checkbox,
-            self.whisper_path,
-            self.output_path,
-        ):
+        for widget in self._settings_widgets():
             widget.setEnabled(not running)
+        if not running:
+            self._update_capture_controls()
 
     def _finish_engine_stop(self) -> None:
         self._behind_seconds = 0.0
@@ -679,6 +784,7 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         if self.engine or self._stopping:
+            self.pages.setCurrentIndex(SESSION_PAGE)
             self.status_label.setText("Finishing transcription")
             self._append_log("Finishing transcription before closing. Wait for Stopped.")
             if self.engine and not self._stopping:
@@ -689,8 +795,11 @@ class MainWindow(QMainWindow):
 
 
 def main() -> int:
-    app = QApplication(sys.argv)
+    enforce_offline()
+    app = QApplication.instance() or QApplication(sys.argv)
     app.setStyle("Fusion")
+    app.setApplicationName(APP_NAME)
+    app.setStyleSheet(APP_STYLESHEET)
     window = MainWindow()
     window.show()
     return app.exec()
