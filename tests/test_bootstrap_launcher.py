@@ -806,6 +806,70 @@ class BootstrapLauncherTests(unittest.TestCase):
             self.assertEqual(result.code, 0)
             self.assertEqual(calls, ["apply", "close"])
 
+    def test_full_cpu_button_lifts_cap_on_running_pip_and_skips_later_runs(self):
+        from bootstrap_launcher import run_pip_install
+
+        flag_calls = []
+
+        class FakeKernel32:
+            def SetInformationJobObject(self, job, info_class, info_ptr, info_size):
+                info = ctypes.cast(
+                    info_ptr,
+                    ctypes.POINTER(bootstrap_launcher_module.JOBOBJECT_CPU_RATE_CONTROL_INFORMATION),
+                ).contents
+                flag_calls.append((job, info.ControlFlags))
+                return 1
+
+        class RunningPip:
+            _cpu_limit_job_handle = 4321
+
+        process = RunningPip()
+        bootstrap_launcher_module.ACTIVE_PIP_PROCESSES.add(process)
+        self.addCleanup(bootstrap_launcher_module.ACTIVE_PIP_PROCESSES.discard, process)
+        self.addCleanup(bootstrap_launcher_module.PIP_CPU_CAP.__setitem__, "enabled", True)
+        real_remove = bootstrap_launcher_module.remove_windows_cpu_limit
+        with patch(
+            "bootstrap_launcher.remove_windows_cpu_limit",
+            side_effect=lambda proc: real_remove(proc, kernel32=FakeKernel32()),
+        ):
+            released = bootstrap_launcher_module.use_full_cpu_for_pip()
+
+        self.assertTrue(released)
+        self.assertEqual(flag_calls, [(4321, 0)])
+
+        with tempfile.TemporaryDirectory() as runtime_tmp, tempfile.TemporaryDirectory() as package_tmp:
+            package_root = Path(package_tmp)
+            (package_root / "resources").mkdir()
+            (package_root / "resources" / "requirements.txt").write_text("example==1.0\n", encoding="utf-8")
+
+            class FakeProcess:
+                def __init__(self, cmd, **kwargs):
+                    self.stdout = iter([])
+
+                def wait(self):
+                    return 0
+
+            with patch("bootstrap_launcher.subprocess.Popen", FakeProcess), patch(
+                "bootstrap_launcher.apply_windows_cpu_limit"
+            ) as apply_limit:
+                run_pip_install(Path(runtime_tmp), lambda event: None, package_root)
+            apply_limit.assert_not_called()
+
+    def test_setup_window_offers_full_cpu_button(self):
+        source = (Path(__file__).resolve().parents[1] / "app" / "bootstrap_launcher.py").read_text(encoding="utf-8")
+
+        self.assertIn('"I am not doing work, use 100% of CPU"', source)
+
+    def test_launch_countdown_uses_triple_size_font(self):
+        source = (Path(__file__).resolve().parents[1] / "app" / "bootstrap_launcher.py").read_text(encoding="utf-8")
+
+        self.assertEqual(bootstrap_launcher_module.LAUNCH_COUNTDOWN_FONT_SIZE, 30)
+        self.assertIn('package_text.configure(font=("Segoe UI", LAUNCH_COUNTDOWN_FONT_SIZE))', source)
+
+    def test_pip_cpu_cap_is_on_by_default(self):
+        self.assertEqual(bootstrap_launcher_module.PIP_CPU_LIMIT_PERCENT, 25)
+        self.assertTrue(bootstrap_launcher_module.PIP_CPU_CAP["enabled"])
+
     def test_ensure_portable_layout_uses_external_template_root(self):
         with tempfile.TemporaryDirectory() as runtime_tmp, tempfile.TemporaryDirectory() as source_tmp:
             runtime_root = Path(runtime_tmp)

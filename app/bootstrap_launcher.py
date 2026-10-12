@@ -64,6 +64,7 @@ MODEL_GUIDES: dict[str, str] = {
 }
 SETUP_MARKER = ".setup_complete"
 IMPORTANT_MESSAGE_SECONDS = 5
+LAUNCH_COUNTDOWN_FONT_SIZE = 30
 RUNTIME_DIR = ".runtime"
 PACKAGE_DIR = "site-packages"
 RUNTIME_ENV = "LOCAL_WHISPER_RUNTIME_ROOT"
@@ -1899,6 +1900,26 @@ def apply_windows_cpu_limit(
         return False
 
 
+def remove_windows_cpu_limit(process: subprocess.Popen, kernel32: Any | None = None) -> bool:
+    """Lift the CPU hard cap on a running process by switching off rate control on its job object."""
+    job_handle = getattr(process, "_cpu_limit_job_handle", None)
+    if not job_handle:
+        return False
+    try:
+        kernel32 = kernel32 or ctypes.WinDLL("kernel32", use_last_error=True)
+        info = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION(0, 0)
+        return bool(
+            kernel32.SetInformationJobObject(
+                job_handle,
+                JobObjectCpuRateControlInformation,
+                ctypes.byref(info),
+                ctypes.sizeof(info),
+            )
+        )
+    except Exception:
+        return False
+
+
 def close_windows_cpu_limit(process: subprocess.Popen, kernel32: Any | None = None) -> None:
     job_handle = getattr(process, "_cpu_limit_job_handle", None)
     if not job_handle:
@@ -1915,6 +1936,16 @@ def close_windows_cpu_limit(process: subprocess.Popen, kernel32: Any | None = No
 
 
 ACTIVE_PIP_PROCESSES: set[subprocess.Popen] = set()
+PIP_CPU_CAP = {"enabled": True}
+
+
+def use_full_cpu_for_pip() -> bool:
+    """User says the laptop is idle: lift the cap now and skip it for later pip runs (for example Retry)."""
+    PIP_CPU_CAP["enabled"] = False
+    released = False
+    for process in list(ACTIVE_PIP_PROCESSES):
+        released = remove_windows_cpu_limit(process) or released
+    return released
 
 
 def terminate_active_pip() -> None:
@@ -1958,7 +1989,7 @@ def run_pip_install(root: Path, on_event, package_root: Path | None = None) -> P
         errors="replace",
     )
     ACTIVE_PIP_PROCESSES.add(process)
-    cpu_limited = apply_windows_cpu_limit(process)
+    cpu_limited = apply_windows_cpu_limit(process) if PIP_CPU_CAP["enabled"] else False
     if cpu_limited:
         detail = f"pip CPU hard cap: {PIP_CPU_LIMIT_PERCENT}% of total CPU"
         on_event(PipProgressEvent("CPU limit", detail, None, detail))
@@ -2389,6 +2420,32 @@ def run_bootstrap() -> int:
     )
     package_text.pack(fill="x", expand=False, padx=18, pady=(0, 14))
 
+    full_cpu_row = tk.Frame(progress_frame, bg="#ffffff")
+    full_cpu_row.pack(fill="x", padx=18, pady=(0, 8))
+    full_cpu_button = tk.Button(full_cpu_row, text="I am not doing work, use 100% of CPU")
+
+    def show_full_cpu_button() -> None:
+        if PIP_CPU_CAP["enabled"] and not full_cpu_button.winfo_ismapped():
+            full_cpu_button.config(state="normal", text="I am not doing work, use 100% of CPU")
+            full_cpu_button.pack(side="left")
+
+    def hide_full_cpu_button() -> None:
+        full_cpu_button.pack_forget()
+
+    def use_full_cpu() -> None:
+        released = use_full_cpu_for_pip()
+        message = (
+            "pip CPU cap removed: using 100% of CPU"
+            if released
+            else "pip CPU cap will not be applied to the next install run"
+        )
+        full_cpu_button.config(state="disabled", text="Using 100% of CPU")
+        package_detail.set(message)
+        set_text(package_text, message)
+        log_install(BOOTSTRAP_STEPS[3], "CPU cap removed by user", {"released_running_pip": released})
+
+    full_cpu_button.config(command=use_full_cpu)
+
     button_row = tk.Frame(progress_frame, bg="#ffffff")
     button_row.pack(fill="x", padx=18, pady=(0, 6))
 
@@ -2713,6 +2770,8 @@ def run_bootstrap() -> int:
 
         def apply_event() -> None:
             set_command_text(event.phase)
+            if event.phase == "CPU limit":
+                show_full_cpu_button()
             replace_last = is_live_download_progress(event)
             append_details_log(
                 event.detail if replace_last else event.raw_line or event.detail or event.phase,
@@ -2818,6 +2877,8 @@ def run_bootstrap() -> int:
             set_detail_bar_indeterminate(False)
             detail = f"Launching in {seconds}..."
             package_detail.set(detail)
+            # Three times the normal 10 pt detail text so the countdown is easy to see.
+            package_text.configure(font=("Segoe UI", LAUNCH_COUNTDOWN_FONT_SIZE))
             set_text(package_text, detail)
             overall_bar.configure(style=COMPLETE_PROGRESS_STYLE)
             detail_bar.configure(style=COMPLETE_PROGRESS_STYLE)
@@ -2903,6 +2964,7 @@ def run_bootstrap() -> int:
                         result = run_pip_install(root, update_from_pip, package_root)
                     finally:
                         set_sensitive_install_phase(False)
+                        window.after(0, hide_full_cpu_button)
                     if result.code != 0:
                         log_path = write_setup_error_log(
                             root,
@@ -3036,6 +3098,7 @@ def run_bootstrap() -> int:
         retry_button,
         copy_details_button,
         open_error_log_button,
+        full_cpu_button,
     ):
         style_setup_button(button)
 
