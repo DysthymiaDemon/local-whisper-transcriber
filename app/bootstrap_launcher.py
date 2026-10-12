@@ -259,7 +259,10 @@ INTEL_OPENVINO_BACKEND = SpeechBackend(
         "whisper_model_dir": "models/openvino-whisper",
         "device": "openvino:GPU",
         "compute_type": "int8",
-        "chunk_seconds": 10.0,
+        # Measured on an i5-1345U Iris Xe: each chunk costs about 2.5 s on the GPU whatever its length (Whisper
+        # pads to 30 s). 8 s gives text about 2 s sooner than 10 s with the same accuracy; 6 s and shorter add
+        # repeated and cut-off words at chunk edges.
+        "chunk_seconds": 8.0,
         "overlap_seconds": 1.0,
     },
     note=(
@@ -1256,10 +1259,11 @@ def migrate_backend_config(config_path: Path, backend: SpeechBackend | None = No
         raw["compute_type"] = backend.config_overrides["compute_type"]
         changed = True
     try:
-        uses_old_chunks = (
-            float(raw.get("chunk_seconds")) == 5.0
-            and float(raw.get("overlap_seconds")) == 0.5
-        )
+        # Earlier generated Intel defaults; anything else was set by the user and is kept.
+        uses_old_chunks = (float(raw.get("chunk_seconds")), float(raw.get("overlap_seconds"))) in {
+            (5.0, 0.5),
+            (10.0, 1.0),
+        }
     except (TypeError, ValueError):
         uses_old_chunks = False
     if uses_old_chunks:

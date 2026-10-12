@@ -64,8 +64,8 @@ Results on the target i5-1345U laptop with the 15-minute Security Data Platform 
 | | Intel GPU (large-v3-turbo) | CPU (distil-large-v3.5) |
 |---|---|---|
 | Whole recording | 107 s | 346 s |
-| Live chunk | about 3 s per 10 s chunk | about 9 s per 15 s chunk |
-| Live chunk size | 10 s with 1 s overlap | 15 s with 1.5 s overlap |
+| Live chunk | about 2.5 s per 8 s chunk | about 9 s per 15 s chunk |
+| Live chunk size | 8 s with 1 s overlap | 15 s with 1.5 s overlap |
 | Text delay while recording | about 13 s | about 15 to 25 s |
 
 The GPU engine was also more accurate on that meeting, with better punctuation and names. It leaves the CPU free for Teams.
@@ -130,7 +130,7 @@ The Python block cannot stop code in native libraries. If IT wants an operating-
 
 The launcher's checksum changes with every release:
 
-`Open Offline Meeting Transcriber.pyw` SHA-256: `02865891a5c8dfe2c45a1a289a6112f2d4f7a7fdd41e6ac30dc4c7d661dd71cc`
+`Open Offline Meeting Transcriber.pyw` SHA-256: `655ea1dc1c25348fe93f0ff5d0b793341cceb2f2e1647402a5d4bfec8f47f089`
 
 To check a copy, run this in a terminal in its folder, and compare the result with the line above as published in this repository:
 

@@ -595,7 +595,7 @@ class BootstrapLauncherTests(unittest.TestCase):
         self.assertEqual(intel.model_downloads[0].target_subdir, "models/openvino-whisper")
         self.assertEqual(intel.config_overrides["device"], "openvino:GPU")
         self.assertEqual(intel.config_overrides["compute_type"], "int8")
-        self.assertEqual(intel.config_overrides["chunk_seconds"], 10.0)
+        self.assertEqual(intel.config_overrides["chunk_seconds"], 8.0)
         self.assertEqual(intel.config_overrides["overlap_seconds"], 1.0)
         requirements = read_requirement_lines(RESOURCES / intel.requirements_file)
         self.assertIn("openvino==2026.4.1", requirements)
@@ -683,7 +683,7 @@ class BootstrapLauncherTests(unittest.TestCase):
             self.assertEqual(config["whisper_model_dir"], "models/openvino-whisper")
             self.assertEqual(config["device"], "openvino:GPU")
             self.assertEqual(config["compute_type"], "int8")
-            self.assertEqual(config["chunk_seconds"], 10.0)
+            self.assertEqual(config["chunk_seconds"], 8.0)
             self.assertEqual(config["overlap_seconds"], 1.0)
             self.assertIn("828 MB", guide_content)
             self.assertIn("OpenVINO 2026.1", guide_content)
@@ -719,9 +719,31 @@ class BootstrapLauncherTests(unittest.TestCase):
             config = json.loads(config_path.read_text(encoding="utf-8"))
 
         self.assertEqual(config["compute_type"], "int8")
-        self.assertEqual(config["chunk_seconds"], 10.0)
+        self.assertEqual(config["chunk_seconds"], 8.0)
         self.assertEqual(config["overlap_seconds"], 1.0)
         self.assertEqual(config["language"], "en")
+
+    def test_intel_layout_moves_previous_ten_second_default_to_eight(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "whisper_model_dir": "models/openvino-whisper",
+                        "device": "openvino:GPU",
+                        "compute_type": "int8",
+                        "chunk_seconds": 10.0,
+                        "overlap_seconds": 1.0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with intel_backend():
+                ensure_portable_layout(root)
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+
+        self.assertEqual((config["chunk_seconds"], config["overlap_seconds"]), (8.0, 1.0))
 
     def test_intel_layout_preserves_custom_path_and_chunks(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -100,7 +100,7 @@ class StandaloneLauncherTests(unittest.TestCase):
 
         self.assertIn("OpenVINO/whisper-large-v3-turbo-int8-ov", content)
         self.assertIn('"compute_type": "int8"', content)
-        self.assertIn('"chunk_seconds": 10.0', content)
+        self.assertIn('"chunk_seconds": 8.0', content)
         self.assertNotIn("OpenVINO/whisper-small-fp16-ov", content)
 
     def test_launcher_does_not_force_huggingface_offline_before_bootstrap(self):
