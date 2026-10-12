@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -79,6 +80,7 @@ APP_PUBLISHER = "Ameen Khan"
 APP_VERSION = "local"
 INSTALL_DISK_SPACE_ESTIMATE = "~2.9 GB"
 MODEL_SOURCE_FILE = "MODEL_SOURCE.json"
+MODEL_MANIFEST_FILE = "model_manifest.json"
 BASE_REQUIREMENTS_FILE = "requirements.txt"
 FASTER_WHISPER_ALLOW_PATTERNS = (
     "model.bin",
@@ -1340,17 +1342,65 @@ def _model_folder_ready_at(folder: Path, name: str) -> bool:
     return False
 
 
-def read_model_source(folder: Path) -> str | None:
+def read_model_source_details(folder: Path) -> tuple[str | None, str | None]:
+    """(repo_id, revision) from the MODEL_SOURCE.json marker; revision is None for markers written before pinning."""
     try:
         raw = json.loads((folder / MODEL_SOURCE_FILE).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return None
-    repo_id = raw.get("repo_id") if isinstance(raw, dict) else None
-    return repo_id if isinstance(repo_id, str) else None
+        return None, None
+    if not isinstance(raw, dict):
+        return None, None
+    repo_id = raw.get("repo_id")
+    revision = raw.get("revision")
+    return (repo_id if isinstance(repo_id, str) else None, revision if isinstance(revision, str) else None)
 
 
-def write_model_source(folder: Path, repo_id: str) -> None:
-    (folder / MODEL_SOURCE_FILE).write_text(json.dumps({"repo_id": repo_id}, indent=2) + "\n", encoding="utf-8")
+def read_model_source(folder: Path) -> str | None:
+    return read_model_source_details(folder)[0]
+
+
+def write_model_source(folder: Path, repo_id: str, revision: str = "") -> None:
+    marker: dict[str, str] = {"repo_id": repo_id}
+    if revision:
+        marker["revision"] = revision
+    (folder / MODEL_SOURCE_FILE).write_text(json.dumps(marker, indent=2) + "\n", encoding="utf-8")
+
+
+def load_model_manifest(package_root: Path | None = None) -> dict[str, Any]:
+    """Approved model revisions and file digests, written by packaging/lock_models.py."""
+    path = resource_root(package_root) / MODEL_MANIFEST_FILE
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise RuntimeError(f"Model manifest is not a JSON object: {path}")
+    return raw
+
+
+def model_manifest_entry(repo_id: str) -> dict[str, Any]:
+    entry = load_model_manifest().get(repo_id)
+    files = entry.get("files") if isinstance(entry, dict) else None
+    if not isinstance(entry, dict) or not isinstance(entry.get("revision"), str) or not isinstance(files, dict) or not files:
+        raise RuntimeError(f"No approved revision for {repo_id} in {MODEL_MANIFEST_FILE}; refusing to download it.")
+    return entry
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def verify_model_digests(folder: Path, repo_id: str) -> list[str]:
+    """Problems found comparing the model files in folder with the approved digests; empty when every file matches."""
+    problems: list[str] = []
+    for rel_path, expected in sorted(model_manifest_entry(repo_id)["files"].items()):
+        path = folder / rel_path
+        if not path.is_file():
+            problems.append(f"missing: {rel_path}")
+        elif file_sha256(path) != str(expected).lower():
+            problems.append(f"changed: {rel_path}")
+    return problems
 
 
 def _configured_model_dir(root: Path) -> Path | None:
@@ -1366,18 +1416,29 @@ def _configured_model_dir(root: Path) -> Path | None:
 
 
 def model_needs_upgrade(root: Path, spec: ModelDownloadSpec) -> bool:
-    """A complete default faster-whisper folder from an older default model (for example small.en).
+    """True when a complete default model folder is not the approved model revision.
 
-    Only the default folder is ever upgraded; a custom model path in config.json is left alone.
+    That is an older default faster-whisper model (for example small.en), or the right model whose files do not
+    match the approved digests. Only the default folder is ever upgraded; a custom model path in config.json is
+    left alone.
     """
-    if spec.name != "faster-whisper":
-        return False
     target = (root / spec.target_subdir).resolve()
     if _configured_model_dir(root) not in (None, target):
         return False
     if not _model_folder_ready_at(target, spec.name):
         return False
-    return read_model_source(target) != spec.repo_id
+    repo_id, revision = read_model_source_details(target)
+    if repo_id != spec.repo_id:
+        # Older default CPU model: offer the upgrade. Other unmarked folders were copied in by hand: leave them.
+        return spec.name == "faster-whisper"
+    approved = model_manifest_entry(spec.repo_id)["revision"]
+    if revision == approved:
+        return False
+    # Marker written before revisions were pinned: check the files once and record the revision if they match.
+    if verify_model_digests(target, spec.repo_id):
+        return True
+    write_model_source(target, spec.repo_id, approved)
+    return False
 
 
 def model_upgrades_available(root: Path) -> list[ModelDownloadSpec]:
@@ -1697,6 +1758,8 @@ def download_snapshot_with_progress(
         try:
             kwargs: dict[str, Any] = {
                 "repo_id": spec.repo_id,
+                # Pinned commit from resources/model_manifest.json, never the moving main branch.
+                "revision": model_manifest_entry(spec.repo_id)["revision"],
                 "local_dir": str(staging),
                 "local_files_only": False,
                 "force_download": True,
@@ -1770,6 +1833,7 @@ def download_default_models(root: Path, on_event, downloader: Callable[..., str]
 
         detail = f"{spec.repo_id} -> {target}"
         on_event(PipProgressEvent("Downloading model", detail, base_progress, detail))
+        approved_revision = model_manifest_entry(spec.repo_id)["revision"]
         staging = prepare_model_download_staging_dir(root, spec)
         end_progress = int((index / total) * 100)
         total_bytes = fetch_model_repo_size(spec.repo_id, root)
@@ -1791,9 +1855,18 @@ def download_default_models(root: Path, on_event, downloader: Callable[..., str]
                 downloader,
             )
         verify_downloaded_model(root, spec, staging, returned_path)
+        check_detail = f"Checking {spec.repo_id} files against approved digests"
+        on_event(PipProgressEvent("Verifying model", check_detail, end_progress, check_detail))
+        problems = verify_model_digests(staging, spec.repo_id)
+        if problems:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise RuntimeError(
+                f"Downloaded {spec.repo_id} does not match the approved model files, so it was not installed.\n"
+                + "\n".join(problems[:10])
+            )
         copy_staged_model_to_target(staging, target, spec.name)
         verify_downloaded_model(root, spec, target, returned_path)
-        write_model_source(target, spec.repo_id)
+        write_model_source(target, spec.repo_id, approved_revision)
         downloaded.append(spec.name)
         on_event(PipProgressEvent("Model downloaded", detail, end_progress, detail))
     return downloaded
@@ -2121,6 +2194,8 @@ def run_bootstrap() -> int:
         and not backend_active()
         and config_uses_default_cpu_model(root)
     )
+    if not gpu_upgrade:
+        update_startup_splash(splash, splash_status, "Checking speech model files...")
     upgrades = [] if gpu_upgrade else model_upgrades_available(root)
     if gpu_upgrade:
         upgrades = list(wanted_backend.model_downloads)

@@ -189,6 +189,13 @@ class FileGuiTests(unittest.TestCase):
         self.assertEqual(self.window.model_button.state, gui.MODEL_STOPPED)
         self.assertEqual(self.window.model_button.text(), "Start Model")
 
+    def test_only_custom_model_folders_are_flagged_as_unverified(self):
+        models = gui.application_root() / "models"
+
+        self.assertTrue(self.window._model_folder_is_setup_managed(str(models / "faster-whisper")))
+        self.assertTrue(self.window._model_folder_is_setup_managed(str(models / "openvino-whisper")))
+        self.assertFalse(self.window._model_folder_is_setup_managed("D:/models/my-whisper"))
+
     def test_home_record_starts_model_red_yellow_green(self):
         with patch.object(gui.EngineConfig, "validate", return_value=[]):
             self.window.home_record_button.click()

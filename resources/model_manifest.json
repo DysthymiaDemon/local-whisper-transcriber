@@ -1,0 +1,38 @@
+{
+  "OpenVINO/whisper-large-v3-turbo-int8-ov": {
+    "files": {
+      ".gitattributes": "11ad7efa24975ee4b0c3c3a38ed18737f0658a5f75a0a96787b576a78a023361",
+      "README.md": "5d31d3988be3a54b10fb8bab7387c4338d05d6250f471b2f48159f4d006cb569",
+      "added_tokens.json": "3c51f66c4c21f9e126970078f11ae77a78c74aee8df606ee9daba86e467108e0",
+      "config.json": "bfd92c097547ab12cb42abae8008be5a59a91fdc5ab39acce24489eb8a3e8a86",
+      "generation_config.json": "4617fcca458af3b91a103143aaac919c1ab6680b552d7abd10811b7248bd77b4",
+      "merges.txt": "2df2990a395e35e8dfbc7511e08c12d56018d8d04691e0133e5d63b21e154dc6",
+      "normalizer.json": "bf1c507dc8724ca9cf9903640dacfb69dae2f00edee4f21ceba106a7392f26dd",
+      "openvino_config.json": "9da38e88cec069ad54699d627f1c59d36c36a3dfb54b5e1bb5cfdf5832efaf03",
+      "openvino_decoder_model.bin": "c064991cbafc4381567d29972b7013dc24026de9c326d03eb1e6e4fc44aa959f",
+      "openvino_decoder_model.xml": "aeb09fafbf1c0cbf84baf30f46763436005822faf3b365359b8de0aa04f03047",
+      "openvino_detokenizer.bin": "f2b3c47825a1089525ff65c0c8e49271e1dee69a401a04fc827ac2de5b7766e4",
+      "openvino_detokenizer.xml": "6e106a14f14b0771b46b7948a99b1d819ff93b2455b7da8f47761ab9dba9dc56",
+      "openvino_encoder_model.bin": "0590a8f35f96d57801c55990028d917821ac721026e34b7f3f59d7561fc908e6",
+      "openvino_encoder_model.xml": "60713d4ed3a8ac8ee020e11c4737ec276d14cabc6a082537bddf2c00ba6ce070",
+      "openvino_tokenizer.bin": "adfa3d9a2920d0f314121270a960ab331ec0f05838544bb8ecaaa422282a6fd4",
+      "openvino_tokenizer.xml": "cba304e7bad54773b9d2cbccfbc8501117ecf2e3c0f4f5331742a0a3c9feed93",
+      "preprocessor_config.json": "654cf18d3e163b948ceaf9766da56ce0b52de265d58673cf61c9376f126bd499",
+      "special_tokens_map.json": "baea4ea09372eb4fca86b4e4346139fd73cb807d5087e9de0948e971739c3e74",
+      "tokenizer.json": "5c1bf30c9e716e1477bedef846b01be0013daecb89e9e3ef7ab89b23c178df1b",
+      "tokenizer_config.json": "3c75940dfce3a294fca7041a5faff011677f1b68fa85e47511bb8cf6dccaded6",
+      "vocab.json": "6788c80b082e9b0d1393147d3a3e62ba19285ac0c82ace8e5ef00f37ead58971"
+    },
+    "revision": "b568445dd5dc8c695bde596f8acbb4694fd6ba64"
+  },
+  "distil-whisper/distil-large-v3.5-ct2": {
+    "files": {
+      "config.json": "90c55f775cc4e0bb17293d0bf12f96557a486f20dea886fabd8e6075a3588b21",
+      "model.bin": "c58b88b8585ffcd2135fddaaf421ce72cb223b32edea70d156aed1dea319a119",
+      "preprocessor_config.json": "7ccc62c6f2765af1f3b46c00c9b5894426835a05021c8b9c01eecb6dfb542711",
+      "tokenizer.json": "b3c8202bbf06d8ee4232c5984baa563784ac4737e2e7fdc42fa180200d3cfcdb",
+      "vocabulary.json": "c69260f2ab26d659b7c398f9a2b2b48ed0df16c3b47d7326782fd9cba71690c1"
+    },
+    "revision": "9793ccc07920e0f830e1dba0343efcdf0ef8c903"
+  }
+}

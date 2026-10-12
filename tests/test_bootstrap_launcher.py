@@ -57,6 +57,117 @@ from bootstrap_launcher import (
 
 
 RESOURCES = Path(__file__).resolve().parents[1] / "resources"
+REAL_VERIFY_MODEL_DIGESTS = bootstrap_launcher_module.verify_model_digests
+_digest_patch = patch.object(bootstrap_launcher_module, "verify_model_digests", return_value=[])
+
+
+def setUpModule():
+    # Fake model files cannot match the real approved digests; ModelDigestTests checks the real function.
+    _digest_patch.start()
+
+
+def tearDownModule():
+    _digest_patch.stop()
+
+
+class ModelDigestTests(unittest.TestCase):
+    def manifest_for(self, files: dict[str, bytes], revision: str = "a" * 40):
+        import hashlib
+
+        entry = {"revision": revision, "files": {name: hashlib.sha256(data).hexdigest() for name, data in files.items()}}
+        return patch.object(bootstrap_launcher_module, "load_model_manifest", return_value={"org/model": entry})
+
+    def test_manifest_pins_every_setup_model_to_a_commit_with_digests(self):
+        manifest = bootstrap_launcher_module.load_model_manifest(RESOURCES.parent)
+        specs = DEFAULT_MODEL_DOWNLOADS + bootstrap_launcher_module.OPENVINO_MODEL_DOWNLOADS
+        for spec in specs:
+            with self.subTest(repo=spec.repo_id):
+                entry = manifest[spec.repo_id]
+                self.assertRegex(entry["revision"], r"^[0-9a-f]{40}$")
+                self.assertTrue(entry["files"])
+                for digest in entry["files"].values():
+                    self.assertRegex(digest, r"^[0-9a-f]{64}$")
+        self.assertIn("model.bin", manifest[DEFAULT_MODEL_DOWNLOADS[0].repo_id]["files"])
+
+    def test_matching_files_pass_and_changed_or_missing_files_are_reported(self):
+        files = {"model.bin": b"weights", "config.json": b"{}"}
+        with tempfile.TemporaryDirectory() as tmp, self.manifest_for(files):
+            folder = Path(tmp)
+            for name, data in files.items():
+                (folder / name).write_bytes(data)
+            (folder / "README_MODEL_FILES.txt").write_text("local guide", encoding="utf-8")
+            clean = REAL_VERIFY_MODEL_DIGESTS(folder, "org/model")
+            (folder / "model.bin").write_bytes(b"weightz")
+            (folder / "config.json").unlink()
+            problems = REAL_VERIFY_MODEL_DIGESTS(folder, "org/model")
+
+        self.assertEqual(clean, [])
+        self.assertEqual(problems, ["missing: config.json", "changed: model.bin"])
+
+    def test_unknown_model_is_refused(self):
+        with patch.object(bootstrap_launcher_module, "load_model_manifest", return_value={}):
+            with self.assertRaises(RuntimeError):
+                bootstrap_launcher_module.model_manifest_entry("org/unknown")
+
+    def test_download_uses_pinned_revision_and_tampered_download_is_not_installed(self):
+        spec = DEFAULT_MODEL_DOWNLOADS[0]
+        manifest = bootstrap_launcher_module.load_model_manifest(RESOURCES.parent)
+        calls = []
+
+        def fake_download(**kwargs):
+            calls.append(kwargs)
+            write_fake_faster_whisper(kwargs["local_dir"])
+            return kwargs["local_dir"]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ensure_portable_layout(root)
+            write_fake_faster_whisper(root / "models" / "faster-whisper")
+            write_model_source(root / "models" / "faster-whisper", "Systran/faster-whisper-small.en")
+            with patch.object(bootstrap_launcher_module, "verify_model_digests", REAL_VERIFY_MODEL_DIGESTS):
+                with self.assertRaisesRegex(RuntimeError, "does not match the approved model files"):
+                    download_default_models(root, lambda event: None, downloader=fake_download)
+            kept = read_model_source(root / "models" / "faster-whisper")
+
+        self.assertEqual(calls[0]["revision"], manifest[spec.repo_id]["revision"])
+        self.assertEqual(kept, "Systran/faster-whisper-small.en")
+
+    def test_verified_download_records_revision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ensure_portable_layout(root)
+            download_default_models(
+                root,
+                lambda event: None,
+                downloader=lambda **kwargs: write_fake_faster_whisper(kwargs["local_dir"]) or kwargs["local_dir"],
+            )
+            repo_id, revision = bootstrap_launcher_module.read_model_source_details(root / "models" / "faster-whisper")
+
+        approved = bootstrap_launcher_module.load_model_manifest(RESOURCES.parent)[repo_id]["revision"]
+        self.assertEqual(repo_id, DEFAULT_MODEL_DOWNLOADS[0].repo_id)
+        self.assertEqual(revision, approved)
+
+    def test_marker_without_revision_is_checked_once_then_recorded(self):
+        spec = DEFAULT_MODEL_DOWNLOADS[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ensure_portable_layout(root)
+            folder = root / "models" / "faster-whisper"
+            write_fake_faster_whisper(folder)
+            write_model_source(folder, spec.repo_id)
+            with patch.object(bootstrap_launcher_module, "verify_model_digests", return_value=[]) as verify:
+                first = model_needs_upgrade(root, spec)
+                second = model_needs_upgrade(root, spec)
+            recorded = bootstrap_launcher_module.read_model_source_details(folder)[1]
+            write_model_source(folder, spec.repo_id)
+            with patch.object(bootstrap_launcher_module, "verify_model_digests", return_value=["changed: model.bin"]):
+                tampered = model_needs_upgrade(root, spec)
+
+        self.assertFalse(first)
+        self.assertFalse(second)
+        self.assertEqual(verify.call_count, 1)
+        self.assertTrue(recorded)
+        self.assertTrue(tampered)
 
 
 def read_requirement_lines(path: Path) -> list[str]:
