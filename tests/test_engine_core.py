@@ -828,6 +828,60 @@ class TranscriptionBacklogTests(unittest.TestCase):
         self.assertTrue(any(str(recovery_path) in message for message in messages))
 
 
+class BoundedStopTests(unittest.TestCase):
+    def run_loop(self, chunks, timeout, transcribe_seconds):
+        import time
+        from types import SimpleNamespace
+        import transcriber_engine
+
+        transcribed = []
+
+        def transcribe(samples, **kwargs):
+            transcribed.append(len(samples))
+            time.sleep(transcribe_seconds)
+            return [], None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = MeetingTranscriberEngine(
+                EngineConfig(output_file=os.path.join(tmp, "out.txt"), chunk_seconds=2.0, overlap_seconds=0.5)
+            )
+            events = []
+            engine.on_event(lambda event_type, payload: events.append((event_type, payload)))
+            for index in range(chunks):
+                engine._transcription_queue.put(AudioChunk(index, float(index), [0.0] * 32000, 16000))
+            engine._transcription_queue.put(None)
+            engine._stop_requested_at = time.monotonic()
+            with patch.object(transcriber_engine, "STOP_DRAIN_TIMEOUT_SECONDS", timeout), patch.object(
+                engine, "_load_whisper_model", return_value=SimpleNamespace(transcribe=transcribe)
+            ):
+                started = time.monotonic()
+                engine._transcription_loop()
+                took = time.monotonic() - started
+        warnings = [payload for event_type, payload in events if event_type == "warning"]
+        return transcribed, warnings, took
+
+    def test_long_backlog_after_stop_is_reported_instead_of_waited_for(self):
+        transcribed, warnings, took = self.run_loop(chunks=10, timeout=0.2, transcribe_seconds=0.15)
+
+        self.assertLess(len(transcribed), 10)
+        self.assertLess(took, 1.0)
+        self.assertEqual(len(warnings), 1)
+        skipped = 10 - len(transcribed)
+        self.assertAlmostEqual(warnings[0]["untranscribed_seconds"], skipped * 1.5)
+        self.assertIn("not transcribed", warnings[0]["message"])
+
+    def test_short_backlog_after_stop_is_fully_transcribed(self):
+        transcribed, warnings, _ = self.run_loop(chunks=3, timeout=5.0, transcribe_seconds=0.0)
+
+        self.assertEqual(len(transcribed), 3)
+        self.assertEqual(warnings, [])
+
+    def test_stop_drain_timeout_is_sixty_seconds(self):
+        import transcriber_engine
+
+        self.assertEqual(transcriber_engine.STOP_DRAIN_TIMEOUT_SECONDS, 60.0)
+
+
 class EngineDisclosureTests(unittest.TestCase):
     def test_engine_installs_the_socket_guard_itself(self):
         import offline_guard

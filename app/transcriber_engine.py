@@ -266,6 +266,8 @@ def audio_chunk_has_activity(samples: Any, noise_floor: float = DEFAULT_NOISE_FL
 # Untranscribed live audio kept in memory before the oldest chunk is skipped (about 130 MB at 15 s chunks).
 MAX_BACKLOG_SECONDS = 1800.0
 RAW_CHUNK_QUEUE_SIZE = 8
+# After Stop, queued audio is still transcribed for this long; anything left after that is reported, not transcribed.
+STOP_DRAIN_TIMEOUT_SECONDS = 60.0
 
 
 def transcription_queue_limit(chunk_seconds: float, overlap_seconds: float) -> int:
@@ -679,6 +681,7 @@ class MeetingTranscriberEngine:
             maxsize=transcription_queue_limit(config.chunk_seconds, config.overlap_seconds)
         )
         self._skipped_seconds = 0.0
+        self._stop_requested_at: float | None = None
         self._pending_transcription_chunks: set[int] = set()
         self._active_transcription_chunk: AudioChunk | None = None
         self._transcript_save_error_reported = False
@@ -714,6 +717,7 @@ class MeetingTranscriberEngine:
 
     def stop(self) -> None:
         self._emit("status", {"message": "Stopping"})
+        self._stop_requested_at = time.monotonic()
         self._stop_event.set()
         for thread in self._threads:
             thread.join()
@@ -1172,11 +1176,30 @@ class MeetingTranscriberEngine:
             self._emit("fatal", {"message": f"Whisper model load failed: {exc}"})
             return
 
+        untranscribed_seconds = 0.0
         while True:
             chunk = self._transcription_queue.get()
             if chunk is None:
+                if untranscribed_seconds > 0:
+                    self._emit(
+                        "warning",
+                        {
+                            "message": (
+                                f"Stopped after {STOP_DRAIN_TIMEOUT_SECONDS:.0f} s of catch-up: "
+                                f"{untranscribed_seconds:.0f} s of recorded audio was not transcribed."
+                            ),
+                            "untranscribed_seconds": untranscribed_seconds,
+                        },
+                    )
                 self._emit("lag", {"behind_seconds": 0.0, "active": False})
                 return
+            stop_at = self._stop_requested_at
+            if stop_at is not None and time.monotonic() - stop_at > STOP_DRAIN_TIMEOUT_SECONDS:
+                # Stop must not wait without limit for a long backlog: drain the rest without transcribing it.
+                untranscribed_seconds += max(0.0, audio_chunk_duration_seconds(chunk) - self.config.overlap_seconds)
+                with self._state_lock:
+                    self._pending_transcription_chunks.discard(chunk.index)
+                continue
             try:
                 with self._state_lock:
                     self._active_transcription_chunk = chunk
