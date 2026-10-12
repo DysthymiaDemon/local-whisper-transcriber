@@ -26,6 +26,7 @@ if sys.stderr is None:
     sys.stderr = open(os.devnull, "w", encoding="utf-8")
 
 from app_config import append_error_log, application_root, error_log_root, source_root
+from transcriber_engine import OPENVINO_REQUIRED_MODEL_FILES, faster_whisper_missing_files
 
 
 REQUIRED_IMPORTS: dict[str, str] = {
@@ -43,10 +44,14 @@ GPU_TRIAL_MODEL_DIRS = ("openvino-whisper",)
 MODEL_DIRS = DEFAULT_MODEL_DIRS + OPTIONAL_MODEL_DIRS
 MODEL_GUIDES: dict[str, str] = {
     "faster-whisper": (
-        "Default CPU setup downloads Systran/faster-whisper-small.en here.\n\n"
-        "Required file:\n"
-        "- model.bin\n\n"
-        "Example source model: Systran/faster-whisper-small.en\n"
+        "Default CPU setup downloads distil-whisper/distil-large-v3.5-ct2 here (about 1.5 GB).\n\n"
+        "Required files:\n"
+        "- model.bin\n"
+        "- config.json\n"
+        "- tokenizer.json\n"
+        "- vocabulary.json or vocabulary.txt\n"
+        "- preprocessor_config.json (for 128 mel-bin models such as distil-large-v3.5)\n\n"
+        "Source model: distil-whisper/distil-large-v3.5-ct2\n"
     ),
     "openvino-whisper": (
         "GPU trial setup downloads OpenVINO/whisper-large-v3-turbo-int8-ov here for Intel GPU testing.\n\n"
@@ -71,22 +76,20 @@ OPENVINO_MODEL_CONFIG_SIGNATURE = {
     "decoder_layers": 4,
     "num_mel_bins": 128,
 }
-OPENVINO_REQUIRED_MODEL_FILES = (
-    "openvino_encoder_model.xml",
-    "openvino_encoder_model.bin",
-    "openvino_decoder_model.xml",
-    "openvino_decoder_model.bin",
-    "openvino_tokenizer.xml",
-    "openvino_tokenizer.bin",
-    "openvino_detokenizer.xml",
-    "openvino_detokenizer.bin",
-)
 APP_PUBLISHER = "Ameen Khan"
 APP_VERSION = "local"
-INSTALL_DISK_SPACE_ESTIMATE = "~1.8 GB"
+INSTALL_DISK_SPACE_ESTIMATE = "~2.9 GB"
+MODEL_SOURCE_FILE = "MODEL_SOURCE.json"
+FASTER_WHISPER_ALLOW_PATTERNS = (
+    "model.bin",
+    "config.json",
+    "tokenizer.json",
+    "vocabulary.*",
+    "preprocessor_config.json",
+)
 NPM_DOTS5_SPINNER_FRAMES = ("⠋", "⠙", "⠚", "⠞", "⠖", "⠦", "⠴", "⠲", "⠳", "⠓")
 HF_OFFLINE_ENV_VARS = ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE")
-HF_PROGRESS_ENV_VARS = ("HF_HUB_DISABLE_PROGRESS_BARS",)
+HF_PROGRESS_ENV_VARS = ("HF_HUB_DISABLE_PROGRESS_BARS", "HF_HUB_DISABLE_TELEMETRY")
 CA_BUNDLE_ENV = "LOCAL_WHISPER_CA_BUNDLE"
 TLS_CERT_ENV_VARS = ("REQUESTS_CA_BUNDLE", "SSL_CERT_FILE", "CURL_CA_BUNDLE")
 CA_BUNDLE_FILENAMES = ("company-ca.pem", "corporate-ca.pem", "ca-bundle.pem")
@@ -186,6 +189,8 @@ class ModelDownloadSpec:
     name: str
     repo_id: str
     target_subdir: str
+    approx_size: str = ""
+    allow_patterns: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -210,8 +215,10 @@ class JOBOBJECT_CPU_RATE_CONTROL_INFORMATION(ctypes.Structure):
 DEFAULT_MODEL_DOWNLOADS = (
     ModelDownloadSpec(
         name="faster-whisper",
-        repo_id="Systran/faster-whisper-small.en",
+        repo_id="distil-whisper/distil-large-v3.5-ct2",
         target_subdir="models/faster-whisper",
+        approx_size="1.5 GB",
+        allow_patterns=FASTER_WHISPER_ALLOW_PATTERNS,
     ),
 )
 
@@ -220,6 +227,7 @@ OPENVINO_MODEL_DOWNLOADS = (
         name="openvino-whisper",
         repo_id="OpenVINO/whisper-large-v3-turbo-int8-ov",
         target_subdir="models/openvino-whisper",
+        approx_size="828 MB",
     ),
 )
 
@@ -294,7 +302,7 @@ def setup_install_summary(package_root: Path | None = None) -> str:
         backend = active_gpu_trial_backend()
         gpu_trial_note = f"\nGPU trial backend: {backend.label}\n{backend.note}\n"
     return (
-        "Install Offline Meeting Transcriber?\n"
+        "Install Meeting Scribe?\n"
         "Local Windows App\n"
         f"Publisher: {APP_PUBLISHER}\n"
         f"Version: {APP_VERSION}\n\n"
@@ -312,6 +320,11 @@ def setup_install_summary(package_root: Path | None = None) -> str:
 
 def setup_model_list() -> list[str]:
     return [f"{spec.repo_id} -> {spec.target_subdir.replace('/', os.sep)}" for spec in active_model_downloads()]
+
+
+def setup_model_size_hint() -> str:
+    sizes = [spec.approx_size for spec in active_model_downloads() if spec.approx_size]
+    return "Estimated model download: " + (" + ".join(sizes) if sizes else "shown when download starts")
 
 
 def setup_package_list(package_root: Path | None = None) -> list[str]:
@@ -1128,9 +1141,16 @@ sys.exit(1 if missing else 0)
         env=env,
         check=False,
     )
+    # The probe exits 0 (all present) or 1 (some missing). Anything else, or no JSON, means the
+    # probe itself crashed, so nothing can be trusted as installed.
+    output = result.stdout.strip()
+    if result.returncode not in (0, 1) or not output:
+        return list(required.keys())
     try:
-        parsed = json.loads(result.stdout.strip() or "[]")
+        parsed = json.loads(output.splitlines()[-1])
     except json.JSONDecodeError:
+        return list(required.keys())
+    if not isinstance(parsed, list):
         return list(required.keys())
     return [item for item in parsed if isinstance(item, str)]
 
@@ -1272,10 +1292,54 @@ def _openvino_model_matches_expected(folder: Path) -> bool:
 
 def _model_folder_ready_at(folder: Path, name: str) -> bool:
     if name == "faster-whisper":
-        return (folder / "model.bin").is_file()
+        return folder.is_dir() and not faster_whisper_missing_files(folder)
     if name == "openvino-whisper":
         return _openvino_model_matches_expected(folder)
     return False
+
+
+def read_model_source(folder: Path) -> str | None:
+    try:
+        raw = json.loads((folder / MODEL_SOURCE_FILE).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    repo_id = raw.get("repo_id") if isinstance(raw, dict) else None
+    return repo_id if isinstance(repo_id, str) else None
+
+
+def write_model_source(folder: Path, repo_id: str) -> None:
+    (folder / MODEL_SOURCE_FILE).write_text(json.dumps({"repo_id": repo_id}, indent=2) + "\n", encoding="utf-8")
+
+
+def _configured_model_dir(root: Path) -> Path | None:
+    try:
+        raw = json.loads((root / "config.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    value = raw.get("whisper_model_dir") if isinstance(raw, dict) else None
+    if not isinstance(value, str) or not value:
+        return None
+    path = Path(value)
+    return (path if path.is_absolute() else root / path).resolve()
+
+
+def model_needs_upgrade(root: Path, spec: ModelDownloadSpec) -> bool:
+    """A complete default faster-whisper folder from an older default model (for example small.en).
+
+    Only the default folder is ever upgraded; a custom model path in config.json is left alone.
+    """
+    if spec.name != "faster-whisper":
+        return False
+    target = (root / spec.target_subdir).resolve()
+    if _configured_model_dir(root) not in (None, target):
+        return False
+    if not _model_folder_ready_at(target, spec.name):
+        return False
+    return read_model_source(target) != spec.repo_id
+
+
+def model_upgrades_available(root: Path) -> list[ModelDownloadSpec]:
+    return [spec for spec in active_model_downloads() if model_needs_upgrade(root, spec)]
 
 
 def model_folder_status(root: Path, include_optional: bool = False) -> dict[str, BootstrapStatus]:
@@ -1589,12 +1653,17 @@ def download_snapshot_with_progress(
 
     def worker() -> None:
         try:
-            result["path"] = downloader(
-                repo_id=spec.repo_id,
-                local_dir=str(staging),
-                local_files_only=False,
-                force_download=True,
-            )
+            kwargs: dict[str, Any] = {
+                "repo_id": spec.repo_id,
+                "local_dir": str(staging),
+                "local_files_only": False,
+                "force_download": True,
+                # Public models only: never send a cached Hugging Face token from this laptop.
+                "token": False,
+            }
+            if spec.allow_patterns:
+                kwargs["allow_patterns"] = list(spec.allow_patterns)
+            result["path"] = downloader(**kwargs)
         except BaseException as exc:  # pragma: no cover - propagated below
             result["error"] = exc
 
@@ -1646,7 +1715,7 @@ def download_default_models(root: Path, on_event, downloader: Callable[..., str]
             raise RuntimeError(f"Model rollback folder already exists: {rollback}")
         target.mkdir(parents=True, exist_ok=True)
         base_progress = int(((index - 1) / total) * 100)
-        if _model_folder_ready(root, spec.name):
+        if _model_folder_ready(root, spec.name) and not model_needs_upgrade(root, spec):
             on_event(
                 PipProgressEvent(
                     "Model ready",
@@ -1682,6 +1751,7 @@ def download_default_models(root: Path, on_event, downloader: Callable[..., str]
         verify_downloaded_model(root, spec, staging, returned_path)
         copy_staged_model_to_target(staging, target, spec.name)
         verify_downloaded_model(root, spec, target, returned_path)
+        write_model_source(target, spec.repo_id)
         downloaded.append(spec.name)
         on_event(PipProgressEvent("Model downloaded", detail, end_progress, detail))
     return downloaded
@@ -1751,9 +1821,10 @@ def launch_gui(root: Path, splash=None, splash_status=None) -> int:
     os.chdir(root)
     os.environ["LOCAL_WHISPER_APP_ROOT"] = str(root)
     os.environ["LOCAL_WHISPER_SOURCE_ROOT"] = str(installer_source_root())
-    os.environ.setdefault("HF_HUB_OFFLINE", "1")
-    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-    os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+    # Setup is over: from here on nothing may reach the network.
+    from offline_guard import enforce_offline
+
+    enforce_offline()
 
     if splash is None:
         try:
@@ -1843,6 +1914,19 @@ def close_windows_cpu_limit(process: subprocess.Popen, kernel32: Any | None = No
         pass
 
 
+ACTIVE_PIP_PROCESSES: set[subprocess.Popen] = set()
+
+
+def terminate_active_pip() -> None:
+    """Stop pip when the user closes setup, so it does not keep writing to site-packages."""
+    for process in list(ACTIVE_PIP_PROCESSES):
+        try:
+            if process.poll() is None:
+                process.terminate()
+        except Exception:
+            pass
+
+
 def run_pip_install(root: Path, on_event, package_root: Path | None = None) -> PipInstallResult:
     package_root = package_root or installer_source_root()
     requirements_paths = pip_requirement_paths(root, package_root)
@@ -1873,6 +1957,7 @@ def run_pip_install(root: Path, on_event, package_root: Path | None = None) -> P
         encoding="utf-8",
         errors="replace",
     )
+    ACTIVE_PIP_PROCESSES.add(process)
     cpu_limited = apply_windows_cpu_limit(process)
     if cpu_limited:
         detail = f"pip CPU hard cap: {PIP_CPU_LIMIT_PERCENT}% of total CPU"
@@ -1887,6 +1972,7 @@ def run_pip_install(root: Path, on_event, package_root: Path | None = None) -> P
             on_event(parser.parse(stripped))
         code = process.wait()
     finally:
+        ACTIVE_PIP_PROCESSES.discard(process)
         close_windows_cpu_limit(process)
     return PipInstallResult(code, command, list(recent_output))
 
@@ -1916,10 +2002,39 @@ def needs_setup(root: Path, required: Mapping[str, str] | None = None) -> bool:
     return bool(missing_runtime_imports(root, required)) or models_missing or not (root / SETUP_MARKER).exists()
 
 
+SETUP_BUTTON_LIGHT = "#DCEBFA"
+SETUP_BUTTON_TEXT = "#1E3A5F"
+SETUP_BUTTON_HOVER = "#24508F"
+SETUP_BUTTON_HOVER_TEXT = "#FFFFFF"
+
+
+def style_setup_button(button) -> None:
+    """Light-blue buttons that turn dark blue on hover, matching the Meeting Scribe app."""
+
+    def set_colors(background: str, foreground: str) -> None:
+        if str(button.cget("state")) != "disabled":
+            button.config(bg=background, fg=foreground)
+
+    button.config(
+        bg=SETUP_BUTTON_LIGHT,
+        fg=SETUP_BUTTON_TEXT,
+        activebackground=SETUP_BUTTON_HOVER,
+        activeforeground=SETUP_BUTTON_HOVER_TEXT,
+        relief="flat",
+        borderwidth=0,
+        highlightthickness=0,
+        padx=10,
+        pady=5,
+        cursor="hand2",
+        font=("Segoe UI", 10),
+    )
+    button.bind("<Enter>", lambda _event: set_colors(SETUP_BUTTON_HOVER, SETUP_BUTTON_HOVER_TEXT), add="+")
+    button.bind("<Leave>", lambda _event: set_colors(SETUP_BUTTON_LIGHT, SETUP_BUTTON_TEXT), add="+")
+
+
 def run_bootstrap() -> int:
     root = runtime_root()
     package_root = installer_source_root()
-    configure_download_tls(root)
     splash = None
     splash_status = None
     try:
@@ -1937,11 +2052,15 @@ def run_bootstrap() -> int:
     models_missing = any(value == BootstrapStatus.MISSING for value in model_folder_status(root).values())
     update_startup_splash(splash, splash_status, "Checking first-time setup status...")
     setup_missing = not (root / SETUP_MARKER).exists()
-    if not missing_packages and not models_missing and not setup_missing:
+    upgrades = model_upgrades_available(root)
+    upgrade_only = not missing_packages and not models_missing and not setup_missing and bool(upgrades)
+    if not missing_packages and not models_missing and not setup_missing and not upgrades:
         update_startup_splash(splash, splash_status, "Dependencies ready.")
         return launch_gui(root, splash, splash_status)
 
-    if missing_packages:
+    if upgrade_only:
+        update_startup_splash(splash, splash_status, "A more accurate speech model is available...")
+    elif missing_packages:
         update_startup_splash(splash, splash_status, "Dependencies missing. Opening first-time setup...")
     elif models_missing:
         update_startup_splash(splash, splash_status, "Default AI models missing. Opening setup...")
@@ -1954,10 +2073,10 @@ def run_bootstrap() -> int:
     append_install_log(root, "Setup", "Installer opened", {"install_log": str(install_log_file)})
 
     import tkinter as tk
-    from tkinter import filedialog, messagebox, ttk
+    from tkinter import messagebox, ttk
 
     window = tk.Tk()
-    window.title("Offline Meeting Transcriber Setup")
+    window.title("Meeting Scribe Setup")
     window.geometry("860x680")
     window.minsize(820, 650)
     window.resizable(False, False)
@@ -1979,7 +2098,7 @@ def run_bootstrap() -> int:
     command_detail = tk.StringVar(value="")
     eta_detail = tk.StringVar(value="")
     install_path_detail = tk.StringVar(value=f"Install path: {root}")
-    model_size_summary = tk.StringVar(value="Estimated model download: estimating...")
+    model_size_summary = tk.StringVar(value=setup_model_size_hint())
     final_message_active = tk.BooleanVar(value=False)
     ui_thread = threading.current_thread()
     step_diagnostics = {step: StepDiagnostic(step) for step in BOOTSTRAP_STEPS}
@@ -1996,7 +2115,7 @@ def run_bootstrap() -> int:
 
     title = tk.Label(
         window,
-        text="Offline Meeting Transcriber",
+        text="Meeting Scribe",
         font=("Segoe UI", 18, "bold"),
         anchor="w",
         bg="#f7f7f7",
@@ -2061,7 +2180,7 @@ def run_bootstrap() -> int:
 
     install_title = tk.Label(
         install_content,
-        text="Install Offline Meeting Transcriber?",
+        text="Upgrade speech model?" if upgrade_only else "Install Meeting Scribe?",
         font=("Segoe UI", 16, "bold"),
         anchor="w",
         bg="#ffffff",
@@ -2183,38 +2302,25 @@ def run_bootstrap() -> int:
     package_list.insert("1.0", "\n".join(f"- {package}" for package in setup_package_list(package_root)))
     package_list.configure(state="disabled", cursor="arrow", takefocus=False)
 
+    if upgrade_only:
+        upgrade_sizes = ", ".join(spec.approx_size for spec in upgrades if spec.approx_size)
+        install_note_text = (
+            f"A more accurate speech model is available ({upgrade_sizes}). "
+            "Install downloads it once. Use current model keeps the one you have."
+        )
+    else:
+        install_note_text = "Internet is used only for these setup downloads. The app itself always runs offline."
     install_note = tk.Label(
         install_content,
-        text="Internet required for first setup downloads. Runtime stays local/offline.",
+        text=install_note_text,
+        wraplength=480,
+        justify="left",
         font=("Segoe UI", 10),
         anchor="w",
         bg="#ffffff",
         fg="#333333",
     )
     install_note.pack(fill="x", padx=20, pady=(8, 8))
-
-    onedrive_warning_frame = tk.Frame(
-        install_content,
-        bg="#fff4ce",
-        highlightbackground="#d29922",
-        highlightthickness=1,
-    )
-    onedrive_warning = tk.Label(
-        onedrive_warning_frame,
-        text=(
-            "This install path is under OneDrive. Models and runtime files can be large; "
-            "a local folder such as C:\\Dev avoids sync delays."
-        ),
-        font=("Segoe UI", 9),
-        anchor="w",
-        justify="left",
-        bg="#fff4ce",
-        fg="#5f3b00",
-        wraplength=480,
-    )
-    onedrive_warning.pack(fill="x", padx=10, pady=(8, 6))
-    onedrive_actions = tk.Frame(onedrive_warning_frame, bg="#fff4ce")
-    onedrive_actions.pack(fill="x", padx=10, pady=(0, 8))
 
     progress_frame = tk.Frame(detail_frame, bg="#ffffff")
 
@@ -2416,6 +2522,8 @@ def run_bootstrap() -> int:
         set_text(command_text, value)
         step_diagnostics[current_step].last_output = value
 
+    setup_closed = {"value": False}
+
     def run_on_ui(callback):
         if threading.current_thread() is ui_thread:
             return callback()
@@ -2430,62 +2538,16 @@ def run_bootstrap() -> int:
             finally:
                 done.set()
 
-        window.after(0, wrapped)
-        done.wait()
+        try:
+            window.after(0, wrapped)
+        except tk.TclError as exc:
+            raise RuntimeError("Setup window was closed.") from exc
+        while not done.wait(0.25):
+            if setup_closed["value"]:
+                raise RuntimeError("Setup window was closed.")
         if "error" in result:
             raise result["error"]
         return result.get("value")
-
-    def set_install_button_enabled(enabled: bool) -> None:
-        button = install_button_ref.get("value")
-        if button is not None:
-            button.config(state="normal" if enabled else "disabled")
-
-    def refresh_onedrive_warning() -> None:
-        install_path_detail.set(f"Install path: {root}")
-        if is_onedrive_path(root):
-            if not onedrive_warning_frame.winfo_ismapped():
-                onedrive_warning_frame.pack(fill="x", padx=20, pady=(0, 10), before=models_title)
-            set_install_button_enabled(False)
-        else:
-            onedrive_warning_frame.pack_forget()
-            set_install_button_enabled(True)
-
-    def continue_onedrive_install() -> None:
-        onedrive_warning_frame.pack_forget()
-        set_install_button_enabled(True)
-
-    def choose_local_install_folder() -> None:
-        nonlocal root
-        selected = filedialog.askdirectory(title="Choose local install folder")
-        if not selected:
-            return
-        root = Path(selected).expanduser().resolve()
-        install_path_detail.set(f"Install path: {root}")
-        refresh_onedrive_warning()
-
-    tk.Button(onedrive_actions, text="Continue anyway", width=16, command=continue_onedrive_install).pack(side="left")
-    tk.Button(onedrive_actions, text="Choose local folder", width=18, command=choose_local_install_folder).pack(
-        side="left", padx=(8, 0)
-    )
-
-    def refresh_model_size_estimate() -> None:
-        with online_huggingface_download_env(root):
-            sizes = estimate_model_download_sizes(active_model_downloads(), root)
-        total = total_known_size(sizes)
-        if total:
-            message = f"Estimated model download: {format_bytes(total)}"
-        else:
-            known = [size for size in sizes.values() if isinstance(size, int) and size > 0]
-            message = (
-                f"Estimated model download: at least {format_bytes(sum(known))}"
-                if known
-                else "Estimated model download: unavailable"
-            )
-        run_on_ui(lambda: model_size_summary.set(message))
-
-    def start_model_size_estimate() -> None:
-        threading.Thread(target=refresh_model_size_estimate, name="model-size-estimate", daemon=True).start()
 
     sensitive_install_phase = {"active": False}
 
@@ -2556,6 +2618,8 @@ def run_bootstrap() -> int:
                 "Package or model install is in progress. Closing now can leave a half-installed setup.\n\nClose anyway?",
             ):
                 return
+        setup_closed["value"] = True
+        terminate_active_pip()
         window.destroy()
 
     retry_button.config(command=retry_failed_step)
@@ -2635,29 +2699,6 @@ def run_bootstrap() -> int:
 
         run_on_ui(apply_message)
         time.sleep(IMPORTANT_MESSAGE_SECONDS)
-
-    def choose_model_folder(model_name: str) -> None:
-        selected = filedialog.askdirectory(title=f"Select folder for {model_name}")
-        if not selected:
-            return
-        target = root / "models" / model_name
-        target.mkdir(parents=True, exist_ok=True)
-        marker = target / "README_SELECTED_MODEL_PATH.txt"
-        marker.write_text(
-            f"Selected source folder:\n{selected}\n\nCopy model files here or update config.json manually.\n",
-            encoding="utf-8",
-        )
-        detail = f"Recorded selected folder for {model_name}:\n{selected}"
-        package_detail.set(detail)
-        set_text(package_text, detail)
-        render_steps()
-
-    def open_model_folder() -> None:
-        model_root = root / "models"
-        os.startfile(model_root)
-        detail = f"Opened model folder:\n{model_root}"
-        package_detail.set(detail)
-        set_text(package_text, detail)
 
     def update_from_pip(event: PipProgressEvent) -> None:
         log_install(
@@ -2760,6 +2801,7 @@ def run_bootstrap() -> int:
             launched["value"] = True
             step_states[BOOTSTRAP_STEPS[-1]] = StepState.DONE
             (root / SETUP_MARKER).write_text("complete\n", encoding="utf-8")
+            setup_closed["value"] = True
             window.destroy()
             raise SystemExit(launch_gui(root))
 
@@ -2856,6 +2898,8 @@ def run_bootstrap() -> int:
                     pip_tracker["value"] = PipInstallProgressTracker()
                     set_sensitive_install_phase(True)
                     try:
+                        # Corporate HTTPS inspection: trust the Windows certificate store for pip downloads.
+                        configure_download_tls(root)
                         result = run_pip_install(root, update_from_pip, package_root)
                     finally:
                         set_sensitive_install_phase(False)
@@ -2970,19 +3014,36 @@ def run_bootstrap() -> int:
             child.config(state="disabled")
         threading.Thread(target=run_setup_flow, name="setup-flow", daemon=True).start()
 
+    def use_current_model() -> None:
+        setup_closed["value"] = True
+        window.destroy()
+        raise SystemExit(launch_gui(root))
+
     cancel_button = tk.Button(install_button_row, text="Cancel", width=14, command=on_close_setup)
     cancel_button.pack(side="right", padx=(0, 20))
     install_button = tk.Button(install_button_row, text="Install", width=14, command=start_flow)
     install_button.pack(side="right", padx=(0, 8))
     install_button_ref["value"] = install_button
-    refresh_onedrive_warning()
+    if upgrade_only:
+        keep_button = tk.Button(install_button_row, text="Use current model", width=18, command=use_current_model)
+        keep_button.pack(side="right", padx=(0, 8))
+    for button in (
+        install_button,
+        cancel_button,
+        *install_button_row.winfo_children(),
+        details_button,
+        launch_now_button,
+        retry_button,
+        copy_details_button,
+        open_error_log_button,
+    ):
+        style_setup_button(button)
 
     set_text(command_text, command_detail.get())
     set_text(package_text, "")
 
     render_steps()
     tick_spinner()
-    window.after(100, start_model_size_estimate)
     window.mainloop()
     return 0
 

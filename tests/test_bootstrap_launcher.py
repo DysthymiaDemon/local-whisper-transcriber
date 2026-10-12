@@ -50,6 +50,10 @@ from bootstrap_launcher import (
     setup_package_list,
     verify_downloaded_model,
     write_setup_error_log,
+    model_needs_upgrade,
+    model_upgrades_available,
+    read_model_source,
+    write_model_source,
 )
 
 
@@ -57,6 +61,138 @@ def write_complete_openvino_ir(folder: Path, content: str = "model") -> None:
     for stem in ("encoder_model", "decoder_model", "tokenizer", "detokenizer"):
         (folder / f"openvino_{stem}.xml").write_text(f"{content} xml", encoding="utf-8")
         (folder / f"openvino_{stem}.bin").write_bytes(f"{content} weights".encode())
+
+
+def write_fake_faster_whisper(folder):
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    for name in ("model.bin", "config.json", "tokenizer.json", "vocabulary.json"):
+        (folder / name).write_bytes(b"model")
+
+
+class ModelUpgradeTests(unittest.TestCase):
+    def test_default_model_is_distil_large_v3_5_with_file_filter(self):
+        spec = DEFAULT_MODEL_DOWNLOADS[0]
+        self.assertEqual(spec.repo_id, "distil-whisper/distil-large-v3.5-ct2")
+        self.assertIn("tokenizer.json", spec.allow_patterns)
+        self.assertIn("preprocessor_config.json", spec.allow_patterns)
+
+    def test_download_sends_no_token_filters_files_and_writes_marker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ensure_portable_layout(root)
+            calls = []
+
+            def fake_download(**kwargs):
+                calls.append(kwargs)
+                write_fake_faster_whisper(kwargs["local_dir"])
+                return kwargs["local_dir"]
+
+            download_default_models(root, lambda event: None, downloader=fake_download)
+            source = read_model_source(root / "models" / "faster-whisper")
+
+        self.assertIs(calls[0]["token"], False)
+        self.assertIn("vocabulary.*", calls[0]["allow_patterns"])
+        self.assertEqual(source, "distil-whisper/distil-large-v3.5-ct2")
+
+    def test_older_complete_default_model_is_ready_but_offers_upgrade(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ensure_portable_layout(root)
+            write_fake_faster_whisper(root / "models" / "faster-whisper")
+
+            status = model_folder_status(root)
+            upgrades = model_upgrades_available(root)
+            write_model_source(root / "models" / "faster-whisper", "Systran/faster-whisper-small.en")
+            still_upgrade = model_needs_upgrade(root, DEFAULT_MODEL_DOWNLOADS[0])
+            write_model_source(root / "models" / "faster-whisper", DEFAULT_MODEL_DOWNLOADS[0].repo_id)
+            current = model_upgrades_available(root)
+
+        self.assertEqual(status["faster-whisper"], BootstrapStatus.READY)
+        self.assertEqual([spec.name for spec in upgrades], ["faster-whisper"])
+        self.assertTrue(still_upgrade)
+        self.assertEqual(current, [])
+
+    def test_custom_model_path_is_never_upgraded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ensure_portable_layout(root)
+            write_fake_faster_whisper(root / "models" / "faster-whisper")
+            config = json.loads((root / "config.json").read_text(encoding="utf-8"))
+            config["whisper_model_dir"] = "D:/models/my-whisper"
+            (root / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+            self.assertEqual(model_upgrades_available(root), [])
+
+    def test_upgrade_download_replaces_old_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ensure_portable_layout(root)
+            target = root / "models" / "faster-whisper"
+            write_fake_faster_whisper(target)
+            (target / "old.txt").write_text("small.en", encoding="utf-8")
+
+            def fake_download(**kwargs):
+                write_fake_faster_whisper(kwargs["local_dir"])
+                return kwargs["local_dir"]
+
+            downloaded = download_default_models(root, lambda event: None, downloader=fake_download)
+            old_left = (target / "old.txt").exists()
+            upgrades = model_upgrades_available(root)
+
+        self.assertEqual(downloaded, ["faster-whisper"])
+        self.assertFalse(old_left)
+        self.assertEqual(upgrades, [])
+
+    def test_model_without_tokenizer_is_not_ready(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ensure_portable_layout(root)
+            write_fake_faster_whisper(root / "models" / "faster-whisper")
+            (root / "models" / "faster-whisper" / "tokenizer.json").unlink()
+
+            status = model_folder_status(root)
+
+        self.assertEqual(status["faster-whisper"], BootstrapStatus.MISSING)
+
+
+class InstallerNetworkTests(unittest.TestCase):
+    def test_crashed_import_probe_reports_everything_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            local_package_dir(root).mkdir(parents=True)
+            crashed = subprocess.CompletedProcess([], 2, stdout="", stderr="Traceback")
+            with patch.object(bootstrap_launcher_module.subprocess, "run", return_value=crashed):
+                missing = missing_runtime_imports(root, {"json": "json", "os": "os"})
+
+        self.assertEqual(missing, ["json", "os"])
+
+    def test_installer_has_no_automatic_network_call_or_onedrive_banner(self):
+        source = (Path(__file__).resolve().parents[1] / "app" / "bootstrap_launcher.py").read_text(encoding="utf-8")
+        run_bootstrap_source = source.split("def run_bootstrap() -> int:", 1)[1]
+        before_window = run_bootstrap_source.split("window = tk.Tk()", 1)[0]
+
+        self.assertNotIn("start_model_size_estimate", source)
+        self.assertNotIn("configure_download_tls", before_window)
+        self.assertNotIn("This install path is under OneDrive", source)
+
+    def test_closing_setup_terminates_running_pip(self):
+        class FakeProcess:
+            terminated = False
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                self.terminated = True
+
+        process = FakeProcess()
+        bootstrap_launcher_module.ACTIVE_PIP_PROCESSES.add(process)
+        try:
+            bootstrap_launcher_module.terminate_active_pip()
+        finally:
+            bootstrap_launcher_module.ACTIVE_PIP_PROCESSES.discard(process)
+        self.assertTrue(process.terminated)
 
 
 class BootstrapLauncherTests(unittest.TestCase):
@@ -124,8 +260,8 @@ class BootstrapLauncherTests(unittest.TestCase):
             packages = setup_package_list(root)
 
         self.assertIn(f"Publisher: {APP_PUBLISHER}", summary)
-        self.assertIn("Disk space: ~1.8 GB for packages and models.", summary)
-        self.assertIn("Systran/faster-whisper-small.en -> models\\faster-whisper", summary)
+        self.assertIn("Disk space: ~2.9 GB for packages and models.", summary)
+        self.assertIn("distil-whisper/distil-large-v3.5-ct2 -> models\\faster-whisper", summary)
         self.assertNotIn("speechbrain", summary)
         self.assertEqual(packages, ["alpha==1.0", "beta>=2.0"])
         self.assertIn("- alpha==1.0", summary)
@@ -168,7 +304,7 @@ class BootstrapLauncherTests(unittest.TestCase):
     def test_setup_confirmation_mentions_disk_space(self):
         source = (Path(__file__).resolve().parents[1] / "app" / "bootstrap_launcher.py").read_text(encoding="utf-8")
 
-        self.assertIn('INSTALL_DISK_SPACE_ESTIMATE = "~1.8 GB"', source)
+        self.assertIn('INSTALL_DISK_SPACE_ESTIMATE = "~2.9 GB"', source)
         self.assertIn("this install uses {INSTALL_DISK_SPACE_ESTIMATE} for packages and models", source)
 
     def test_detect_gpu_vendors_from_video_controller_names(self):
@@ -689,7 +825,7 @@ class BootstrapLauncherTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             ensure_portable_layout(root)
-            (root / "models" / "faster-whisper" / "model.bin").write_bytes(b"model")
+            write_fake_faster_whisper(root / "models" / "faster-whisper")
 
             status = model_folder_status(root)
 
@@ -820,7 +956,8 @@ class BootstrapLauncherTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             ensure_portable_layout(root)
-            (root / "models" / "faster-whisper" / "model.bin").write_bytes(b"model")
+            write_fake_faster_whisper(root / "models" / "faster-whisper")
+            write_model_source(root / "models" / "faster-whisper", DEFAULT_MODEL_DOWNLOADS[0].repo_id)
             calls = []
 
             downloaded = download_default_models(
@@ -1118,8 +1255,8 @@ class BootstrapLauncherTests(unittest.TestCase):
             def fake_download(**kwargs):
                 calls.append(kwargs)
                 target = Path(kwargs["local_dir"])
-                self.assertEqual(kwargs["repo_id"], "Systran/faster-whisper-small.en")
-                (target / "model.bin").write_bytes(b"model")
+                self.assertEqual(kwargs["repo_id"], "distil-whisper/distil-large-v3.5-ct2")
+                write_fake_faster_whisper(target)
                 return str(target)
 
             downloaded = download_default_models(root, lambda event: None, downloader=fake_download)
@@ -1142,8 +1279,8 @@ class BootstrapLauncherTests(unittest.TestCase):
             def fake_download(**kwargs):
                 calls.append(kwargs)
                 target = Path(kwargs["local_dir"])
-                self.assertEqual(kwargs["repo_id"], "Systran/faster-whisper-small.en")
-                (target / "model.bin").write_bytes(b"model")
+                self.assertEqual(kwargs["repo_id"], "distil-whisper/distil-large-v3.5-ct2")
+                write_fake_faster_whisper(target)
                 return str(target)
 
             downloaded = download_default_models(root, lambda event: None, downloader=fake_download)
@@ -1164,8 +1301,8 @@ class BootstrapLauncherTests(unittest.TestCase):
             def fake_download(**kwargs):
                 target = Path(kwargs["local_dir"])
                 self.assertFalse((target / "stale.txt").exists())
-                self.assertEqual(kwargs["repo_id"], "Systran/faster-whisper-small.en")
-                (target / "model.bin").write_bytes(b"model")
+                self.assertEqual(kwargs["repo_id"], "distil-whisper/distil-large-v3.5-ct2")
+                write_fake_faster_whisper(target)
                 return str(target)
 
             download_default_models(root, lambda event: None, downloader=fake_download)
@@ -1181,8 +1318,8 @@ class BootstrapLauncherTests(unittest.TestCase):
             def fake_download(**kwargs):
                 seen_env.append({name: os.environ.get(name) for name in HF_OFFLINE_ENV_VARS})
                 target = Path(kwargs["local_dir"])
-                self.assertEqual(kwargs["repo_id"], "Systran/faster-whisper-small.en")
-                (target / "model.bin").write_bytes(b"model")
+                self.assertEqual(kwargs["repo_id"], "distil-whisper/distil-large-v3.5-ct2")
+                write_fake_faster_whisper(target)
                 return str(target)
 
             with patch.dict(
@@ -1414,7 +1551,7 @@ class BootstrapLauncherTests(unittest.TestCase):
             self.assertTrue(needs_setup(root, {"json": "json"}))
             (root / SETUP_MARKER).write_text("complete\n", encoding="utf-8")
             local_package_dir(root).mkdir(parents=True)
-            (root / "models" / "faster-whisper" / "model.bin").write_bytes(b"model")
+            write_fake_faster_whisper(root / "models" / "faster-whisper")
 
             self.assertFalse(needs_setup(root, {"json": "json"}))
 
@@ -1507,7 +1644,8 @@ class BootstrapLauncherTests(unittest.TestCase):
 
             def fake_download(**kwargs):
                 target = Path(kwargs["local_dir"])
-                self.assertEqual(kwargs["repo_id"], "Systran/faster-whisper-small.en")
+                self.assertEqual(kwargs["repo_id"], "distil-whisper/distil-large-v3.5-ct2")
+                write_fake_faster_whisper(target)
                 for size in (25, 50, 100):
                     (target / "model.bin").write_bytes(b"x" * size)
                     time.sleep(0.35)
@@ -1693,7 +1831,8 @@ class BootstrapLauncherTests(unittest.TestCase):
         self.assertNotIn("install_button_row.place(", source)
         self.assertNotIn("install_canvas = tk.Canvas", source)
         self.assertNotIn("install_content_window", source)
-        self.assertIn("before=models_title", source)
+        self.assertNotIn("onedrive_warning", source)
+        self.assertNotIn("Continue anyway", source)
 
     def test_write_setup_error_log_records_command_and_recent_output(self):
         with tempfile.TemporaryDirectory() as tmp:

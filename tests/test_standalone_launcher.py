@@ -112,9 +112,9 @@ class StandaloneLauncherTests(unittest.TestCase):
     def test_runtime_launch_still_forces_huggingface_offline(self):
         content = (PROJECT_ROOT / "app" / "bootstrap_launcher.py").read_text(encoding="utf-8")
 
-        self.assertIn('os.environ.setdefault("HF_HUB_OFFLINE", "1")', content)
-        self.assertIn('os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")', content)
-        self.assertIn('os.environ.setdefault("HF_DATASETS_OFFLINE", "1")', content)
+        launch_source = content.split("def launch_gui(", 1)[1].split("\ndef ", 1)[0]
+        self.assertIn("enforce_offline()", launch_source)
+        self.assertNotIn("os.environ.setdefault(\"HF_HUB_OFFLINE\"", content)
 
     def test_copy_buttons_show_temporary_copied_feedback(self):
         content = (PROJECT_ROOT / "app" / "meeting_transcriber_gui.py").read_text(encoding="utf-8")
