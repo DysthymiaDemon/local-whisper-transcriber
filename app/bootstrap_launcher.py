@@ -82,6 +82,8 @@ INSTALL_DISK_SPACE_ESTIMATE = "~2.9 GB"
 MODEL_SOURCE_FILE = "MODEL_SOURCE.json"
 MODEL_MANIFEST_FILE = "model_manifest.json"
 BASE_REQUIREMENTS_FILE = "requirements.txt"
+# OpenVINO model-converter telemetry: never needed here, and left out of the lock files.
+UNWANTED_PACKAGE_PATTERNS = ("openvino_telemetry", "openvino_telemetry-*.dist-info")
 FASTER_WHISPER_ALLOW_PATTERNS = (
     "model.bin",
     "config.json",
@@ -1269,9 +1271,28 @@ def migrate_backend_config(config_path: Path, backend: SpeechBackend | None = No
     return changed
 
 
+def remove_unwanted_packages(package_dir: Path) -> list[str]:
+    """Delete packages the app must never ship (see EXCLUDED_PACKAGES in packaging/lock_requirements.py).
+
+    Installs made before openvino-telemetry was left out of the lock still have it; OpenVINO works without it.
+    """
+    removed: list[str] = []
+    if not package_dir.is_dir():
+        return removed
+    for pattern in UNWANTED_PACKAGE_PATTERNS:
+        for path in package_dir.glob(pattern):
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                path.unlink(missing_ok=True)
+            removed.append(path.name)
+    return removed
+
+
 def ensure_portable_layout(root: Path, template_root: Path | None = None) -> Path:
     migrate_legacy_onedrive_runtime(root)
     local_runtime_dir(root).mkdir(parents=True, exist_ok=True)
+    remove_unwanted_packages(local_package_dir(root))
     models = root / "models"
     for name in active_model_dirs():
         model_dir = models / name

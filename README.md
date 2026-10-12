@@ -123,14 +123,14 @@ The Python block cannot stop code in native libraries. If IT wants an operating-
 
 ### What setup checks
 
-- **Packages:** every package, including dependencies, is pinned to one version and one SHA-256 hash in the `.lock.txt` files. pip installs with `--require-hashes --only-binary=:all: --no-deps`, so it refuses a changed file, anything built from source, and any package not in the lock.
+- **Packages:** every package, including dependencies, is pinned to one version and one SHA-256 hash in the `.lock.txt` files. pip installs with `--require-hashes --only-binary=:all: --no-deps`, so it refuses a changed file, anything built from source, and any package not in the lock. OpenVINO's telemetry package (`openvino-telemetry`) is deliberately left out. Only OpenVINO's model converter uses it, and this app never runs the converter. Setup also deletes it from older installs.
 - **Models:** `resources\model_manifest.json` pins each model to a Hugging Face commit and lists the SHA-256 of every file. Setup downloads that commit and refuses a download whose files do not match. A model folder you set yourself under **Advanced** is not checked, and the log says so.
 
 ### Checking the launcher
 
 The launcher's checksum changes with every release:
 
-`Open Offline Meeting Transcriber.pyw` SHA-256: `9dc7d4f69bedea10f244a9e262cdd95f6acea3fd1954a2f790bc7276a4a4e297`
+`Open Offline Meeting Transcriber.pyw` SHA-256: `02865891a5c8dfe2c45a1a289a6112f2d4f7a7fdd41e6ac30dc4c7d661dd71cc`
 
 To check a copy, run this in a terminal in its folder, and compare the result with the line above as published in this repository:
 

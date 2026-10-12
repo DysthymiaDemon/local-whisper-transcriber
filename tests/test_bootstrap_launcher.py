@@ -213,6 +213,23 @@ class RequirementLockTests(unittest.TestCase):
 
         self.assertFalse(set(base) & set(openvino))
 
+    def test_openvino_telemetry_is_never_installed(self):
+        for name in ("requirements.lock.txt", "requirements-openvino.lock.txt"):
+            with self.subTest(lock=name):
+                self.assertNotIn("openvino-telemetry", read_lock(RESOURCES / name))
+
+    def test_leftover_openvino_telemetry_is_removed_from_existing_installs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            packages = local_package_dir(root)
+            (packages / "openvino_telemetry" / "backend").mkdir(parents=True)
+            (packages / "openvino_telemetry-2025.2.0.dist-info").mkdir()
+            (packages / "openvino").mkdir()
+            ensure_portable_layout(root)
+            remaining = sorted(path.name for path in packages.iterdir())
+
+        self.assertEqual(remaining, ["openvino"])
+
     def test_lock_paths_follow_the_active_backend(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
