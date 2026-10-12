@@ -27,6 +27,7 @@ from transcriber_engine import (
     list_output_devices,
     preload_whisper_model,
     rms_to_meter_percent,
+    unload_whisper_model,
 )
 from ui_helpers import meter_bar_geometry
 
@@ -86,6 +87,11 @@ try:
         add_soft_shadow,
         draw_icon,
         TITLE_BLUE,
+        MODEL_READY,
+        MODEL_STARTING,
+        MODEL_STOPPED,
+        MODEL_STOPPING,
+        ModelLightButton,
     )
 except ImportError as exc:  # pragma: no cover - depends on local GUI deps
     print(
@@ -174,6 +180,7 @@ class MainWindow(QMainWindow):
         self._spinner_frames = ["|", "/", "-", "\\"]
         self._copy_feedback_tokens: dict[int, int] = {}
         self._copy_button_originals: dict[int, tuple[str, QIcon, str]] = {}
+        self._loaded_model_config: EngineConfig | None = None
         self.spinner_timer = QTimer(self)
         self.spinner_timer.setInterval(160)
         self.spinner_timer.timeout.connect(self._tick_spinner)
@@ -187,7 +194,6 @@ class MainWindow(QMainWindow):
 
         self._load_devices()
         self._set_running(False)
-        self._start_model_preload()
         if CONFIG_LOAD_PROBLEM:
             log_path = self._write_error_log("Configuration file ignored", CONFIG_LOAD_PROBLEM)
             self._append_log(f"{CONFIG_LOAD_PROBLEM}. Using default settings. Details saved to {log_path}")
@@ -286,6 +292,9 @@ class MainWindow(QMainWindow):
 
         controls = QGroupBox("Controls")
         controls_layout = QVBoxLayout(controls)
+        self.model_button = ModelLightButton()
+        self.model_button.clicked.connect(self._toggle_model)
+        controls_layout.addWidget(self.model_button)
         button_row = QHBoxLayout()
         self.record_button = QPushButton("Record")
         self.pause_button = QPushButton("Pause")
@@ -379,21 +388,33 @@ class MainWindow(QMainWindow):
         root_layout.addWidget(self.log_box)
         return root
 
-    def _start_model_preload(self) -> None:
-        """Load and warm up the speech model in the background so Record starts transcribing at once."""
+    def _toggle_model(self) -> None:
+        if self.model_button.state == MODEL_STOPPED:
+            self._start_model()
+        elif self.model_button.state == MODEL_READY:
+            self._stop_model()
+
+    def _start_model(self) -> bool:
+        """Load and warm up the speech model in the background (red -> yellow -> green)."""
+        if self.model_button.state != MODEL_STOPPED:
+            return self.model_button.state in (MODEL_STARTING, MODEL_READY)
         config = self._read_config()
         model_errors = [error for error in config.validate() if "model" in error.lower()]
         if model_errors:
             self._set_model_status("Speech model not found. Run setup or set Advanced > Model folder.")
-            return
-        self._set_model_status("Loading speech model in the background...")
+            return False
+        self._loaded_model_config = config
+        self._set_model_state(MODEL_STARTING)
+        self._set_model_status("Starting speech model...")
 
         def preload() -> None:
             started = time.monotonic()
             try:
                 model = preload_whisper_model(config)
             except Exception as exc:
-                self.bridge.event.emit("model_status", {"ready": False, "message": f"Speech model failed to load: {exc}"})
+                self.bridge.event.emit(
+                    "model_status", {"state": "failed", "message": f"Speech model failed to load: {exc}"}
+                )
                 return
             seconds = time.monotonic() - started
             where = "on the Intel GPU" if config.device.lower().startswith("openvino") else "on the CPU"
@@ -402,10 +423,44 @@ class MainWindow(QMainWindow):
                 where = "on the CPU (Intel GPU unavailable)"
                 self.bridge.event.emit("log", {"message": fallback})
             self.bridge.event.emit(
-                "model_status", {"ready": True, "message": f"Speech model ready {where} ({seconds:.0f}s to load)"}
+                "model_status",
+                {"state": MODEL_READY, "message": f"Speech model ready {where} ({seconds:.0f}s to load)"},
             )
 
-        threading.Thread(target=preload, name="model-preload", daemon=True).start()
+        threading.Thread(target=preload, name="model-start", daemon=True).start()
+        return True
+
+    def _stop_model(self) -> None:
+        """Unload the speech model to free memory (green -> yellow -> red)."""
+        if self.model_button.state != MODEL_READY or self._busy():
+            return
+        config = self._loaded_model_config or self._read_config()
+        self._set_model_state(MODEL_STOPPING)
+        self._set_model_status("Stopping speech model...")
+
+        def unload() -> None:
+            try:
+                unload_whisper_model(config)
+            finally:
+                self.bridge.event.emit("model_status", {"state": MODEL_STOPPED, "message": "Speech model stopped"})
+
+        threading.Thread(target=unload, name="model-stop", daemon=True).start()
+
+    def _busy(self) -> bool:
+        return bool(self.engine or self.file_worker or self._stopping)
+
+    def _set_model_state(self, state: str) -> None:
+        self.model_button.set_state(state)
+        self._refresh_model_controls()
+
+    def _refresh_model_controls(self) -> None:
+        busy = self._busy()
+        changing = self.model_button.state in (MODEL_STARTING, MODEL_STOPPING)
+        self.model_button.setEnabled(not busy and not changing)
+        # Record is allowed while the model starts (audio is buffered) but not while it is being unloaded.
+        unloading = self.model_button.state == MODEL_STOPPING
+        self.record_button.setEnabled(not busy and not unloading)
+        self.file_button.setEnabled(not busy and not unloading)
 
     def _set_model_status(self, message: str) -> None:
         self.model_status_label.setText(message)
@@ -417,6 +472,7 @@ class MainWindow(QMainWindow):
 
     def _open_recording_session(self) -> None:
         self.pages.setCurrentIndex(SESSION_PAGE)
+        self._start_model()
 
     def _open_existing_meeting(self) -> None:
         if self._start_file_transcription():
@@ -575,6 +631,10 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Configuration error", f"{message}\n\nError details saved to {log_path}")
             return
         self._save_settings(config)
+        if self.model_button.state == MODEL_STOPPING:
+            return
+        # Starting the model here does not block: the engine buffers audio until the model is ready.
+        self._start_model()
 
         session_config = replace(config, output_file=session_output_path(config.output_file))
         self.transcript_text.clear()
@@ -609,6 +669,7 @@ class MainWindow(QMainWindow):
         if Path(source).resolve() == Path(output).resolve():
             QMessageBox.critical(self, "Invalid output", "Output must differ from the source recording.")
             return False
+        self._start_model()
         self.transcript_text.clear()
         self.file_progress_label.setText("Preparing recording")
         self.file_worker = FileTranscriptionWorker(
@@ -724,10 +785,16 @@ class MainWindow(QMainWindow):
             self._append_log(str(payload.get("message", "")))
         elif event_type == "model_status":
             message = str(payload.get("message", ""))
+            state = payload.get("state")
             self._set_model_status(message)
-            if not payload.get("ready"):
-                self._write_error_log("Speech model preload", message)
+            if state == MODEL_READY:
+                self._set_model_state(MODEL_READY)
+            else:
+                self._set_model_state(MODEL_STOPPED)
+                if state == "failed":
+                    self._write_error_log("Speech model start", message)
         elif event_type == "fatal":
+            self._set_model_state(MODEL_STOPPED)
             if self.engine and not self._stopping:
                 self._stop_recording()
         elif event_type == "engine_stopped":
@@ -801,6 +868,7 @@ class MainWindow(QMainWindow):
         self.file_button.setEnabled(not running)
         self.record_button.setEnabled(not running)
         self.home_button.setEnabled(not running)
+        self._refresh_model_controls()
         self.pause_button.setEnabled(running)
         self.stop_button.setEnabled(running)
         self.pause_button.setText("Pause")

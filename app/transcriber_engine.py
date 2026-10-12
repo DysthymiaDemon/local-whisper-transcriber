@@ -1254,6 +1254,20 @@ def whisper_model_is_loaded(config: EngineConfig) -> bool:
         return _model_cache_key(config) in _model_cache
 
 
+def unload_whisper_model(config: EngineConfig) -> bool:
+    """Drop the cached model so its memory (and GPU memory for OpenVINO) is released. Returns True if one was loaded."""
+    import gc
+
+    key = _model_cache_key(config)
+    with _model_cache_lock:
+        model = _model_cache.pop(key, None)
+        _warmed_models.discard(key)
+    unloaded = model is not None
+    del model
+    gc.collect()
+    return unloaded
+
+
 def clear_whisper_model_cache() -> None:
     with _model_cache_lock:
         _model_cache.clear()

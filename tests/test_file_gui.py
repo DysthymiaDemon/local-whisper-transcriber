@@ -16,11 +16,26 @@ class FileGuiTests(unittest.TestCase):
         cls.application = QApplication.instance() or QApplication([])
 
     def setUp(self):
-        with patch.object(gui, "list_input_devices", side_effect=RuntimeError("no device")), patch.object(
-            gui.MainWindow, "_start_model_preload"
-        ):
+        self.preload = self.start_patch(patch.object(gui, "preload_whisper_model"))
+        self.unload = self.start_patch(patch.object(gui, "unload_whisper_model"))
+        with patch.object(gui, "list_input_devices", side_effect=RuntimeError("no device")):
             self.window = gui.MainWindow()
         self.addCleanup(self.cleanup_window)
+
+    def start_patch(self, patcher):
+        mocked = patcher.start()
+        self.addCleanup(patcher.stop)
+        return mocked
+
+    def wait_for_model_state(self, state):
+        import time
+
+        for _ in range(200):
+            self.application.processEvents()
+            if self.window.model_button.state == state:
+                return
+            time.sleep(0.01)
+        self.fail(f"model state stayed {self.window.model_button.state}, expected {state}")
 
     def cleanup_window(self):
         self.window.file_worker = None
@@ -149,9 +164,11 @@ class FileGuiTests(unittest.TestCase):
 
     def test_fatal_engine_event_stops_session(self):
         self.window.engine = MagicMock()
+        self.window._set_model_state(gui.MODEL_STARTING)
         with patch.object(self.window, "_stop_recording") as stop:
             self.window._handle_engine_event("fatal", {"message": "Whisper model load failed"})
         stop.assert_called_once()
+        self.assertEqual(self.window.model_button.state, gui.MODEL_STOPPED)
 
     def test_transcript_rows_are_joined_with_single_spaces(self):
         row = lambda text: gui.TranscriptRow(id="1", chunk_index=0, start=0, end=1, text=text)
@@ -159,28 +176,70 @@ class FileGuiTests(unittest.TestCase):
             self.window._append_transcript(row(text))
         self.assertEqual(self.window.transcript_text.toPlainText(), "Hello team. Next item.")
 
-    def test_model_preload_runs_in_background_and_reports_ready(self):
-        with patch.object(gui.EngineConfig, "validate", return_value=[]), patch.object(
-            gui, "preload_whisper_model"
-        ) as preload:
-            self.window._start_model_preload()
-            for _ in range(100):
-                self.application.processEvents()
-                if "ready" in self.window.model_status_label.text():
-                    break
-                import time
+    def test_model_is_not_loaded_at_launch(self):
+        self.preload.assert_not_called()
+        self.assertEqual(self.window.model_button.state, gui.MODEL_STOPPED)
+        self.assertEqual(self.window.model_button.text(), "Start Model")
 
-                time.sleep(0.01)
-        preload.assert_called_once()
+    def test_home_record_starts_model_red_yellow_green(self):
+        with patch.object(gui.EngineConfig, "validate", return_value=[]):
+            self.window.home_record_button.click()
+            self.assertIn(self.window.model_button.state, (gui.MODEL_STARTING, gui.MODEL_READY))
+            self.wait_for_model_state(gui.MODEL_READY)
+        self.preload.assert_called_once()
+        self.assertEqual(self.window.model_button.text(), "Ready to Transcribe")
         self.assertIn("Speech model ready", self.window.model_status_label.text())
 
-    def test_model_preload_is_skipped_when_model_folder_is_missing(self):
-        with patch.object(
-            gui.EngineConfig, "validate", return_value=["Whisper model path does not exist: C:/missing"]
-        ), patch.object(gui, "preload_whisper_model") as preload:
-            self.window._start_model_preload()
-        preload.assert_not_called()
+    def test_clicking_green_stops_model_yellow_red(self):
+        with patch.object(gui.EngineConfig, "validate", return_value=[]):
+            self.window.model_button.click()
+            self.wait_for_model_state(gui.MODEL_READY)
+            self.window.model_button.click()
+            self.wait_for_model_state(gui.MODEL_STOPPED)
+        self.unload.assert_called_once()
+        self.assertEqual(self.window.model_button.text(), "Start Model")
+        self.assertIn("stopped", self.window.model_status_label.text())
+
+    def test_model_button_is_locked_while_recording(self):
+        self.window.engine = MagicMock()
+        self.window._set_running(True)
+        self.assertFalse(self.window.model_button.isEnabled())
+        self.window._toggle_model()
+        self.preload.assert_not_called()
+        self.window.engine = None
+        self.window._set_running(False)
+        self.assertTrue(self.window.model_button.isEnabled())
+
+    def test_model_load_failure_returns_to_red(self):
+        self.preload.side_effect = RuntimeError("bad model")
+        with patch.object(gui.EngineConfig, "validate", return_value=[]):
+            self.window.model_button.click()
+            self.wait_for_model_state(gui.MODEL_STOPPED)
+        self.assertIn("failed to load", self.window.model_status_label.text())
+
+    def test_missing_model_folder_keeps_red(self):
+        with patch.object(gui.EngineConfig, "validate", return_value=["Whisper model path does not exist: C:/missing"]):
+            self.window.model_button.click()
+        self.preload.assert_not_called()
+        self.assertEqual(self.window.model_button.state, gui.MODEL_STOPPED)
         self.assertIn("not found", self.window.model_status_label.text())
+
+    def test_record_with_model_stopped_starts_model_and_records(self):
+        with patch.object(gui.EngineConfig, "validate", return_value=[]), patch.object(
+            gui, "MeetingTranscriberEngine"
+        ) as engine, patch.object(gui, "save_portable_config"):
+            self.window._start_recording()
+            self.assertIn(self.window.model_button.state, (gui.MODEL_STARTING, gui.MODEL_READY))
+            engine.return_value.start.assert_called_once()
+            self.assertFalse(self.window.model_button.isEnabled())
+            self.window.engine = None
+            self.window._set_running(False)
+            self.wait_for_model_state(gui.MODEL_READY)
+
+    def test_record_is_blocked_while_model_unloads(self):
+        self.window._set_model_state(gui.MODEL_STOPPING)
+        self.assertFalse(self.window.record_button.isEnabled())
+        self.assertFalse(self.window.model_button.isEnabled())
 
     def test_record_pause_stop_have_their_own_colours(self):
         self.assertEqual(

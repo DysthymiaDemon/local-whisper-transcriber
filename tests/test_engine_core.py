@@ -428,6 +428,33 @@ class EngineConfigTests(unittest.TestCase):
         self.assertIs(first, third)
         self.assertEqual(first.transcribe_calls, 1)
 
+    def test_unloaded_model_is_built_again_on_next_load(self):
+        from transcriber_engine import clear_whisper_model_cache, load_whisper_model, unload_whisper_model
+
+        self.addCleanup(clear_whisper_model_cache)
+        with tempfile.TemporaryDirectory() as tmp:
+            whisper = os.path.join(tmp, "whisper")
+            os.mkdir(whisper)
+            write_model_files(whisper)
+            created = []
+
+            class FakeWhisperModel:
+                def __init__(self, *args, **kwargs):
+                    created.append(self)
+
+            fake_module = type(sys)("faster_whisper")
+            fake_module.WhisperModel = FakeWhisperModel
+            config = EngineConfig(whisper_model_dir=whisper, output_file=os.path.join(tmp, "out.txt"))
+
+            with patch.dict(sys.modules, {"faster_whisper": fake_module}):
+                first = load_whisper_model(config)
+                self.assertTrue(unload_whisper_model(config))
+                self.assertFalse(unload_whisper_model(config))
+                second = load_whisper_model(config)
+
+        self.assertEqual(len(created), 2)
+        self.assertIsNot(first, second)
+
     def test_model_file_path_is_not_treated_as_model_folder(self):
         with tempfile.TemporaryDirectory() as tmp:
             model_file = os.path.join(tmp, "model.bin")
