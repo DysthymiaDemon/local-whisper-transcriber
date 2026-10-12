@@ -42,6 +42,14 @@ RECORD_LIGHT = "#D4F5D4"
 RECORD_BORDER = "#A8DDA8"
 RECORD_TEXT = "#1E5631"
 RECORD_DARK = "#2E7D32"
+RECORD_FLASH = "#A6E3A6"
+RECORD_FLASH_BORDER = "#5FB35F"
+# Session control sizes: the model button matches a standard 10 pt button; Record/Pause/Stop/Copy are the big ones.
+STANDARD_BUTTON_HEIGHT = 32
+SESSION_BUTTON_HEIGHT = 48
+# "Press Record" hint when the model turns ready: three gentle on/off pulses.
+RECORD_FLASH_PULSES = 3
+RECORD_FLASH_INTERVAL_MS = 350
 PAUSE_LIGHT = "#FFF4C2"
 PAUSE_BORDER = "#EED98A"
 PAUSE_TEXT = "#6B5300"
@@ -147,6 +155,18 @@ QPushButton#stopButton:disabled {{
     background: #FBEEEE;
     border-color: #FBEEEE;
     color: #CDA4A4;
+}}
+QPushButton#recordButton, QPushButton#pauseButton, QPushButton#stopButton, QPushButton#copyButton {{
+    font-size: 12.5pt;
+    font-weight: 600;
+    padding: 0 4px;
+    border-radius: 23px;
+    min-height: {SESSION_BUTTON_HEIGHT - 2}px;
+    max-height: {SESSION_BUTTON_HEIGHT - 2}px;
+}}
+QPushButton#recordButton[flash="true"] {{
+    background: {RECORD_FLASH};
+    border: 2px solid {RECORD_FLASH_BORDER};
 }}
 QCheckBox::indicator {{
     width: 15px;
@@ -389,7 +409,7 @@ MODEL_STATE_LABELS = {
 }
 # (fill, hover fill, border, text) for the pill behind each traffic-light state.
 MODEL_PILL_COLOURS = {
-    MODEL_STOPPED: ("#F3A6A0", "#EC8F88", "#E58A84", "#FFFFFF"),
+    MODEL_STOPPED: ("#F3A6A0", "#EC8F88", "#E58A84", STOP_TEXT),
     MODEL_STARTING: ("#F8E08A", "#F3D466", "#E6C65A", PAUSE_TEXT),
     MODEL_STOPPING: ("#F8E08A", "#F3D466", "#E6C65A", PAUSE_TEXT),
     MODEL_READY: ("#AEE3B4", "#97D9A0", "#86C98E", RECORD_TEXT),
@@ -409,7 +429,7 @@ class ModelLightButton(QPushButton):
         self._pulse_timer = QTimer(self)
         self._pulse_timer.setInterval(60)
         self._pulse_timer.timeout.connect(self._advance_pulse)
-        self.setMinimumHeight(48)
+        self.setFixedHeight(STANDARD_BUTTON_HEIGHT)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
 
@@ -428,7 +448,7 @@ class ModelLightButton(QPushButton):
         self.update()
 
     def sizeHint(self) -> QSize:  # pragma: no cover - layout hint
-        return QSize(320, 48)
+        return QSize(320, STANDARD_BUTTON_HEIGHT)
 
     def paintEvent(self, event: Any) -> None:  # pragma: no cover - visual widget
         del event
@@ -482,9 +502,8 @@ class ModelLightButton(QPushButton):
 
         text_rect = QRectF(rect.left() + 18, rect.top(), capsule.left() - rect.left() - 24, rect.height())
         font = QFont(self.font())
-        font.setWeight(QFont.Weight.DemiBold)
-        size = max(font.pointSizeF(), 10.0) * 1.25
-        # Shrink the label until the longest state text fits beside the traffic light.
+        size = max(font.pointSizeF(), 10.0)
+        # Same text size as the other standard buttons; shrink only if a label would not fit beside the light.
         while size > 8.0:
             font.setPointSizeF(size)
             if QFontMetrics(font).horizontalAdvance(self.text()) <= text_rect.width():

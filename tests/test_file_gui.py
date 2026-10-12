@@ -60,7 +60,6 @@ class FileGuiTests(unittest.TestCase):
         self.assertEqual(self.window.output_path.text(), output)
         self.assertFalse(self.window.record_button.isEnabled())
         self.assertFalse(self.window.pause_button.isEnabled())
-        self.assertFalse(self.window.file_button.isEnabled())
         with patch.object(gui, "MeetingTranscriberEngine") as engine:
             self.window._start_recording()
             engine.assert_not_called()
@@ -68,7 +67,6 @@ class FileGuiTests(unittest.TestCase):
         worker.cancel.assert_called_once()
         self.window._handle_engine_event("file_finished", {"outcome": "cancelled", "output_path": "C:/meeting.txt"})
         self.assertIsNone(self.window.file_worker)
-        self.assertTrue(self.window.file_button.isEnabled())
         self.assertTrue(self.window.record_button.isEnabled())
 
     def test_recording_blocks_file_picker(self):
@@ -83,7 +81,7 @@ class FileGuiTests(unittest.TestCase):
         self.assertIn("50%", self.window.file_progress_label.text())
         self.window._handle_engine_event("file_finished", {"outcome": "failed", "output_path": None})
         self.assertIn("failed", self.window.status_label.text())
-        self.assertTrue(self.window.file_button.isEnabled())
+        self.assertTrue(self.window.record_button.isEnabled())
 
     def test_home_page_shows_three_actions_on_start(self):
         self.assertEqual(self.window.pages.currentIndex(), gui.HOME_PAGE)
@@ -265,6 +263,65 @@ class FileGuiTests(unittest.TestCase):
 
         for name in ("recordButton", "pauseButton", "stopButton"):
             self.assertIn(f"QPushButton#{name} {{", APP_STYLESHEET)
+
+    def test_transcribe_file_button_is_gone_but_home_still_opens_files(self):
+        self.assertFalse(hasattr(self.window, "file_button"))
+        self.assertEqual(self.window.home_file_button.text(), "Transcribe Existing Meeting")
+
+    def test_model_button_is_standard_size_and_session_buttons_are_large(self):
+        from ui_theme import SESSION_BUTTON_HEIGHT, STANDARD_BUTTON_HEIGHT
+
+        self.window.resize(1040, 720)
+        self.window.pages.setCurrentIndex(gui.SESSION_PAGE)
+        self.window.show()
+        self.addCleanup(self.window.hide)
+        self.application.processEvents()
+        row = [self.window.record_button, self.window.pause_button, self.window.stop_button, self.window.copy_button]
+
+        self.assertEqual(self.window.model_button.height(), STANDARD_BUTTON_HEIGHT)
+        self.assertEqual([button.height() for button in row], [SESSION_BUTTON_HEIGHT] * 4)
+        widths = [button.width() for button in row]
+        self.assertLessEqual(max(widths) - min(widths), 1)
+        spanned = row[-1].geometry().right() - row[0].geometry().left() + 1
+        self.assertEqual(spanned, self.window.model_button.width())
+        self.assertEqual(self.window.copy_button.objectName(), "copyButton")
+
+    def test_record_flashes_when_model_turns_ready(self):
+        from ui_theme import RECORD_FLASH_PULSES
+
+        self.window._set_model_state(gui.MODEL_STARTING)
+        self.window._handle_engine_event("model_status", {"state": gui.MODEL_READY, "message": "Speech model ready"})
+
+        self.assertTrue(self.window._flash_timer.isActive())
+        self.assertTrue(self.window.record_button.property("flash"))
+        seen = []
+        for _ in range(2 * RECORD_FLASH_PULSES + 1):
+            self.window._advance_record_flash()
+            seen.append(bool(self.window.record_button.property("flash")))
+        self.assertIn(False, seen[:-1])
+        self.assertFalse(seen[-1])
+        self.assertFalse(self.window._flash_timer.isActive())
+
+    def test_pressing_record_stops_the_flash(self):
+        self.window._set_model_state(gui.MODEL_STARTING)
+        self.window._handle_engine_event("model_status", {"state": gui.MODEL_READY, "message": "Speech model ready"})
+        with patch.object(gui.EngineConfig, "validate", return_value=["stop here"]), patch.object(
+            gui.QMessageBox, "critical"
+        ):
+            self.window._start_recording()
+
+        self.assertFalse(self.window._flash_timer.isActive())
+        self.assertFalse(self.window.record_button.property("flash"))
+
+    def test_no_flash_when_model_becomes_ready_during_recording(self):
+        self.window._set_model_state(gui.MODEL_STARTING)
+        self.window.engine = MagicMock()
+        self.window._set_running(True)
+        self.window._handle_engine_event("model_status", {"state": gui.MODEL_READY, "message": "Speech model ready"})
+
+        self.assertFalse(self.window._flash_timer.isActive())
+        self.window.engine = None
+        self.window._set_running(False)
 
     def test_close_requests_cancel_and_waits(self):
         worker = self.start_file()

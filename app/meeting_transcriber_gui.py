@@ -92,6 +92,9 @@ try:
         MODEL_STOPPED,
         MODEL_STOPPING,
         ModelLightButton,
+        RECORD_FLASH_INTERVAL_MS,
+        RECORD_FLASH_PULSES,
+        SESSION_BUTTON_HEIGHT,
     )
 except ImportError as exc:  # pragma: no cover - depends on local GUI deps
     print(
@@ -180,6 +183,10 @@ class MainWindow(QMainWindow):
         self._spinner_frames = ["|", "/", "-", "\\"]
         self._copy_feedback_tokens: dict[int, int] = {}
         self._copy_button_originals: dict[int, tuple[str, QIcon, str]] = {}
+        self._flash_ticks = 0
+        self._flash_timer = QTimer(self)
+        self._flash_timer.setInterval(RECORD_FLASH_INTERVAL_MS)
+        self._flash_timer.timeout.connect(self._advance_record_flash)
         self._loaded_model_config: EngineConfig | None = None
         self.spinner_timer = QTimer(self)
         self.spinner_timer.setInterval(160)
@@ -303,18 +310,17 @@ class MainWindow(QMainWindow):
         self.pause_button.setObjectName("pauseButton")
         self.stop_button.setObjectName("stopButton")
         self.copy_button = QPushButton("Copy")
+        self.copy_button.setObjectName("copyButton")
         self.record_button.clicked.connect(self._start_recording)
         self.pause_button.clicked.connect(self._toggle_pause)
         self.stop_button.clicked.connect(self._stop_recording)
         self.copy_button.clicked.connect(lambda: self._copy_transcript(self.copy_button))
-        button_row.addWidget(self.record_button)
-        button_row.addWidget(self.pause_button)
-        button_row.addWidget(self.stop_button)
-        button_row.addWidget(self.copy_button)
+        # The main session buttons: tall, and sharing the full Controls width equally.
+        for button in (self.record_button, self.pause_button, self.stop_button, self.copy_button):
+            button.setFixedHeight(SESSION_BUTTON_HEIGHT)
+            button.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+            button_row.addWidget(button, 1)
         controls_layout.addLayout(button_row)
-        self.file_button = QPushButton("Transcribe File")
-        self.file_button.clicked.connect(self._start_file_transcription)
-        controls_layout.addWidget(self.file_button)
         self.file_progress_label = QLabel("")
         controls_layout.addWidget(self.file_progress_label)
 
@@ -449,6 +455,7 @@ class MainWindow(QMainWindow):
         """Unload the speech model to free memory (green -> yellow -> red)."""
         if self.model_button.state != MODEL_READY or self._busy():
             return
+        self._stop_record_flash()
         config = self._loaded_model_config or self._read_config()
         self._set_model_state(MODEL_STOPPING)
         self._set_model_status("Stopping speech model...")
@@ -464,6 +471,31 @@ class MainWindow(QMainWindow):
     def _busy(self) -> bool:
         return bool(self.engine or self.file_worker or self._stopping)
 
+    def _flash_record_button(self) -> None:
+        """Pulse Record a few times when the model turns ready, as a hint to press it."""
+        self._flash_ticks = 0
+        self._flash_timer.start()
+        self._advance_record_flash()
+
+    def _advance_record_flash(self) -> None:
+        self._flash_ticks += 1
+        if self._flash_ticks > 2 * RECORD_FLASH_PULSES:
+            self._stop_record_flash()
+            return
+        self._set_record_flash(self._flash_ticks % 2 == 1)
+
+    def _stop_record_flash(self) -> None:
+        self._flash_timer.stop()
+        self._set_record_flash(False)
+
+    def _set_record_flash(self, on: bool) -> None:
+        if bool(self.record_button.property("flash")) == on:
+            return
+        self.record_button.setProperty("flash", on)
+        # Dynamic properties only restyle after a re-polish.
+        self.record_button.style().unpolish(self.record_button)
+        self.record_button.style().polish(self.record_button)
+
     def _set_model_state(self, state: str) -> None:
         self.model_button.set_state(state)
         self._refresh_model_controls()
@@ -475,7 +507,6 @@ class MainWindow(QMainWindow):
         # Record is allowed while the model starts (audio is buffered) but not while it is being unloaded.
         unloading = self.model_button.state == MODEL_STOPPING
         self.record_button.setEnabled(not busy and not unloading)
-        self.file_button.setEnabled(not busy and not unloading)
 
     def _set_model_status(self, message: str) -> None:
         self.model_status_label.setText(message)
@@ -499,6 +530,7 @@ class MainWindow(QMainWindow):
     def _show_home(self) -> None:
         if self.engine or self.file_worker or self._stopping:
             return
+        self._stop_record_flash()
         self.pages.setCurrentIndex(HOME_PAGE)
         self._home_page.setFocus()
 
@@ -636,6 +668,7 @@ class MainWindow(QMainWindow):
             self._append_log(f"Settings could not be saved; recording continues: {exc}")
 
     def _start_recording(self) -> None:
+        self._stop_record_flash()
         if self._stopping or self.engine or self.file_worker:
             return
         config = self._read_config()
@@ -758,6 +791,8 @@ class MainWindow(QMainWindow):
         token = self._copy_feedback_tokens.get(button_id, 0) + 1
         self._copy_feedback_tokens[button_id] = token
         button.setText("✓ Copied!")
+        if button.fontMetrics().horizontalAdvance(button.text()) > button.width() - 8:
+            button.setText("✓")  # The narrow Copy button in the controls row: a tick alone still reads clearly.
         button.setStyleSheet("QPushButton { color: #2e7d32; }")
 
         def restore() -> None:
@@ -807,7 +842,10 @@ class MainWindow(QMainWindow):
             state = payload.get("state")
             self._set_model_status(message)
             if state == MODEL_READY:
+                was_starting = self.model_button.state == MODEL_STARTING
                 self._set_model_state(MODEL_READY)
+                if was_starting and not self._busy() and self.record_button.isEnabled():
+                    self._flash_record_button()
             else:
                 self._set_model_state(MODEL_STOPPED)
                 if state == "failed":
@@ -884,7 +922,8 @@ class MainWindow(QMainWindow):
         )
 
     def _set_running(self, running: bool) -> None:
-        self.file_button.setEnabled(not running)
+        if running:
+            self._stop_record_flash()
         self.record_button.setEnabled(not running)
         self.home_button.setEnabled(not running)
         self._refresh_model_controls()
