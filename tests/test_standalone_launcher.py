@@ -53,6 +53,29 @@ class StandaloneLauncherTests(unittest.TestCase):
 
         self.assertEqual(actual, expected)
 
+    def test_payload_is_line_ending_independent(self):
+        generator = load_generator()
+        with tempfile.TemporaryDirectory() as tmp:
+            for newline in ("\n", "\r\n"):
+                root = Path(tmp) / repr(newline)
+                (root / "app").mkdir(parents=True)
+                (root / "resources").mkdir()
+                (root / "app" / "module.py").write_bytes(newline.join(["a = 1", "b = 2", ""]).encode())
+            lf = generator.build_payload(Path(tmp) / repr("\n"))
+            crlf = generator.build_payload(Path(tmp) / repr("\r\n"))
+
+        self.assertEqual(lf, crlf)
+
+    def test_launcher_rejects_payload_paths_outside_install_root(self):
+        namespace = {"__name__": "embedded_launcher"}
+        exec(LAUNCHER_PATH.read_text(encoding="utf-8"), namespace)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for rel_path in ("../escape.py", "app/../../escape.py", "C:/Windows/escape.py"):
+                with self.assertRaises(RuntimeError):
+                    namespace["write_payload_file"](root, rel_path, "", "")
+            self.assertFalse((root.parent / "escape.py").exists())
+
     def test_launcher_sets_log_root_to_copied_file_folder(self):
         content = LAUNCHER_PATH.read_text(encoding="utf-8")
 

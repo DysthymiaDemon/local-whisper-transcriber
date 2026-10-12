@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 from datetime import datetime
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -83,6 +84,7 @@ def _uses_generated_latency_defaults(raw: Mapping[str, Any]) -> bool:
         (8.0, 2.0),
         (4.0, 0.5),
         (3.0, 0.25),
+        (5.0, 0.5),
     }
 
 
@@ -113,11 +115,44 @@ def load_portable_config(root: Path | None = None) -> EngineConfig:
     return replace(config, **overrides)
 
 
+def load_portable_config_safely(root: Path | None = None) -> tuple[EngineConfig, str | None]:
+    """Load config.json, falling back to defaults when the file is unreadable or has wrong types."""
+    app_root = (root or application_root()).resolve()
+    try:
+        config = load_portable_config(app_root)
+        _check_config_types(config)
+        return config, None
+    except Exception as exc:
+        return default_portable_config(app_root), f"{app_root / CONFIG_FILE_NAME} could not be used: {exc}"
+
+
+def _check_config_types(config: EngineConfig) -> None:
+    numeric = ("sample_rate", "chunk_seconds", "overlap_seconds", "cpu_threads", "num_workers", "max_queue_chunks")
+    for name in numeric:
+        value = getattr(config, name)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{name} must be a number, got {value!r}")
+    for name in ("whisper_model_dir", "output_file", "compute_type", "device", "capture_mode"):
+        if not isinstance(getattr(config, name), str):
+            raise ValueError(f"{name} must be text, got {getattr(config, name)!r}")
+    for name in ("input_device", "system_device_index"):
+        value = getattr(config, name)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
+            raise ValueError(f"{name} must be a device number or null, got {value!r}")
+
+
 def save_portable_config(config: EngineConfig, root: Path | None = None) -> Path:
     app_root = (root or application_root()).resolve()
     config_path = app_root / CONFIG_FILE_NAME
     raw = asdict(config)
-    config_path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{CONFIG_FILE_NAME}.", suffix=".tmp", dir=str(app_root))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(raw, indent=2) + "\n")
+        os.replace(tmp_name, config_path)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
     return config_path
 
 

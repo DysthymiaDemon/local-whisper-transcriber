@@ -11,9 +11,14 @@ from transcriber_engine import (
     load_whisper_model, transcription_segment_is_usable,
 )
 
+# Whisper pads every window to 30 seconds, so saved recordings use near-full windows:
+# less encoder work per audio minute and more context for the model.
+FILE_WINDOW_SECONDS = 28.0
+FILE_OVERLAP_SECONDS = 2.0
+
 
 def audio_chunks(container, seconds: float, overlap: float, cancelled: threading.Event):
-    """Yield 16 kHz mono windows, retaining only overlap and one decoded frame."""
+    """Yield 16 kHz mono windows, retaining only overlap and the samples of one pending window."""
     import av
     import numpy as np
 
@@ -23,7 +28,10 @@ def audio_chunks(container, seconds: float, overlap: float, cancelled: threading
     step = size - keep
     if size <= 0 or keep < 0 or step <= 0:
         raise ValueError("Audio chunk size must exceed overlap at 16 kHz.")
-    buffer = np.empty(0, dtype=np.float32)
+    # Decoded frames are collected in a list and joined only when a full window is ready,
+    # instead of re-copying the whole buffer for every frame.
+    pending: list = []
+    pending_size = 0
     offset = 0
     fresh = 0
 
@@ -37,22 +45,32 @@ def audio_chunks(container, seconds: float, overlap: float, cancelled: threading
 
     for frame in frames():
         samples = frame.to_ndarray().reshape(-1)
-        buffer = np.concatenate((buffer, samples))
+        pending.append(samples)
+        pending_size += len(samples)
         fresh += len(samples)
+        if pending_size < size:
+            continue
+        buffer = np.concatenate(pending)
         while len(buffer) >= size:
             if cancelled.is_set():
                 return
             yield offset / 16000, buffer[:size].copy()
-            buffer = buffer[step:].copy()
+            buffer = buffer[step:]
             offset += step
             fresh = len(buffer) - keep
+        pending = [buffer.copy()]
+        pending_size = len(buffer)
+    buffer = np.concatenate(pending) if pending else np.empty(0, dtype=np.float32)
     if fresh > 0 and len(buffer) and not cancelled.is_set():
         yield offset / 16000, buffer
 
 
 class FileTranscriptionWorker:
     def __init__(self, config: EngineConfig, input_path: str, output_path: str, callback: Callable):
-        self.config = replace(config, sample_rate=16000, capture_mode="mic", output_file=output_path)
+        self.config = replace(
+            config, sample_rate=16000, capture_mode="mic", output_file=output_path,
+            chunk_seconds=FILE_WINDOW_SECONDS, overlap_seconds=FILE_OVERLAP_SECONDS,
+        )
         self.input_path = Path(input_path)
         self.output_path = Path(output_path)
         self.callback = callback

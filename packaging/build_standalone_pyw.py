@@ -15,6 +15,7 @@ PAYLOAD_DIRS = ("app", "resources")
 APP_FOLDER_NAME = "OfflineMeetingTranscriber"
 GPU_TRIAL_APP_FOLDER_NAME = "OfflineMeetingTranscriberGpuTrial"
 GPU_TRIAL_RUNTIME_FOLDER_NAME = "OfflineMeetingTranscriberGpuTrialRuntime"
+TEXT_SUFFIXES = {".py", ".txt", ".json", ".md", ".toml", ".cfg", ".ini"}
 
 
 def _iter_payload_files(root: Path = PROJECT_ROOT) -> list[Path]:
@@ -32,6 +33,9 @@ def build_payload(root: Path = PROJECT_ROOT) -> dict[str, object]:
     for path in _iter_payload_files(root):
         rel_path = path.relative_to(root).as_posix()
         raw = path.read_bytes()
+        if path.suffix.lower() in TEXT_SUFFIXES:
+            # Git may check files out with CRLF or LF; embed LF so the payload is identical on every clone.
+            raw = raw.replace(b"\r\n", b"\n")
         payload_files[rel_path] = {
             "sha256": hashlib.sha256(raw).hexdigest(),
             "data": base64.b64encode(raw).decode("ascii"),
@@ -95,8 +99,18 @@ def decode_payload() -> dict[str, object]:
     return json.loads(zlib.decompress(compressed).decode("utf-8"))
 
 
+def safe_payload_target(root: Path, rel_path: str) -> Path:
+    relative = Path(rel_path)
+    if relative.is_absolute() or relative.drive or ".." in relative.parts:
+        raise RuntimeError(f"Unsafe payload path: {{rel_path}}")
+    target = (root / relative).resolve()
+    if not target.is_relative_to(root.resolve()):
+        raise RuntimeError(f"Unsafe payload path: {{rel_path}}")
+    return target
+
+
 def write_payload_file(root: Path, rel_path: str, encoded: str, expected_sha: str) -> None:
-    target = root / Path(rel_path)
+    target = safe_payload_target(root, rel_path)
     raw = base64.b64decode(encoded.encode("ascii"))
     actual_sha = hashlib.sha256(raw).hexdigest()
     if actual_sha != expected_sha:

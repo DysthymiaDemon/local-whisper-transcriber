@@ -31,6 +31,11 @@ from transcriber_engine import (
 from ui_helpers import meter_bar_geometry
 
 
+def write_model_files(folder, names=("model.bin", "config.json", "tokenizer.json", "vocabulary.txt")):
+    for name in names:
+        open(os.path.join(folder, name), "wb").close()
+
+
 class DuplicateSuppressorTests(unittest.TestCase):
     def test_duplicate_text_inside_overlap_window_is_suppressed(self):
         suppressor = DuplicateSuppressor(window_seconds=2.0)
@@ -237,6 +242,49 @@ class AudioPreprocessorTests(unittest.TestCase):
 
         self.assertTrue(audio_chunk_has_activity(cleaned))
 
+    def test_vectorised_filters_match_reference_loop_across_blocks(self):
+        import numpy as np
+
+        def reference_filters(processor, blocks):
+            dc_in = dc_out = hp_in = hp_out = 0.0
+            alpha = processor._high_pass_alpha
+            outputs = []
+            for block in blocks:
+                filtered = np.empty(len(block), dtype=np.float64)
+                for index, value in enumerate(block):
+                    sample = float(value)
+                    dc = sample - dc_in + processor.dc_decay * dc_out
+                    dc_in, dc_out = sample, dc
+                    hp = alpha * (hp_out + dc - hp_in)
+                    hp_in, hp_out = dc, hp
+                    filtered[index] = hp
+                outputs.append(filtered)
+            return outputs
+
+        rng = np.random.default_rng(11)
+        for sample_rate in (8000, 16000, 48000):
+            blocks = [
+                (rng.normal(0.0, 0.2, size) + 0.1).astype(np.float32)
+                for size in (1, 7, 480, 1600, 4096)
+            ]
+            processor = AudioPreprocessor(sample_rate)
+            expected = reference_filters(processor, blocks)
+            for block, wanted in zip(blocks, expected):
+                samples64 = block.astype(np.float64)
+                previous = np.concatenate(([processor._dc_prev_input], samples64[:-1]))
+                from transcriber_engine import first_order_recursive_filter
+
+                dc, processor._dc_prev_output = first_order_recursive_filter(
+                    samples64 - previous, processor.dc_decay, 1.0, processor._dc_prev_output
+                )
+                processor._dc_prev_input = float(samples64[-1])
+                previous = np.concatenate(([processor._hp_prev_input], dc[:-1]))
+                hp, processor._hp_prev_output = first_order_recursive_filter(
+                    dc - previous, processor._high_pass_alpha, processor._high_pass_alpha, processor._hp_prev_output
+                )
+                processor._hp_prev_input = float(dc[-1])
+                np.testing.assert_allclose(hp, wanted, atol=1e-6)
+
 
 class TranscriptionFilterTests(unittest.TestCase):
     def test_rejects_high_no_speech_probability(self):
@@ -286,7 +334,7 @@ class EngineConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             whisper = os.path.join(tmp, "whisper")
             os.mkdir(whisper)
-            open(os.path.join(whisper, "model.bin"), "wb").close()
+            write_model_files(whisper)
             config = EngineConfig(
                 whisper_model_dir=whisper,
                 output_file=os.path.join(tmp, "out.txt"),
@@ -296,12 +344,86 @@ class EngineConfigTests(unittest.TestCase):
 
         self.assertEqual(errors, [])
 
+    def test_model_without_tokenizer_fails_validation(self):
+        # faster-whisper downloads a tokenizer from the internet when tokenizer.json is missing.
+        with tempfile.TemporaryDirectory() as tmp:
+            whisper = os.path.join(tmp, "whisper")
+            os.mkdir(whisper)
+            write_model_files(whisper, ("model.bin", "config.json", "vocabulary.json"))
+            config = EngineConfig(whisper_model_dir=whisper, output_file=os.path.join(tmp, "out.txt"))
+
+            errors = "\n".join(config.validate())
+
+        self.assertIn("tokenizer.json", errors)
+
+    def test_openvino_model_requires_all_ir_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            whisper = os.path.join(tmp, "whisper")
+            os.mkdir(whisper)
+            write_model_files(whisper, ("openvino_encoder_model.xml",))
+            config = EngineConfig(
+                whisper_model_dir=whisper, output_file=os.path.join(tmp, "out.txt"), device="openvino:GPU"
+            )
+
+            errors = "\n".join(config.validate())
+
+        self.assertIn("openvino_decoder_model.xml", errors)
+
+    def test_model_load_never_retries_without_local_files_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            whisper = os.path.join(tmp, "whisper")
+            os.mkdir(whisper)
+            write_model_files(whisper)
+            calls = []
+
+            class FakeWhisperModel:
+                def __init__(self, *args, **kwargs):
+                    calls.append(kwargs)
+                    raise TypeError("unexpected keyword")
+
+            fake_module = type(sys)("faster_whisper")
+            fake_module.WhisperModel = FakeWhisperModel
+            config = EngineConfig(whisper_model_dir=whisper, output_file=os.path.join(tmp, "out.txt"))
+
+            with patch.dict(sys.modules, {"faster_whisper": fake_module}), patch.dict(
+                os.environ, {"HF_HUB_OFFLINE": "0"}
+            ):
+                with self.assertRaises(TypeError):
+                    MeetingTranscriberEngine(config)._load_whisper_model()
+                self.assertEqual(os.environ["HF_HUB_OFFLINE"], "1")
+
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0]["local_files_only"])
+
+    def test_model_file_path_is_not_treated_as_model_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            model_file = os.path.join(tmp, "model.bin")
+            open(model_file, "wb").close()
+            config = EngineConfig(whisper_model_dir=model_file, output_file=os.path.join(tmp, "out.txt"))
+
+            with self.assertRaises(FileNotFoundError):
+                MeetingTranscriberEngine(config)._load_whisper_model()
+
+    def test_model_load_failure_stops_capture_and_reports_fatal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = EngineConfig(whisper_model_dir=tmp, output_file=os.path.join(tmp, "out.txt"))
+            engine = MeetingTranscriberEngine(config)
+            events = []
+            engine.on_event(lambda event_type, payload: events.append(event_type))
+
+            with patch.object(engine, "_load_whisper_model", side_effect=RuntimeError("broken model")):
+                engine._transcription_loop()
+
+        self.assertTrue(engine._stop_event.is_set())
+        self.assertIn("error", events)
+        self.assertEqual(events[-1], "fatal")
+
     def test_defaults_pin_english_and_accuracy_chunks(self):
         config = EngineConfig()
 
         self.assertEqual(config.language, "en")
-        self.assertEqual(config.chunk_seconds, 5.0)
-        self.assertEqual(config.overlap_seconds, 0.5)
+        self.assertEqual(config.chunk_seconds, 10.0)
+        self.assertEqual(config.overlap_seconds, 1.0)
         self.assertEqual(config.device, "cpu")
         self.assertEqual(config.compute_type, "int8")
 
@@ -318,7 +440,7 @@ class EngineConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             whisper = os.path.join(tmp, "whisper")
             os.mkdir(whisper)
-            open(os.path.join(whisper, "model.bin"), "wb").close()
+            write_model_files(whisper)
             config = EngineConfig(
                 whisper_model_dir=whisper,
                 output_file=os.path.join(tmp, "out.txt"),
@@ -351,7 +473,7 @@ class EngineConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             whisper = os.path.join(tmp, "whisper")
             os.mkdir(whisper)
-            open(os.path.join(whisper, "model.bin"), "wb").close()
+            write_model_files(whisper)
             calls = []
 
             class FakeWhisperModel:
@@ -377,7 +499,7 @@ class EngineConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             whisper = os.path.join(tmp, "whisper")
             os.mkdir(whisper)
-            open(os.path.join(whisper, "model.bin"), "wb").close()
+            write_model_files(whisper)
             calls = []
 
             class FakeWhisperModel:

@@ -8,7 +8,7 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
-from math import pi
+from math import log, pi
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Optional
@@ -21,6 +21,30 @@ CAPTURE_MODE_LOOPBACK = "loopback"
 CAPTURE_MODE_MIXED = "mixed"
 CAPTURE_SOURCES_MIC = "microphone"
 CAPTURE_SOURCES_LOOPBACK = "loopback"
+FASTER_WHISPER_REQUIRED_MODEL_FILES = ("model.bin", "config.json", "tokenizer.json")
+FASTER_WHISPER_VOCABULARY_FILES = ("vocabulary.txt", "vocabulary.json")
+OPENVINO_REQUIRED_MODEL_FILES = (
+    "openvino_encoder_model.xml",
+    "openvino_encoder_model.bin",
+    "openvino_decoder_model.xml",
+    "openvino_decoder_model.bin",
+    "openvino_tokenizer.xml",
+    "openvino_tokenizer.bin",
+    "openvino_detokenizer.xml",
+    "openvino_detokenizer.bin",
+)
+
+
+def faster_whisper_missing_files(folder: Path) -> list[str]:
+    """Files a CTranslate2 Whisper folder needs so faster-whisper never falls back to a download."""
+    missing = [name for name in FASTER_WHISPER_REQUIRED_MODEL_FILES if not (folder / name).is_file()]
+    if not any((folder / name).is_file() for name in FASTER_WHISPER_VOCABULARY_FILES):
+        missing.append(" or ".join(FASTER_WHISPER_VOCABULARY_FILES))
+    return missing
+
+
+def openvino_missing_files(folder: Path) -> list[str]:
+    return [name for name in OPENVINO_REQUIRED_MODEL_FILES if not (folder / name).is_file()]
 
 
 def rms_to_meter_percent(rms: float) -> int:
@@ -119,6 +143,38 @@ def resample_audio(samples: Any, source_rate: int, target_rate: int) -> Any:
     return np.interp(target_positions, source_positions, audio).astype(np.float32)
 
 
+def first_order_recursive_filter(drive: Any, decay: float, gain: float, previous_output: float) -> tuple[Any, float]:
+    """Vectorised y[n] = decay * y[n-1] + gain * drive[n].
+
+    Uses the closed form y[n] = decay^n * (decay * y[-1] + gain * cumsum(drive[k] / decay^k)) over short
+    blocks, so decay^-k stays small enough for float64 precision.
+    """
+    import numpy as np
+
+    drive = np.asarray(drive, dtype=np.float64)
+    output = np.empty_like(drive)
+    if drive.size == 0:
+        return output, float(previous_output)
+    if not 0.0 < decay < 1.0:
+        state = float(previous_output)
+        for index, value in enumerate(drive):
+            state = decay * state + gain * float(value)
+            output[index] = state
+        return output, state
+    block = int(max(8, min(512, 20.0 / -log(decay))))
+    steps = np.arange(block, dtype=np.float64)
+    growth = decay ** steps
+    shrink = decay ** -steps
+    state = float(previous_output)
+    for start in range(0, drive.size, block):
+        segment = drive[start : start + block]
+        count = segment.size
+        values = growth[:count] * (decay * state + gain * np.cumsum(segment * shrink[:count]))
+        output[start : start + count] = values
+        state = float(values[-1])
+    return output, state
+
+
 class AudioPreprocessor:
     def __init__(
         self,
@@ -152,19 +208,19 @@ class AudioPreprocessor:
         if audio.size == 0:
             return audio.astype(np.float32, copy=False)
 
-        filtered = np.empty_like(audio)
-        for index, value in enumerate(audio):
-            sample = float(value)
-            dc_blocked = sample - self._dc_prev_input + self.dc_decay * self._dc_prev_output
-            self._dc_prev_input = sample
-            self._dc_prev_output = dc_blocked
+        samples64 = audio.astype(np.float64)
+        previous = np.concatenate(([self._dc_prev_input], samples64[:-1]))
+        dc_blocked, self._dc_prev_output = first_order_recursive_filter(
+            samples64 - previous, self.dc_decay, 1.0, self._dc_prev_output
+        )
+        self._dc_prev_input = float(samples64[-1])
 
-            high_passed = self._high_pass_alpha * (
-                self._hp_prev_output + dc_blocked - self._hp_prev_input
-            )
-            self._hp_prev_input = dc_blocked
-            self._hp_prev_output = high_passed
-            filtered[index] = high_passed
+        previous = np.concatenate(([self._hp_prev_input], dc_blocked[:-1]))
+        high_passed, self._hp_prev_output = first_order_recursive_filter(
+            dc_blocked - previous, self._high_pass_alpha, self._high_pass_alpha, self._hp_prev_output
+        )
+        self._hp_prev_input = float(dc_blocked[-1])
+        filtered = high_passed.astype(np.float32)
 
         rms = float(np.sqrt(np.mean(np.square(filtered)))) if filtered.size else 0.0
         self._update_noise_floor(rms)
@@ -218,9 +274,9 @@ def audio_chunk_duration_seconds(chunk: "AudioChunk") -> float:
 
 
 def _force_offline_mode() -> None:
-    os.environ.setdefault("HF_HUB_OFFLINE", "1")
-    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-    os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+    from offline_guard import force_offline_env
+
+    force_offline_env()
 
 
 def default_cpu_thread_count(cpu_count: int | None = None) -> int:
@@ -243,8 +299,8 @@ class EngineConfig:
     whisper_model_dir: str = r"C:\models\faster-whisper"
     output_file: str = "meeting_transcript.txt"
     sample_rate: int = 16_000
-    chunk_seconds: float = 5.0
-    overlap_seconds: float = 0.5
+    chunk_seconds: float = 10.0
+    overlap_seconds: float = 1.0
     compute_type: str = "int8"
     device: str = "cpu"
     cpu_threads: int = 0
@@ -292,16 +348,19 @@ class EngineConfig:
         whisper_path = self._validate_folder("Whisper model", self.whisper_model_dir, errors)
         if whisper_path:
             if self.device.lower().startswith("openvino"):
-                if not any(whisper_path.glob("*.xml")):
+                missing = openvino_missing_files(whisper_path)
+                if missing:
                     errors.append(
-                        "Whisper OpenVINO model is incomplete: expected OpenVINO .xml model files in "
-                        f"{whisper_path}."
+                        "Whisper OpenVINO model is incomplete: expected "
+                        f"{', '.join(missing)} in {whisper_path}."
                     )
-            elif not (whisper_path / "model.bin").is_file():
-                errors.append(
-                    "Whisper model is incomplete: expected model.bin in "
-                    f"{whisper_path}. Copy a CTranslate2 faster-whisper model folder into this path."
-                )
+            else:
+                missing = faster_whisper_missing_files(whisper_path)
+                if missing:
+                    errors.append(
+                        f"Whisper model is incomplete: expected {', '.join(missing)} in "
+                        f"{whisper_path}. Copy a complete CTranslate2 faster-whisper model folder into this path."
+                    )
         return errors
 
     @staticmethod
@@ -620,7 +679,6 @@ class MeetingTranscriberEngine:
         keep_samples = max(0, overlap_samples)
         step_samples = max(1, chunk_samples - keep_samples)
         chunk_index = 0
-        stream_start = time.monotonic()
         accumulated = np.empty((0,), dtype=np.float32)
 
         source_queues: dict[str, InputBlockBuffer] = {}
@@ -666,7 +724,7 @@ class MeetingTranscriberEngine:
             nonlocal accumulated, chunk_index
             if accumulated.size <= model_sample_rate // 2:
                 return
-            start_time = max(0.0, time.monotonic() - stream_start - (accumulated.size / model_sample_rate))
+            start_time = max(0.0, (chunk_index * (chunk_samples - keep_samples)) / model_sample_rate)
             samples = accumulated.copy()
             accumulated = np.empty((0,), dtype=np.float32)
             with self._state_lock:
@@ -800,11 +858,7 @@ class MeetingTranscriberEngine:
                         "log",
                         {"message": "Loopback stream active. Ensure meeting output is routed to selected device."},
                     )
-                while not self._stop_event.is_set():
-                    if self._pause_event.is_set():
-                        time.sleep(0.02)
-                    else:
-                        time.sleep(0.02)
+                self._stop_event.wait()
 
             q.put(None)
 
@@ -989,8 +1043,11 @@ class MeetingTranscriberEngine:
             self._emit("log", {"message": "Loading Whisper model..."})
             model = self._load_whisper_model()
             self._emit("log", {"message": "Whisper model ready"})
-        except Exception as exc:  # pragma: no cover - environment-dependent
+        except Exception as exc:
+            # Without a model nothing can be transcribed; stop capturing instead of queueing audio forever.
+            self._stop_event.set()
             self._emit("error", {"message": f"Whisper model load failed: {exc}"})
+            self._emit("fatal", {"message": f"Whisper model load failed: {exc}"})
             return
 
         while True:
@@ -1064,8 +1121,8 @@ class MeetingTranscriberEngine:
 def load_whisper_model(config: EngineConfig) -> Any:
     _force_offline_mode()
 
-    if not Path(config.whisper_model_dir).exists():
-        raise FileNotFoundError(config.whisper_model_dir)
+    if not Path(config.whisper_model_dir).is_dir():
+        raise FileNotFoundError(f"Whisper model folder not found: {config.whisper_model_dir}")
     device = config.device.strip()
     if device.lower().startswith("openvino"):
         _, _, openvino_device = device.partition(":")
@@ -1083,12 +1140,7 @@ def load_whisper_model(config: EngineConfig) -> Any:
         model_kwargs["cpu_threads"] = cpu_threads
     if config.num_workers > 0:
         model_kwargs["num_workers"] = config.num_workers
-    try:
-        return WhisperModel(config.whisper_model_dir, **model_kwargs)
-    except TypeError:
-        fallback_kwargs = dict(model_kwargs)
-        fallback_kwargs.pop("local_files_only", None)
-        return WhisperModel(config.whisper_model_dir, **fallback_kwargs)
+    return WhisperModel(config.whisper_model_dir, **model_kwargs)
 
 
 def list_input_devices() -> list[dict[str, Any]]:

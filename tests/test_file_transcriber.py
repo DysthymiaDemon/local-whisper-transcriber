@@ -32,7 +32,8 @@ class FileTranscriptionTests(unittest.TestCase):
         make_audio(self.source)
         self.model = self.root / "model"
         self.model.mkdir()
-        (self.model / "model.bin").write_bytes(b"model")
+        for name in ("model.bin", "config.json", "tokenizer.json", "vocabulary.json"):
+            (self.model / name).write_bytes(b"model")
         self.config = EngineConfig(whisper_model_dir=str(self.model), chunk_seconds=1, overlap_seconds=.2,
                                    capture_mode="mixed", system_device_index=None)
         self.events = []
@@ -121,6 +122,13 @@ class FileTranscriptionTests(unittest.TestCase):
             load_whisper_model(self.config)
             self.assertTrue(constructor.call_args.kwargs["local_files_only"])
             self.assertEqual(os.environ["HF_HUB_OFFLINE"], "1")
+
+    def test_saved_recordings_use_near_full_whisper_windows(self):
+        from file_transcriber import FILE_OVERLAP_SECONDS, FILE_WINDOW_SECONDS
+
+        self.assertEqual((FILE_WINDOW_SECONDS, FILE_OVERLAP_SECONDS), (28.0, 2.0))
+        self.assertEqual(self.worker.config.chunk_seconds, 28.0)
+        self.assertEqual(self.worker.config.overlap_seconds, 2.0)
 
     def test_missing_model_does_not_load_or_download(self):
         self.worker.config = replace(self.worker.config, whisper_model_dir=str(self.root / "missing"))

@@ -521,8 +521,12 @@ class MainWindow(QMainWindow):
         engine = self.engine
 
         def stop_worker() -> None:
-            engine.stop()
-            self.bridge.event.emit("engine_stopped", {})
+            try:
+                engine.stop()
+            except Exception as exc:
+                self.bridge.event.emit("error", {"message": f"Stopping transcription failed: {exc}"})
+            finally:
+                self.bridge.event.emit("engine_stopped", {})
 
         threading.Thread(target=stop_worker, name="gui-stop-engine", daemon=True).start()
 
@@ -579,6 +583,9 @@ class MainWindow(QMainWindow):
                 self._append_log(f"{message}\nError details saved to {log_path}")
         elif event_type == "log":
             self._append_log(str(payload.get("message", "")))
+        elif event_type == "fatal":
+            if self.engine and not self._stopping:
+                self._stop_recording()
         elif event_type == "engine_stopped":
             self._finish_engine_stop()
 
