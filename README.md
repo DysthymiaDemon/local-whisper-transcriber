@@ -23,7 +23,7 @@ You need Python 3.12 (64-bit). On a managed laptop, install it from the company 
 
 The home screen has three buttons:
 
-- **Record and Transcribe This Meeting** opens the recording window. Choose the capture mode and microphone, then click **Record**. Text appears as the meeting goes on. **Pause** pauses capture. **Stop** finishes the last chunk and saves the transcript. **Copy** copies the transcript to the clipboard.
+- **Record and Transcribe This Meeting** opens the recording window and starts the speech model. The traffic light at the top of **Controls** goes from red to yellow to green, and **Record** flashes when the model is ready. Choose the capture mode and microphone, then click **Record**. Text appears as the meeting goes on. **Pause** pauses capture. **Stop** transcribes the audio still queued and saves the transcript. If that catch-up takes more than 60 seconds, Stop saves what it has and the log says how much audio was not transcribed. **Copy** copies the transcript to the clipboard. Clicking the green light unloads the model to free memory.
 - **Transcribe Existing Meeting** asks for a recording (`.mp4`, `.m4a`, `.mp3`, `.wav`, `.webm`, `.mkv`, `.mov`, `.aac` or `.wma`) and where to save the text. The recording is decoded locally and never changed. **Stop** saves what has been transcribed so far.
 - **Close This App** closes Meeting Scribe. If a transcription is running, it finishes safely first.
 
@@ -66,7 +66,7 @@ Results on the target i5-1345U laptop with the 15-minute Security Data Platform 
 | Whole recording | 107 s | 346 s |
 | Live chunk | about 2.5 s per 8 s chunk | about 9 s per 15 s chunk |
 | Live chunk size | 8 s with 1 s overlap | 15 s with 1.5 s overlap |
-| Text delay while recording | about 13 s | about 15 to 25 s |
+| Text delay while recording | about 10 to 11 s | about 15 to 25 s |
 
 The GPU engine was also more accurate on that meeting, with better punctuation and names. It leaves the CPU free for Teams.
 
@@ -74,7 +74,7 @@ Whisper pads every chunk to 30 seconds, so a chunk costs about the same whatever
 
 ### Start-up
 
-The app loads the speech model in the background as soon as it opens. The home screen shows "Speech model ready" when it is done, so Record starts transcribing at once.
+The speech model is not loaded when the app opens. It starts when you open the recording window, pick a recording to transcribe, or click the red **Start Model** light. Before loading, the app checks every model file against the approved SHA-256 digests, which adds about 1 to 1.5 seconds. If you click **Record** before the light is green, audio is kept and transcribed once the model is ready.
 
 The first start on the GPU compiles the model, which takes about 30 seconds. The compiled model is cached in `models\openvino-whisper\.ov_cache`, so later starts take a few seconds.
 
@@ -86,7 +86,7 @@ To force the CPU engine on an Intel laptop, set the environment variable `LOCAL_
 
 Setup checks that the model folder is complete. The app never loads a partial folder, because faster-whisper would otherwise download a missing tokenizer from the internet.
 
-- **CPU model:** `model.bin`, `config.json`, `tokenizer.json`, `vocabulary.json` or `vocabulary.txt`, and `preprocessor_config.json`.
+- **CPU model:** `model.bin`, `config.json`, `tokenizer.json`, and `vocabulary.json` or `vocabulary.txt`. Models with 128 mel bins, such as distil-large-v3.5, also need `preprocessor_config.json`; setup always downloads it.
 - **GPU model:** the OpenVINO encoder, decoder, tokenizer and detokenizer `.xml` and `.bin` files.
 
 ### Upgrading an existing install
@@ -117,14 +117,20 @@ How the app stays offline after setup:
 - It loads models with `local_files_only=True` and only from a complete local folder.
 - It blocks Python network connections to anything other than this laptop (loopback). An attempt fails with "Network access is disabled after setup".
 
-- It decodes saved recordings in a separate process that cannot start other programs, is capped at 2 GB of memory, and only lets FFmpeg read local files.
+- It decodes saved recordings in a separate process that cannot start other programs and is capped at 2 GB of memory. If Windows cannot apply those limits, the recording is not opened. FFmpeg may only open files, not network streams such as `http` or `rtsp`.
+
+Limits:
+
+- Files on a network share (`\\server\share` or a mapped network drive) are still allowed. Windows reads them through file sharing, which is outside the app's Python network block.
+- The decoder process runs as you and can read your files. It is limited, not sandboxed.
 
 The Python block cannot stop code in native libraries. If IT wants an operating-system guarantee, an outbound Windows Firewall rule for `pythonw.exe` can block everything after setup.
 
-### What setup checks
+### What setup and the app check
 
 - **Packages:** every package, including dependencies, is pinned to one version and one SHA-256 hash in the `.lock.txt` files. pip installs with `--require-hashes --only-binary=:all: --no-deps`, so it refuses a changed file, anything built from source, and any package not in the lock. OpenVINO's telemetry package (`openvino-telemetry`) is deliberately left out. Only OpenVINO's model converter uses it, and this app never runs the converter. Setup also deletes it from older installs.
-- **Models:** `resources\model_manifest.json` pins each model to a Hugging Face commit and lists the SHA-256 of every file. Setup downloads that commit and refuses a download whose files do not match. A model folder you set yourself under **Advanced** is not checked, and the log says so.
+- **Models:** `resources\model_manifest.json` pins each model to a Hugging Face commit and lists the SHA-256 of every file. Setup downloads that commit and refuses a download whose files do not match. The app checks the files again every time the model starts, and refuses to load a model whose files changed since setup. The compiled GPU cache (`.ov_cache`) is not covered. A model folder you set yourself under **Advanced** is not checked, and the log says so.
+- **Transcript text** goes only to the window, the transcript file and, when you click Copy, the clipboard. It is not printed to a console or written to `error_log.txt`.
 
 ### Checking the launcher
 
