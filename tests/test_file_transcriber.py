@@ -9,7 +9,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
-from file_transcriber import FileTranscriptionWorker, audio_chunks
+import file_transcriber
+from file_transcriber import DecodedAudio, FileTranscriptionWorker, pcm_windows
 from transcriber_engine import EngineConfig
 
 
@@ -44,19 +45,78 @@ class FileTranscriptionTests(unittest.TestCase):
         return SimpleNamespace(transcribe=lambda samples, **kwargs: (
             [SimpleNamespace(text="Meeting discussion", start=0, end=len(samples)/16000)], None))
 
+    def decoded_windows(self, seconds=1, overlap=.2):
+        cancelled = threading.Event()
+        with DecodedAudio(self.source, cancelled) as decoded:
+            return list(pcm_windows(decoded.samples(), seconds, overlap, cancelled))
+
     def test_stereo_resampling_overlap_and_tail(self):
-        import av
-        with av.open(str(self.source)) as container:
-            chunks = list(audio_chunks(container, 1, .2, threading.Event()))
+        chunks = self.decoded_windows()
         self.assertEqual([round(start, 1) for start, _ in chunks], [0, .8, 1.6])
         self.assertEqual([len(samples) for _, samples in chunks], [16000, 16000, 9600])
         self.assertTrue(all(samples.ndim == 1 for _, samples in chunks))
 
     def test_exact_window_does_not_repeat_overlap(self):
-        import av
         make_audio(self.source, seconds=1)
-        with av.open(str(self.source)) as container:
-            self.assertEqual(len(list(audio_chunks(container, 1, .2, threading.Event()))), 1)
+        self.assertEqual(len(self.decoded_windows()), 1)
+
+    def test_decoder_runs_in_a_separate_process_and_reports_duration(self):
+        import os
+
+        cancelled = threading.Event()
+        with DecodedAudio(self.source, cancelled) as decoded:
+            samples = sum(len(block) for block in decoded.samples())
+            child_pid = decoded.process.pid
+            duration = decoded.duration
+        self.assertNotEqual(child_pid, os.getpid())
+        self.assertEqual(decoded.process.returncode, 0)
+        self.assertAlmostEqual(duration, 2.2, places=2)
+        self.assertEqual(samples, round(2.2 * 16000))
+
+    def test_cancel_stops_the_decoder_process(self):
+        make_audio(self.source, seconds=120)
+        cancelled = threading.Event()
+        with DecodedAudio(self.source, cancelled) as decoded:
+            for _ in decoded.samples():
+                cancelled.set()
+        self.assertIsNotNone(decoded.process.poll())
+
+    def fake_decoder(self, code):
+        return patch.object(file_transcriber, "decoder_command",
+                            return_value=[sys.executable, "-I", "-c", code])
+
+    def test_decoder_crash_is_reported_not_raised_in_the_app(self):
+        with self.fake_decoder("import sys; sys.stdin.buffer.read(1); sys.exit(3)"):
+            with self.assertRaisesRegex(RuntimeError, "exit code 3"):
+                DecodedAudio(self.source, threading.Event())
+
+    def test_decoder_error_message_is_passed_on(self):
+        code = ("import sys, json; sys.stdin.buffer.read(1); "
+                "sys.stderr.write(json.dumps({'error': 'Invalid data found'}) + chr(10)); sys.exit(2)")
+        with self.fake_decoder(code):
+            with self.assertRaisesRegex(RuntimeError, "Invalid data found"):
+                DecodedAudio(self.source, threading.Event())
+
+    def test_silent_decoder_is_stopped_after_the_idle_timeout(self):
+        code = ("import sys, time; sys.stdin.buffer.read(1); "
+                "sys.stdout.write('{\"duration\": 1}' + chr(10)); sys.stdout.flush(); time.sleep(30)")
+        with self.fake_decoder(code):
+            decoded = DecodedAudio(self.source, threading.Event(), idle_timeout=0.5)
+            with self.assertRaisesRegex(RuntimeError, "stopped responding"):
+                list(decoded.samples())
+        decoded.process.wait(timeout=10)
+        self.assertIsNotNone(decoded.process.poll())
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows job objects")
+    def test_decoder_job_blocks_child_processes(self):
+        code = ("import subprocess, sys; sys.stdin.buffer.read(1)\n"
+                "try:\n    subprocess.run([sys.executable, '-c', 'pass'], check=True)\n"
+                "except OSError:\n    sys.exit(0)\n"
+                "sys.exit(5)")
+        with self.fake_decoder(code):
+            with self.assertRaisesRegex(RuntimeError, "exit code 0"):
+                # Exit 0 without a header means the spawn was refused inside the job.
+                DecodedAudio(self.source, threading.Event())
 
     def test_completes_without_capture_devices_and_saves(self):
         with patch("file_transcriber.load_whisper_model", return_value=self.fake_model()):
@@ -86,14 +146,24 @@ class FileTranscriptionTests(unittest.TestCase):
         self.assertEqual(self.events[-1][1]["outcome"], "failed")
 
     def test_missing_audio(self):
+        import io
+        import audio_decode_worker
         container = SimpleNamespace(streams=SimpleNamespace(audio=[]))
         from unittest.mock import MagicMock
         context = MagicMock()
         context.__enter__.return_value = container
-        with patch("av.open", return_value=context):
-            self.worker.run()
-        self.assertTrue(any("no audio track" in p.get("message", "") for _, p in self.events))
-        self.assertEqual(self.events[-1][1]["outcome"], "failed")
+        with patch("av.open", return_value=context) as opened:
+            with self.assertRaisesRegex(ValueError, "no audio track"):
+                audio_decode_worker.decode_to(io.BytesIO(), str(self.source))
+        self.assertEqual(opened.call_args.kwargs["options"], {"protocol_whitelist": "file"})
+
+    def test_decoder_only_opens_existing_local_files(self):
+        import audio_decode_worker
+        for raw in ("http://example.com/a.mp3", "rtsp://host/stream", "\\\\.\\pipe\\x", str(self.root),
+                    str(self.root / "missing.wav"), ""):
+            with self.subTest(path=raw), self.assertRaises(ValueError):
+                audio_decode_worker.checked_input_path(raw)
+        self.assertEqual(audio_decode_worker.checked_input_path(str(self.source)), self.source.resolve())
 
     def test_write_error_recovers_partial(self):
         with patch("file_transcriber.load_whisper_model", return_value=self.fake_model()), patch(

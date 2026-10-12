@@ -3221,4 +3221,9 @@ def run_bootstrap() -> int:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--decode-worker":
+        # Portable (PyInstaller) build: file_transcriber starts this executable again as the audio decoder.
+        import audio_decode_worker
+
+        raise SystemExit(audio_decode_worker.main(sys.argv[2:]))
     raise SystemExit(run_bootstrap())

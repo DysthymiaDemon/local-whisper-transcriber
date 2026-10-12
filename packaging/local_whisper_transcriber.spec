@@ -10,7 +10,7 @@ project_root = Path.cwd()
 app_root = project_root / "app"
 datas = []
 binaries = []
-hiddenimports = []
+hiddenimports = ["audio_decode_worker", "win_job"]
 
 for package in (
     "PySide6",

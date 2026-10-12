@@ -49,7 +49,7 @@ NUM_WORKERS = PORTABLE_DEFAULTS.num_workers
 LANGUAGE = PORTABLE_DEFAULTS.language
 
 MEETING_FILE_FILTER = (
-    "Meeting recordings (*.mp4 *.m4a *.mp3 *.wav *.webm *.mkv *.mov *.aac *.wma);;All files (*.*)"
+    "Meeting recordings (*.mp4 *.m4a *.mp3 *.wav *.webm *.mkv *.mov *.aac *.wma)"
 )
 HOME_PAGE = 0
 SESSION_PAGE = 1
