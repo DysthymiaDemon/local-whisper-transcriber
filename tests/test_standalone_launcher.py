@@ -11,7 +11,6 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 GENERATOR_PATH = PROJECT_ROOT / "packaging" / "build_standalone_pyw.py"
 LAUNCHER_PATH = PROJECT_ROOT / "Open Offline Meeting Transcriber.pyw"
-GPU_TRIAL_LAUNCHER_PATH = PROJECT_ROOT / "Open Offline Meeting Transcriber GPU Trial.pyw"
 
 
 def load_generator():
@@ -45,14 +44,6 @@ class StandaloneLauncherTests(unittest.TestCase):
 
         self.assertEqual(actual, expected)
 
-    def test_committed_gpu_trial_launcher_payload_is_current(self):
-        generator = load_generator()
-
-        expected = generator.generate_gpu_trial(PROJECT_ROOT)
-        actual = GPU_TRIAL_LAUNCHER_PATH.read_text(encoding="utf-8")
-
-        self.assertEqual(actual, expected)
-
     def test_payload_is_line_ending_independent(self):
         generator = load_generator()
         with tempfile.TemporaryDirectory() as tmp:
@@ -81,17 +72,15 @@ class StandaloneLauncherTests(unittest.TestCase):
 
         self.assertIn('os.environ["LOCAL_WHISPER_LOG_ROOT"] = str(launcher_path.parent)', content)
 
-    def test_gpu_trial_launcher_uses_separate_folder_and_env_flag(self):
-        content = GPU_TRIAL_LAUNCHER_PATH.read_text(encoding="utf-8")
+    def test_no_gpu_trial_launcher_is_generated(self):
+        generator = load_generator()
 
-        self.assertIn('APP_FOLDER_NAME = "OfflineMeetingTranscriberGpuTrial"', content)
-        self.assertIn('os.environ["LOCAL_WHISPER_GPU_TRIAL"] = "1"', content)
-        self.assertIn('os.environ["LOCAL_WHISPER_RUNTIME_APP_FOLDER_NAME"] = "OfflineMeetingTranscriberGpuTrialRuntime"', content)
-        self.assertNotIn('APP_FOLDER_NAME = "OfflineMeetingTranscriber"\nPAYLOAD', content)
+        self.assertFalse(hasattr(generator, "generate_gpu_trial"))
+        self.assertNotIn("LOCAL_WHISPER_GPU_TRIAL", LAUNCHER_PATH.read_text(encoding="utf-8"))
 
-    def test_gpu_trial_launcher_embeds_large_v3_turbo_int8_model(self):
-        namespace = {"__name__": "embedded_gpu_trial_launcher"}
-        exec(GPU_TRIAL_LAUNCHER_PATH.read_text(encoding="utf-8"), namespace)
+    def test_launcher_embeds_intel_large_v3_turbo_int8_model(self):
+        namespace = {"__name__": "embedded_launcher"}
+        exec(LAUNCHER_PATH.read_text(encoding="utf-8"), namespace)
         payload = namespace["decode_payload"]()
         encoded = payload["files"]["app/bootstrap_launcher.py"]["data"]
         content = base64.b64decode(encoded).decode("utf-8")
@@ -160,27 +149,6 @@ class StandaloneLauncherTests(unittest.TestCase):
             self.assertTrue((app_root / "models" / "faster-whisper").is_dir())
             self.assertFalse((app_root / "models" / "speechbrain-ecapa").exists())
             self.assertTrue((app_root / "transcripts").is_dir())
-
-    def test_gpu_trial_init_only_extracts_beside_copied_launcher_to_trial_folder(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            folder = Path(tmp)
-            copied_launcher = folder / GPU_TRIAL_LAUNCHER_PATH.name
-            shutil.copy2(GPU_TRIAL_LAUNCHER_PATH, copied_launcher)
-
-            result = subprocess.run(
-                [sys.executable, str(copied_launcher), "--init-only"],
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-            )
-
-            app_root = folder / "OfflineMeetingTranscriberGpuTrial"
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(Path(result.stdout.strip()), app_root.resolve())
-            self.assertTrue((app_root / "app" / "bootstrap_launcher.py").is_file())
-            self.assertTrue((app_root / "resources" / "requirements.txt").is_file())
-            self.assertTrue((app_root / "config.json").is_file())
 
     def test_init_only_uses_current_folder_when_named_like_app(self):
         with tempfile.TemporaryDirectory() as tmp:

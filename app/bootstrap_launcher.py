@@ -40,7 +40,6 @@ REQUIRED_IMPORTS: dict[str, str] = {
 
 DEFAULT_MODEL_DIRS = ("faster-whisper",)
 OPTIONAL_MODEL_DIRS: tuple[str, ...] = ()
-GPU_TRIAL_MODEL_DIRS = ("openvino-whisper",)
 MODEL_DIRS = DEFAULT_MODEL_DIRS + OPTIONAL_MODEL_DIRS
 MODEL_GUIDES: dict[str, str] = {
     "faster-whisper": (
@@ -54,7 +53,7 @@ MODEL_GUIDES: dict[str, str] = {
         "Source model: distil-whisper/distil-large-v3.5-ct2\n"
     ),
     "openvino-whisper": (
-        "GPU trial setup downloads OpenVINO/whisper-large-v3-turbo-int8-ov here for Intel GPU testing.\n\n"
+        "Intel GPU setup downloads OpenVINO/whisper-large-v3-turbo-int8-ov here.\n\n"
         "Model size: 828 MB. Requires OpenVINO 2026.1 or newer.\n\n"
         "Required files include OpenVINO IR XML/BIN files and tokenizer files.\n\n"
         "Setup replaces a stale default model in place using the temporary "
@@ -70,7 +69,6 @@ PACKAGE_DIR = "site-packages"
 RUNTIME_ENV = "LOCAL_WHISPER_RUNTIME_ROOT"
 RUNTIME_APP_FOLDER_ENV = "LOCAL_WHISPER_RUNTIME_APP_FOLDER_NAME"
 RUNTIME_APP_FOLDER_NAME = "OfflineMeetingTranscriberRuntime"
-GPU_TRIAL_ENV = "LOCAL_WHISPER_GPU_TRIAL"
 OPENVINO_MODEL_CONFIG_SIGNATURE = {
     "d_model": 1280,
     "encoder_layers": 32,
@@ -195,7 +193,7 @@ class ModelDownloadSpec:
 
 
 @dataclass(frozen=True)
-class GpuTrialBackend:
+class SpeechBackend:
     key: str
     label: str
     requirements: tuple[str, ...] = ()
@@ -232,82 +230,60 @@ OPENVINO_MODEL_DOWNLOADS = (
     ),
 )
 
-GPU_TRIAL_BACKEND_NONE = GpuTrialBackend(
+CPU_BACKEND = SpeechBackend(
     key="cpu-only",
-    label="No supported GPU trial backend detected",
-    note="No NVIDIA, Intel, or AMD GPU was detected. The trial launcher will use the normal CPU backend.",
+    label="CPU faster-whisper",
+    note="Uses the distil-large-v3.5 model on the CPU.",
 )
-GPU_TRIAL_BACKENDS = {
-    GpuVendor.NVIDIA: GpuTrialBackend(
-        key="nvidia-cuda",
-        label="NVIDIA CUDA faster-whisper",
-        config_overrides={"device": "cuda", "compute_type": "float16"},
-        note=(
-            "Uses the existing CTranslate2 faster-whisper model with device=cuda. "
-            "CUDA/cuDNN runtime libraries must be available on Windows."
-        ),
+INTEL_OPENVINO_BACKEND = SpeechBackend(
+    key="intel-openvino",
+    label="Intel OpenVINO WhisperPipeline",
+    requirements=(
+        "openvino==2026.4.1",
+        "openvino-tokenizers==2026.4.1.0",
+        "openvino-genai==2026.4.1.0",
     ),
-    GpuVendor.INTEL: GpuTrialBackend(
-        key="intel-openvino",
-        label="Intel OpenVINO WhisperPipeline",
-        requirements=(
-            "openvino==2026.4.1",
-            "openvino-tokenizers==2026.4.1.0",
-            "openvino-genai==2026.4.1.0",
-        ),
-        imports={
-            "openvino": "openvino",
-            "openvino-genai": "openvino_genai",
-            "openvino-tokenizers": "openvino_tokenizers",
-        },
-        minimum_versions={
-            "openvino": "2026.1.0",
-            "openvino-genai": "2026.1.0",
-            "openvino-tokenizers": "2026.1.0",
-        },
-        model_downloads=OPENVINO_MODEL_DOWNLOADS,
-        config_overrides={
-            "whisper_model_dir": "models/openvino-whisper",
-            "device": "openvino:GPU",
-            "compute_type": "int8",
-            "chunk_seconds": 10.0,
-            "overlap_seconds": 1.0,
-        },
-        note=(
-            "Uses OpenVINO GenAI WhisperPipeline on Intel GPU with "
-            "the 828 MB OpenVINO Whisper large-v3-turbo INT8 model. "
-            "Requires OpenVINO 2026.1 or newer. Setup replaces a stale default model "
-            "in place using temporary models/.openvino-whisper.rollback."
-        ),
+    imports={
+        "openvino": "openvino",
+        "openvino-genai": "openvino_genai",
+        "openvino-tokenizers": "openvino_tokenizers",
+    },
+    minimum_versions={
+        "openvino": "2026.1.0",
+        "openvino-genai": "2026.1.0",
+        "openvino-tokenizers": "2026.1.0",
+    },
+    model_downloads=OPENVINO_MODEL_DOWNLOADS,
+    config_overrides={
+        "whisper_model_dir": "models/openvino-whisper",
+        "device": "openvino:GPU",
+        "compute_type": "int8",
+        "chunk_seconds": 10.0,
+        "overlap_seconds": 1.0,
+    },
+    note=(
+        "Uses OpenVINO GenAI WhisperPipeline on Intel GPU with "
+        "the 828 MB OpenVINO Whisper large-v3-turbo INT8 model. "
+        "Requires OpenVINO 2026.1 or newer. Setup replaces a stale default model "
+        "in place using temporary models/.openvino-whisper.rollback."
     ),
-    GpuVendor.AMD: GpuTrialBackend(
-        key="amd-directml",
-        label="AMD DirectML framework probe",
-        requirements=("onnxruntime-directml>=1.19.0",),
-        imports={"onnxruntime-directml": "onnxruntime"},
-        note=(
-            "Installs DirectML runtime for detection/probing. Current transcription engine is not "
-            "ONNX-backed, so AMD GPU transcription is not enabled yet."
-        ),
-    ),
-}
+)
 
 
 def setup_install_summary(package_root: Path | None = None) -> str:
     package_lines = "\n".join(f"- {package}" for package in setup_package_list(package_root))
     model_lines = "\n".join(f"- {model}" for model in setup_model_list())
-    gpu_trial_note = ""
-    if gpu_trial_enabled() or backend_active():
-        backend = active_gpu_trial_backend()
-        label = "GPU trial backend" if gpu_trial_enabled() else "Speech engine"
-        gpu_trial_note = f"\n{label}: {backend.label}\n{backend.note}\n"
+    engine_note = ""
+    if backend_active():
+        backend = active_backend()
+        engine_note = f"\nSpeech engine: {backend.label}\n{backend.note}\n"
     return (
         "Install Meeting Scribe?\n"
         "Local Windows App\n"
         f"Publisher: {APP_PUBLISHER}\n"
         f"Version: {APP_VERSION}\n\n"
         f"Disk space: {INSTALL_DISK_SPACE_ESTIMATE} for packages and models.\n\n"
-        f"{gpu_trial_note}"
+        f"{engine_note}"
         "Models to install locally:\n"
         f"{model_lines}\n\n"
         "Python packages to install locally:\n"
@@ -338,12 +314,8 @@ def setup_package_list(package_root: Path | None = None) -> list[str]:
         if line and not line.startswith("#"):
             packages.append(line)
     if backend_active():
-        packages.extend(line for line in active_gpu_trial_backend().requirements if not line.startswith("--"))
+        packages.extend(line for line in active_backend().requirements if not line.startswith("--"))
     return packages or ["Python package requirements"]
-
-
-def gpu_trial_enabled() -> bool:
-    return os.environ.get(GPU_TRIAL_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 FORCE_CPU_ENV = "LOCAL_WHISPER_FORCE_CPU"
@@ -447,52 +419,42 @@ def detect_gpu_vendors() -> list[GpuVendor]:
     return detect_gpu_vendors_from_names(detect_windows_gpu_names())
 
 
-def choose_gpu_trial_backend(vendors: Iterable[GpuVendor] | None = None) -> GpuTrialBackend:
-    vendor_list = list(vendors) if vendors is not None else detect_gpu_vendors()
-    for vendor in (GpuVendor.NVIDIA, GpuVendor.INTEL, GpuVendor.AMD):
-        if vendor in vendor_list:
-            return GPU_TRIAL_BACKENDS[vendor]
-    return GPU_TRIAL_BACKEND_NONE
+_install_backend: SpeechBackend | None = None
 
 
-_install_backend: GpuTrialBackend | None = None
-
-
-def choose_default_backend(vendors: Iterable[GpuVendor] | None = None) -> GpuTrialBackend:
+def choose_default_backend(vendors: Iterable[GpuVendor] | None = None) -> SpeechBackend:
     """Main launcher: Intel GPUs (Iris Xe, Arc) use OpenVINO; every other laptop keeps the CPU model.
 
     On the target i5-1345U laptop the Intel GPU path was about 3x faster than distil-large-v3.5 on the CPU
-    (15-minute meeting in 107 s against 346 s) and more accurate. NVIDIA and AMD stay in the GPU trial launcher.
+    (15-minute meeting in 107 s against 346 s) and more accurate. NVIDIA and AMD laptops use the CPU model.
     """
     if os.environ.get(FORCE_CPU_ENV, "").strip().lower() in {"1", "true", "yes", "on"}:
-        return GPU_TRIAL_BACKEND_NONE
+        return CPU_BACKEND
     vendor_list = list(vendors) if vendors is not None else detect_gpu_vendors()
     if GpuVendor.INTEL in vendor_list:
-        return GPU_TRIAL_BACKENDS[GpuVendor.INTEL]
-    return GPU_TRIAL_BACKEND_NONE
+        return INTEL_OPENVINO_BACKEND
+    return CPU_BACKEND
 
 
-def desired_backend() -> GpuTrialBackend:
-    return choose_gpu_trial_backend() if gpu_trial_enabled() else choose_default_backend()
+def desired_backend() -> SpeechBackend:
+    return choose_default_backend()
 
 
-def set_install_backend(backend: GpuTrialBackend | None) -> None:
+def set_install_backend(backend: SpeechBackend | None) -> None:
     """Pin the backend that setup installs and checks for this run (None = work it out again)."""
     global _install_backend
     _install_backend = backend
 
 
-def active_gpu_trial_backend() -> GpuTrialBackend:
-    if _install_backend is not None:
-        return _install_backend
-    return choose_gpu_trial_backend() if gpu_trial_enabled() else GPU_TRIAL_BACKEND_NONE
+def active_backend() -> SpeechBackend:
+    return _install_backend if _install_backend is not None else CPU_BACKEND
 
 
 def backend_active() -> bool:
-    return active_gpu_trial_backend() is not GPU_TRIAL_BACKEND_NONE
+    return active_backend() is not CPU_BACKEND
 
 
-def config_uses_backend(root: Path, backend: GpuTrialBackend) -> bool:
+def config_uses_backend(root: Path, backend: SpeechBackend) -> bool:
     if not backend.config_overrides:
         return False
     try:
@@ -514,37 +476,23 @@ def config_uses_default_cpu_model(root: Path) -> bool:
     return _configured_model_dir(root) == (root / "models" / "faster-whisper").resolve()
 
 
-def gpu_trial_requirement_lines(vendors: Iterable[GpuVendor] | None = None) -> list[str]:
-    backend = choose_gpu_trial_backend(vendors)
-    return list(backend.requirements)
-
-
-def gpu_trial_package_list(vendors: Iterable[GpuVendor] | None = None) -> list[str]:
-    return [line for line in gpu_trial_requirement_lines(vendors) if line and not line.startswith("--")]
-
-
-def gpu_trial_required_imports(vendors: Iterable[GpuVendor] | None = None) -> dict[str, str]:
-    backend = choose_gpu_trial_backend(vendors)
-    return dict(backend.imports or {})
-
-
 def runtime_required_imports() -> dict[str, str]:
     required = dict(REQUIRED_IMPORTS)
     if backend_active():
-        required.update(dict(active_gpu_trial_backend().imports or {}))
+        required.update(dict(active_backend().imports or {}))
     return required
 
 
 def runtime_required_minimum_versions() -> dict[str, str]:
     if not backend_active():
         return {}
-    return dict(active_gpu_trial_backend().minimum_versions or {})
+    return dict(active_backend().minimum_versions or {})
 
 
 def active_model_downloads() -> tuple[ModelDownloadSpec, ...]:
     if not backend_active():
         return DEFAULT_MODEL_DOWNLOADS
-    return active_gpu_trial_backend().model_downloads or DEFAULT_MODEL_DOWNLOADS
+    return active_backend().model_downloads or DEFAULT_MODEL_DOWNLOADS
 
 
 def active_model_dirs() -> tuple[str, ...]:
@@ -555,11 +503,11 @@ def active_model_dirs() -> tuple[str, ...]:
     return tuple(names)
 
 
-def write_gpu_trial_requirements(root: Path, backend: GpuTrialBackend | None = None) -> Path | None:
-    backend = backend or active_gpu_trial_backend()
+def write_backend_requirements(root: Path, backend: SpeechBackend | None = None) -> Path | None:
+    backend = backend or active_backend()
     if not backend.requirements:
         return None
-    requirements_path = local_runtime_dir(root) / "gpu-trial-requirements.txt"
+    requirements_path = local_runtime_dir(root) / "backend-requirements.txt"
     requirements_path.parent.mkdir(parents=True, exist_ok=True)
     requirements_path.write_text("\n".join(backend.requirements) + "\n", encoding="utf-8")
     return requirements_path
@@ -569,7 +517,7 @@ def pip_requirement_paths(root: Path, package_root: Path | None = None) -> list[
     package_root = package_root or installer_source_root()
     paths = [resource_root(package_root) / "requirements.txt"]
     if backend_active():
-        extra_path = write_gpu_trial_requirements(root)
+        extra_path = write_backend_requirements(root)
         if extra_path is not None:
             paths.append(extra_path)
     return paths
@@ -1254,26 +1202,8 @@ sys.exit(1 if missing else 0)
     return [item for item in parsed if isinstance(item, str)]
 
 
-def write_gpu_trial_report(root: Path, backend: GpuTrialBackend | None = None) -> Path:
-    backend = backend or active_gpu_trial_backend()
-    names = detect_windows_gpu_names()
-    vendors = detect_gpu_vendors_from_names(names)
-    lines = [
-        "GPU trial report",
-        f"timestamp: {datetime.now().isoformat(timespec='seconds')}",
-        f"detected_gpus: {', '.join(names) if names else 'none'}",
-        f"detected_vendors: {', '.join(vendor.value for vendor in vendors) if vendors else 'none'}",
-        f"selected_backend: {backend.key}",
-        f"selected_backend_label: {backend.label}",
-        f"note: {backend.note or 'none'}",
-    ]
-    report_path = root / "gpu_trial_report.txt"
-    report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return report_path
-
-
-def apply_gpu_trial_config(config_path: Path, backend: GpuTrialBackend | None = None) -> None:
-    backend = backend or active_gpu_trial_backend()
+def apply_backend_config(config_path: Path, backend: SpeechBackend | None = None) -> None:
+    backend = backend or active_backend()
     if not backend.config_overrides:
         return
     try:
@@ -1286,8 +1216,8 @@ def apply_gpu_trial_config(config_path: Path, backend: GpuTrialBackend | None = 
     config_path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
 
 
-def migrate_gpu_trial_config(config_path: Path, backend: GpuTrialBackend | None = None) -> bool:
-    backend = backend or active_gpu_trial_backend()
+def migrate_backend_config(config_path: Path, backend: SpeechBackend | None = None) -> bool:
+    backend = backend or active_backend()
     if backend.key != "intel-openvino" or not backend.config_overrides:
         return False
     try:
@@ -1358,22 +1288,14 @@ def ensure_portable_layout(root: Path, template_root: Path | None = None) -> Pat
                 encoding="utf-8",
             )
         created_config = True
-    if gpu_trial_enabled():
-        backend = active_gpu_trial_backend()
-        write_gpu_trial_requirements(root, backend)
-        write_gpu_trial_report(root, backend)
-        if created_config:
-            apply_gpu_trial_config(config_path, backend)
-        else:
-            migrate_gpu_trial_config(config_path, backend)
-    elif backend_active():
-        backend = active_gpu_trial_backend()
-        write_gpu_trial_requirements(root, backend)
+    if backend_active():
+        backend = active_backend()
+        write_backend_requirements(root, backend)
         if created_config:
             # Fresh install on an Intel GPU laptop: start on the GPU model straight away.
-            apply_gpu_trial_config(config_path, backend)
+            apply_backend_config(config_path, backend)
         elif config_uses_backend(root, backend):
-            migrate_gpu_trial_config(config_path, backend)
+            migrate_backend_config(config_path, backend)
     return config_path
 
 
@@ -2179,11 +2101,11 @@ def run_bootstrap() -> int:
 
     wanted_backend = desired_backend()
     fresh_install = not (root / "config.json").exists()
-    if gpu_trial_enabled() or fresh_install or config_uses_backend(root, wanted_backend):
+    if fresh_install or config_uses_backend(root, wanted_backend):
         set_install_backend(wanted_backend)
     else:
         # Existing install still on the CPU model: keep it working, offer the GPU below.
-        set_install_backend(GPU_TRIAL_BACKEND_NONE)
+        set_install_backend(CPU_BACKEND)
     ensure_portable_layout(root, package_root)
     update_startup_splash(splash, splash_status, "Checking Python packages...")
     required_imports = runtime_required_imports()
@@ -2193,8 +2115,7 @@ def run_bootstrap() -> int:
     update_startup_splash(splash, splash_status, "Checking first-time setup status...")
     setup_missing = not (root / SETUP_MARKER).exists()
     gpu_upgrade = (
-        not gpu_trial_enabled()
-        and wanted_backend is not GPU_TRIAL_BACKEND_NONE
+        wanted_backend is not CPU_BACKEND
         and not backend_active()
         and config_uses_default_cpu_model(root)
     )
@@ -3169,7 +3090,7 @@ def run_bootstrap() -> int:
             if start_index <= 6:
                 important_message(BOOTSTRAP_STEPS[6], "Saving setup state and preparing launch...")
                 if gpu_upgrade and backend_active():
-                    apply_gpu_trial_config(root / "config.json", active_gpu_trial_backend())
+                    apply_backend_config(root / "config.json", active_backend())
                     log_install(BOOTSTRAP_STEPS[6], "Switched to the Intel GPU speech engine")
                 set_step(BOOTSTRAP_STEPS[6], StepState.DONE, "Setup complete", 100)
             window.after(0, finish_with_launch_countdown)

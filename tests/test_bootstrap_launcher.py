@@ -8,6 +8,7 @@ import tempfile
 import time
 import types
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -30,11 +31,9 @@ from bootstrap_launcher import (
     StepDiagnostic,
     StepState,
     build_step_tooltip,
-    choose_gpu_trial_backend,
     detect_gpu_vendors_from_names,
     download_default_models,
     ensure_portable_layout,
-    gpu_trial_required_imports,
     is_onedrive_path,
     local_package_dir,
     local_runtime_dir,
@@ -55,6 +54,16 @@ from bootstrap_launcher import (
     read_model_source,
     write_model_source,
 )
+
+
+@contextmanager
+def intel_backend():
+    """Select the Intel OpenVINO backend for this setup run, as run_bootstrap does on an Intel laptop."""
+    bootstrap_launcher_module.set_install_backend(bootstrap_launcher_module.INTEL_OPENVINO_BACKEND)
+    try:
+        yield
+    finally:
+        bootstrap_launcher_module.set_install_backend(None)
 
 
 def write_complete_openvino_ir(folder: Path, content: str = "model") -> None:
@@ -162,7 +171,7 @@ class DefaultBackendTests(unittest.TestCase):
 
     def test_intel_gpu_is_default_and_others_stay_on_cpu(self):
         choose = bootstrap_launcher_module.choose_default_backend
-        none = bootstrap_launcher_module.GPU_TRIAL_BACKEND_NONE
+        none = bootstrap_launcher_module.CPU_BACKEND
         with patch.dict(os.environ, {"LOCAL_WHISPER_FORCE_CPU": ""}):
             self.assertEqual(choose([GpuVendor.INTEL]).key, "intel-openvino")
             self.assertIs(choose([GpuVendor.NVIDIA]), none)
@@ -171,7 +180,7 @@ class DefaultBackendTests(unittest.TestCase):
             self.assertIs(choose([GpuVendor.INTEL]), none)
 
     def test_openvino_packages_come_from_pypi_pinned(self):
-        intel = bootstrap_launcher_module.GPU_TRIAL_BACKENDS[GpuVendor.INTEL]
+        intel = bootstrap_launcher_module.INTEL_OPENVINO_BACKEND
         self.assertFalse(any(line.startswith("--") for line in intel.requirements))
         self.assertTrue(all("==" in line for line in intel.requirements))
 
@@ -189,7 +198,7 @@ class DefaultBackendTests(unittest.TestCase):
         self.assertEqual(names, ["Intel(R) Iris(R) Xe Graphics", "DisplayLink USB Device"])
 
     def test_fresh_install_on_intel_starts_on_gpu_model(self):
-        intel = bootstrap_launcher_module.GPU_TRIAL_BACKENDS[GpuVendor.INTEL]
+        intel = bootstrap_launcher_module.INTEL_OPENVINO_BACKEND
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             bootstrap_launcher_module.set_install_backend(intel)
@@ -204,16 +213,16 @@ class DefaultBackendTests(unittest.TestCase):
         self.assertIn("openvino-genai", imports)
 
     def test_existing_cpu_install_is_left_on_cpu_until_upgrade(self):
-        intel = bootstrap_launcher_module.GPU_TRIAL_BACKENDS[GpuVendor.INTEL]
+        intel = bootstrap_launcher_module.INTEL_OPENVINO_BACKEND
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             ensure_portable_layout(root)
-            bootstrap_launcher_module.set_install_backend(bootstrap_launcher_module.GPU_TRIAL_BACKEND_NONE)
+            bootstrap_launcher_module.set_install_backend(bootstrap_launcher_module.CPU_BACKEND)
             ensure_portable_layout(root)
             config = json.loads((root / "config.json").read_text(encoding="utf-8"))
             on_default_cpu = bootstrap_launcher_module.config_uses_default_cpu_model(root)
             uses_gpu = bootstrap_launcher_module.config_uses_backend(root, intel)
-            bootstrap_launcher_module.apply_gpu_trial_config(root / "config.json", intel)
+            bootstrap_launcher_module.apply_backend_config(root / "config.json", intel)
             switched = bootstrap_launcher_module.config_uses_backend(root, intel)
 
         self.assertEqual(config["device"], "cpu")
@@ -340,7 +349,7 @@ class BootstrapLauncherTests(unittest.TestCase):
             resources.mkdir()
             (resources / "requirements.txt").write_text("alpha==1.0\n", encoding="utf-8")
 
-            with patch.dict(os.environ, {"LOCAL_WHISPER_GPU_TRIAL": "1"}, clear=False):
+            with intel_backend():
                 with patch.object(
                     bootstrap_launcher_module,
                     "detect_windows_gpu_names",
@@ -385,23 +394,8 @@ class BootstrapLauncherTests(unittest.TestCase):
 
         self.assertEqual(vendors, [GpuVendor.INTEL, GpuVendor.AMD, GpuVendor.NVIDIA])
 
-    def test_choose_gpu_trial_backend_prefers_nvidia_then_intel_then_amd(self):
-        nvidia = choose_gpu_trial_backend([GpuVendor.INTEL, GpuVendor.NVIDIA])
-        intel = choose_gpu_trial_backend([GpuVendor.INTEL])
-        amd = choose_gpu_trial_backend([GpuVendor.AMD])
-
-        self.assertEqual(nvidia.key, "nvidia-cuda")
-        self.assertEqual(nvidia.config_overrides["device"], "cuda")
-        self.assertEqual(nvidia.config_overrides["compute_type"], "float16")
-        self.assertNotIn("chunk_seconds", nvidia.config_overrides)
-        self.assertNotIn("overlap_seconds", nvidia.config_overrides)
-        self.assertEqual(intel.key, "intel-openvino")
-        self.assertTrue(any(requirement.startswith("openvino-genai") for requirement in intel.requirements))
-        self.assertEqual(amd.key, "amd-directml")
-        self.assertTrue(any(requirement.startswith("onnxruntime-directml") for requirement in amd.requirements))
-
-    def test_intel_gpu_trial_uses_large_v3_turbo_int8_contract(self):
-        intel = choose_gpu_trial_backend([GpuVendor.INTEL])
+    def test_intel_backend_uses_large_v3_turbo_int8_contract(self):
+        intel = bootstrap_launcher_module.INTEL_OPENVINO_BACKEND
 
         self.assertEqual(len(intel.model_downloads), 1)
         self.assertEqual(
@@ -417,13 +411,22 @@ class BootstrapLauncherTests(unittest.TestCase):
         self.assertIn("openvino-tokenizers==2026.4.1.0", intel.requirements)
         self.assertIn("openvino-genai==2026.4.1.0", intel.requirements)
 
-    def test_gpu_trial_required_imports_are_selected_by_vendor(self):
-        imports = gpu_trial_required_imports([GpuVendor.INTEL])
+    def test_openvino_imports_are_required_only_on_the_intel_backend(self):
+        cpu_imports = bootstrap_launcher_module.runtime_required_imports()
+        with intel_backend():
+            imports = bootstrap_launcher_module.runtime_required_imports()
 
         self.assertIn("openvino", imports)
         self.assertIn("openvino-genai", imports)
         self.assertIn("openvino-tokenizers", imports)
-        self.assertNotIn("onnxruntime-directml", imports)
+        self.assertNotIn("openvino", cpu_imports)
+
+    def test_gpu_trial_mode_and_unused_gpu_backends_are_gone(self):
+        source = (Path(__file__).resolve().parents[1] / "app" / "bootstrap_launcher.py").read_text(encoding="utf-8")
+
+        self.assertNotIn("LOCAL_WHISPER_GPU_TRIAL", source)
+        self.assertNotIn("onnxruntime", source)
+        self.assertFalse(hasattr(bootstrap_launcher_module, "gpu_trial_enabled"))
 
     def test_successful_package_install_marks_package_check_done(self):
         source = (Path(__file__).resolve().parents[1] / "app" / "bootstrap_launcher.py").read_text(encoding="utf-8")
@@ -468,11 +471,11 @@ class BootstrapLauncherTests(unittest.TestCase):
         self.assertEqual(config["output_file"], "transcripts/meeting_transcript.txt")
         self.assertEqual(config["language"], "en")
 
-    def test_gpu_trial_layout_uses_openvino_model_and_config_for_intel(self):
+    def test_intel_layout_uses_openvino_model_and_config(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
 
-            with patch.dict(os.environ, {"LOCAL_WHISPER_GPU_TRIAL": "1"}, clear=False):
+            with intel_backend():
                 with patch.object(
                     bootstrap_launcher_module,
                     "detect_windows_gpu_names",
@@ -481,12 +484,10 @@ class BootstrapLauncherTests(unittest.TestCase):
                     config_path = ensure_portable_layout(root)
 
             config = json.loads(config_path.read_text(encoding="utf-8"))
-            requirements = local_runtime_dir(root) / "gpu-trial-requirements.txt"
-            report = root / "gpu_trial_report.txt"
+            requirements = local_runtime_dir(root) / "backend-requirements.txt"
             self.assertTrue(requirements.is_file())
-            self.assertTrue(report.is_file())
+            self.assertFalse((root / "gpu_trial_report.txt").exists())
             requirements_content = requirements.read_text(encoding="utf-8")
-            report_content = report.read_text(encoding="utf-8")
             guide_content = (
                 root / "models" / "openvino-whisper" / "README_MODEL_FILES.txt"
             ).read_text(encoding="utf-8")
@@ -497,14 +498,12 @@ class BootstrapLauncherTests(unittest.TestCase):
             self.assertEqual(config["chunk_seconds"], 10.0)
             self.assertEqual(config["overlap_seconds"], 1.0)
             self.assertIn("openvino-genai==2026.4.1.0", requirements_content)
-            self.assertIn("selected_backend: intel-openvino", report_content)
-            for content in (report_content, guide_content):
-                self.assertIn("828 MB", content)
-                self.assertIn("OpenVINO 2026.1", content)
-                self.assertIn("in place", content)
-                self.assertIn("models/.openvino-whisper.rollback", content)
+            self.assertIn("828 MB", guide_content)
+            self.assertIn("OpenVINO 2026.1", guide_content)
+            self.assertIn("in place", guide_content)
+            self.assertIn("models/.openvino-whisper.rollback", guide_content)
 
-    def test_gpu_trial_layout_migrates_untouched_intel_chunk_defaults(self):
+    def test_intel_layout_migrates_untouched_intel_chunk_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             config_path = root / "config.json"
@@ -522,7 +521,7 @@ class BootstrapLauncherTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with patch.dict(os.environ, {"LOCAL_WHISPER_GPU_TRIAL": "1"}, clear=False):
+            with intel_backend():
                 with patch.object(
                     bootstrap_launcher_module,
                     "detect_windows_gpu_names",
@@ -537,7 +536,7 @@ class BootstrapLauncherTests(unittest.TestCase):
         self.assertEqual(config["overlap_seconds"], 1.0)
         self.assertEqual(config["language"], "en")
 
-    def test_gpu_trial_layout_preserves_custom_path_and_chunks(self):
+    def test_intel_layout_preserves_custom_path_and_chunks(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             config_path = root / "config.json"
@@ -554,7 +553,7 @@ class BootstrapLauncherTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with patch.dict(os.environ, {"LOCAL_WHISPER_GPU_TRIAL": "1"}, clear=False):
+            with intel_backend():
                 with patch.object(
                     bootstrap_launcher_module,
                     "detect_windows_gpu_names",
@@ -669,7 +668,7 @@ class BootstrapLauncherTests(unittest.TestCase):
                     encoding="utf-8",
                 )
 
-            with patch.dict(os.environ, {"LOCAL_WHISPER_GPU_TRIAL": "1"}, clear=False):
+            with intel_backend():
                 with patch.object(
                     bootstrap_launcher_module,
                     "detect_windows_gpu_names",
@@ -711,7 +710,7 @@ class BootstrapLauncherTests(unittest.TestCase):
                     encoding="utf-8",
                 )
 
-            with patch.dict(os.environ, {"LOCAL_WHISPER_GPU_TRIAL": "1"}, clear=False):
+            with intel_backend():
                 with patch.object(
                     bootstrap_launcher_module,
                     "detect_windows_gpu_names",
@@ -756,7 +755,7 @@ class BootstrapLauncherTests(unittest.TestCase):
             self.assertIn(str(root / ".runtime" / "site-packages"), captured["cmd"])
             self.assertNotIn("venv", captured["cmd"])
 
-    def test_run_pip_install_adds_gpu_trial_requirements_for_intel(self):
+    def test_run_pip_install_adds_backend_requirements_for_intel(self):
         from bootstrap_launcher import run_pip_install
 
         with tempfile.TemporaryDirectory() as runtime_tmp, tempfile.TemporaryDirectory() as package_tmp:
@@ -775,7 +774,7 @@ class BootstrapLauncherTests(unittest.TestCase):
                 def wait(self):
                     return 0
 
-            with patch.dict(os.environ, {"LOCAL_WHISPER_GPU_TRIAL": "1"}, clear=False):
+            with intel_backend():
                 with patch.object(
                     bootstrap_launcher_module,
                     "detect_windows_gpu_names",
@@ -792,7 +791,7 @@ class BootstrapLauncherTests(unittest.TestCase):
 
         self.assertEqual(result.code, 0)
         self.assertEqual(len(requirement_args), 2)
-        self.assertTrue(requirement_args[-1].endswith("gpu-trial-requirements.txt"))
+        self.assertTrue(requirement_args[-1].endswith("backend-requirements.txt"))
 
     def test_windows_cpu_limit_uses_job_object_hard_cap_at_25_percent(self):
         calls = []
@@ -989,7 +988,7 @@ class BootstrapLauncherTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with patch.dict(os.environ, {"LOCAL_WHISPER_GPU_TRIAL": "1"}, clear=False):
+            with intel_backend():
                 with patch.object(
                     bootstrap_launcher_module,
                     "detect_windows_gpu_names",
@@ -1017,7 +1016,7 @@ class BootstrapLauncherTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with patch.dict(os.environ, {"LOCAL_WHISPER_GPU_TRIAL": "1"}, clear=False):
+            with intel_backend():
                 with patch.object(
                     bootstrap_launcher_module,
                     "detect_windows_gpu_names",
@@ -1046,7 +1045,7 @@ class BootstrapLauncherTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with patch.dict(os.environ, {"LOCAL_WHISPER_GPU_TRIAL": "1"}, clear=False):
+            with intel_backend():
                 with patch.object(
                     bootstrap_launcher_module,
                     "detect_windows_gpu_names",
@@ -1064,7 +1063,7 @@ class BootstrapLauncherTests(unittest.TestCase):
             (model_dir / "openvino_encoder_model.xml").write_text("xml", encoding="utf-8")
             (model_dir / "config.json").write_text("not json", encoding="utf-8")
 
-            with patch.dict(os.environ, {"LOCAL_WHISPER_GPU_TRIAL": "1"}, clear=False):
+            with intel_backend():
                 with patch.object(
                     bootstrap_launcher_module,
                     "detect_windows_gpu_names",
@@ -1136,7 +1135,7 @@ class BootstrapLauncherTests(unittest.TestCase):
                 )
                 return str(staging)
 
-            with patch.dict(os.environ, {"LOCAL_WHISPER_GPU_TRIAL": "1"}, clear=False):
+            with intel_backend():
                 with patch.object(
                     bootstrap_launcher_module,
                     "detect_windows_gpu_names",
@@ -1178,7 +1177,7 @@ class BootstrapLauncherTests(unittest.TestCase):
             )
             calls = []
 
-            with patch.dict(os.environ, {"LOCAL_WHISPER_GPU_TRIAL": "1"}, clear=False):
+            with intel_backend():
                 with patch.object(
                     bootstrap_launcher_module,
                     "detect_windows_gpu_names",
@@ -1230,7 +1229,7 @@ class BootstrapLauncherTests(unittest.TestCase):
                 (destination / "config.json").write_text('{"decoder_layers": 4}', encoding="utf-8")
                 raise OSError("simulated copy failure")
 
-            with patch.dict(os.environ, {"LOCAL_WHISPER_GPU_TRIAL": "1"}, clear=False):
+            with intel_backend():
                 with patch.object(
                     bootstrap_launcher_module,
                     "detect_windows_gpu_names",
@@ -1294,7 +1293,7 @@ class BootstrapLauncherTests(unittest.TestCase):
                         (destination / source_file.name).write_bytes(source_file.read_bytes())
                 return destination
 
-            with patch.dict(os.environ, {"LOCAL_WHISPER_GPU_TRIAL": "1"}, clear=False):
+            with intel_backend():
                 with patch.object(
                     bootstrap_launcher_module,
                     "detect_windows_gpu_names",
@@ -1356,7 +1355,7 @@ class BootstrapLauncherTests(unittest.TestCase):
                 )
                 return str(staging)
 
-            with patch.dict(os.environ, {"LOCAL_WHISPER_GPU_TRIAL": "1"}, clear=False):
+            with intel_backend():
                 with patch.object(
                     bootstrap_launcher_module,
                     "detect_windows_gpu_names",

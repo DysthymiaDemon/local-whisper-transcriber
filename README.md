@@ -142,14 +142,6 @@ Python packages go to `%LOCALAPPDATA%\OfflineMeetingTranscriberRuntime\site-pack
 
 When something fails, check `error_log.txt`. It records the error and the file paths involved, but never transcript text.
 
-## GPU trial
-
-`Open Offline Meeting Transcriber GPU Trial.pyw` is a separate launcher for testing other GPUs. It uses its own `OfflineMeetingTranscriberGpuTrial` folder. Intel GPUs no longer need it, because the main launcher uses them by default.
-
-- **Intel GPUs** use the same OpenVINO engine as the main launcher.
-- **NVIDIA GPUs** use the default model through CUDA, if CUDA and cuDNN are installed.
-- **AMD GPUs** only install the DirectML runtime for probing. The transcription engine does not use it yet.
-
 ## Portable build (no Python on the laptop)
 
 A PyInstaller build bundles Python and the packages into one folder. See [docs/PORTABLE_WINDOWS.md](docs/PORTABLE_WINDOWS.md). Endpoint security often blocks unsigned EXEs, so IT may need to sign or allow-list `OfflineMeetingTranscriber.exe`.

@@ -10,11 +10,8 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 OUTPUT_FILE = PROJECT_ROOT / "Open Offline Meeting Transcriber.pyw"
-GPU_TRIAL_OUTPUT_FILE = PROJECT_ROOT / "Open Offline Meeting Transcriber GPU Trial.pyw"
 PAYLOAD_DIRS = ("app", "resources")
 APP_FOLDER_NAME = "OfflineMeetingTranscriber"
-GPU_TRIAL_APP_FOLDER_NAME = "OfflineMeetingTranscriberGpuTrial"
-GPU_TRIAL_RUNTIME_FOLDER_NAME = "OfflineMeetingTranscriberGpuTrialRuntime"
 TEXT_SUFFIXES = {".py", ".txt", ".json", ".md", ".toml", ".cfg", ".ini"}
 
 
@@ -52,18 +49,8 @@ def encode_payload(payload: dict[str, object]) -> tuple[str, str]:
     return wrapped, digest
 
 
-def render_launcher(
-    payload: dict[str, object],
-    app_folder_name: str = APP_FOLDER_NAME,
-    gpu_trial: bool = False,
-) -> str:
+def render_launcher(payload: dict[str, object], app_folder_name: str = APP_FOLDER_NAME) -> str:
     encoded, digest = encode_payload(payload)
-    gpu_trial_env = (
-        f'    os.environ["LOCAL_WHISPER_GPU_TRIAL"] = "1"\n'
-        f'    os.environ["LOCAL_WHISPER_RUNTIME_APP_FOLDER_NAME"] = "{GPU_TRIAL_RUNTIME_FOLDER_NAME}"\n'
-        if gpu_trial
-        else ""
-    )
     return f'''#! python3.12
 from __future__ import annotations
 
@@ -163,7 +150,6 @@ def main(argv: list[str] | None = None) -> int:
     os.environ["LOCAL_WHISPER_APP_ROOT"] = str(install_root)
     os.environ["LOCAL_WHISPER_SOURCE_ROOT"] = str(install_root)
     os.environ["LOCAL_WHISPER_LOG_ROOT"] = str(launcher_path.parent)
-{gpu_trial_env}
 
     app_dir = str(install_root / "app")
     if app_dir not in sys.path:
@@ -187,31 +173,15 @@ def generate(root: Path = PROJECT_ROOT) -> str:
     return render_launcher(build_payload(root))
 
 
-def generate_gpu_trial(root: Path = PROJECT_ROOT) -> str:
-    return render_launcher(
-        build_payload(root),
-        app_folder_name=GPU_TRIAL_APP_FOLDER_NAME,
-        gpu_trial=True,
-    )
-
-
 def write_launcher(root: Path = PROJECT_ROOT, output_file: Path | None = None) -> Path:
     target = output_file or root / OUTPUT_FILE.name
     target.write_text(generate(root), encoding="utf-8", newline="\n")
     return target
 
 
-def write_gpu_trial_launcher(root: Path = PROJECT_ROOT, output_file: Path | None = None) -> Path:
-    target = output_file or root / GPU_TRIAL_OUTPUT_FILE.name
-    target.write_text(generate_gpu_trial(root), encoding="utf-8", newline="\n")
-    return target
-
-
 def main() -> int:
     target = write_launcher()
-    gpu_target = write_gpu_trial_launcher()
     print(f"Wrote {target}")
-    print(f"Wrote {gpu_target}")
     return 0
 
 
