@@ -35,7 +35,6 @@ $DistDir = ".\dist\OfflineMeetingTranscriber"
 New-Item -ItemType Directory -Force -Path "$DistDir\models\faster-whisper" | Out-Null
 New-Item -ItemType Directory -Force -Path "$DistDir\transcripts" | Out-Null
 
-Copy-Item -LiteralPath ".\packaging\Run-OfflineMeetingTranscriber.bat" -Destination "$DistDir\Run-OfflineMeetingTranscriber.bat" -Force
 if (-not (Test-Path "$DistDir\config.json")) {
     Copy-Item -LiteralPath ".\resources\config.template.json" -Destination "$DistDir\config.json" -Force
 }

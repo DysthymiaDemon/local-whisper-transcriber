@@ -11,3 +11,5 @@ models/
 transcripts/
 .setup_complete
 config.json
+install_log.txt
+error_log.txt

@@ -1,275 +1,134 @@
-# Offline Meeting Transcriber
+# Meeting Scribe
 
-Windows desktop app for offline meeting transcription. It records from the laptop microphone and shows live continuous transcript text.
+Meeting Scribe is a Windows desktop app that transcribes meetings on your own laptop. It can record a meeting live from the microphone, the system audio, or both, and it can transcribe a meeting recording you already have.
 
-Built for Windows 11 Enterprise laptops. First setup can use internet to download packages and default public models; recording/runtime stays local and offline after setup.
+It is built for managed corporate Windows 11 laptops:
 
-## Quick Start
+- The internet is used only while setup installs Python packages and downloads the speech model.
+- After setup, the app never uses the network. Audio, transcripts and models stay on the laptop.
+- Everything you launch is plain Python (`.pyw`). The app does not need `.cmd`, `.bat` or PowerShell scripts, which managed laptops usually block.
+- No admin rights are needed.
 
-### Option A: Copy One File
+## Quick start
 
-Use this when Python 3.12 already exists on the laptop.
+You need Python 3.12 (64-bit). On a managed laptop, install it from the company software portal.
 
-1. Copy this file anywhere:
+1. Copy `Open Offline Meeting Transcriber.pyw` to a folder of your choice.
+2. Double-click it. It creates an `OfflineMeetingTranscriber` folder next to itself.
+3. The setup window lists what it will install. Click **Install**.
+4. Setup installs the Python packages and downloads the speech model (about 1.5 GB). This is the only step that uses the internet.
+5. When setup finishes, Meeting Scribe opens. Later launches open it straight away.
 
-```text
-Open Offline Meeting Transcriber.pyw
-```
+## Using the app
 
-2. Double-click it.
-3. It creates this folder beside itself:
+The home screen has three buttons:
 
-```text
-OfflineMeetingTranscriber\
-```
+- **Record and Transcribe This Meeting** opens the recording window. Choose the capture mode and microphone, then click **Record**. Text appears as the meeting goes on. **Pause** pauses capture. **Stop** finishes the last chunk and saves the transcript. **Copy** copies the transcript to the clipboard.
+- **Transcribe Existing Meeting** asks for a recording (`.mp4`, `.m4a`, `.mp3`, `.wav`, `.webm`, `.mkv`, `.mov`, `.aac` or `.wma`) and where to save the text. The recording is decoded locally and never changed. **Stop** saves what has been transcribed so far.
+- **Close This App** closes Meeting Scribe. If a transcription is running, it finishes safely first.
 
-4. First-run setup opens automatically.
-5. Review what will be installed, then click `Install`.
-6. Setup installs private Python packages and downloads default public models into:
-
-```text
-OfflineMeetingTranscriber\models\faster-whisper
-```
-
-7. The setup window closes and launches the transcriber. Click `Record`.
-
-### Option B: Python Missing
-
-Use this if `.pyw` does not open.
+Each recording is saved to its own file, so earlier meetings are never overwritten:
 
 ```text
-Open Offline Meeting Transcriber.cmd
+OfflineMeetingTranscriber\transcripts\meeting_transcript_2026-10-12_093015.txt
 ```
 
-This checks for Python 3.12 and tries a current-user install through `winget`. If corporate policy blocks `.cmd` or `winget`, use the portable EXE build.
-
-### Option C: No Python Install Allowed
-
-Use the portable build:
-
-```text
-dist\OfflineMeetingTranscriber\OfflineMeetingTranscriber.exe
-```
-
-or:
-
-```text
-dist\OfflineMeetingTranscriber\Run-OfflineMeetingTranscriber.bat
-```
-
-Portable EXE bundles Python and Python packages. If first setup has internet, it downloads default models; otherwise copy model folders into `models\` before use.
-
-### Option D: GPU Trial
-
-Use this separate launcher only for testing GPU acceleration:
-
-```text
-Open Offline Meeting Transcriber GPU Trial.pyw
-```
-
-It creates `OfflineMeetingTranscriberGpuTrial\` beside itself. NVIDIA uses faster-whisper CUDA config if CUDA/cuDNN is available. Intel GPU trial installs OpenVINO GenAI 2026.1 or newer and downloads the 828 MB `OpenVINO/whisper-large-v3-turbo-int8-ov` model into `models\openvino-whisper`. Intel uses 10-second chunks with 1-second overlap. AMD installs DirectML runtime for probing, but the current transcription engine is not ONNX-backed yet.
-
-## What It Does
-
-### Transcribe a saved meeting
-
-Click **Transcribe File**, choose an MP4 recording, and select where to save its
-text transcript. The picker starts in Downloads and suggests a `.txt` file beside
-the recording. Existing output files require overwrite confirmation.
-
-Transcription uses your configured local Whisper model and backend. Complete
-model and runtime setup first; processing does not download models or upload
-recordings. PyAV decodes the first audio track locally, in bounded chunks, without
-creating a WAV copy. The source recording is never modified.
-
-Progress shows processed audio time and percentage when duration is available.
-Text appears and saves incrementally. **Stop** finishes the current chunk and
-saves the partial transcript; remaining audio is skipped. Pause is unavailable
-for files. Closing the window cancels the file job and waits for safe completion.
-Live recording and file transcription cannot run together. File output selection
-does not change your live-recording output setting.
-
-- Records microphone audio locally.
-- Transcribes with `faster-whisper` on CPU using INT8 quantization.
-- Shows live continuous transcript text.
-- Lets users copy the transcript from the GUI.
-- Writes an updated transcript file continuously.
-- Uses internet only during first setup downloads; no cloud APIs are used during recording/runtime.
-
-## Double-Click Launch
-
-Copy or double-click this single file:
-
-```text
-Open Offline Meeting Transcriber.pyw
-```
-
-Behavior:
-
-- If the file is copied to `X:\SomeFolder\`, it creates and uses:
-
-```text
-X:\SomeFolder\OfflineMeetingTranscriber
-```
-
-- If the file is already inside a folder named `OfflineMeetingTranscriber`, it uses that folder directly.
-- First launch opens a medium-sized setup window.
-- Before setup opens, a small startup window checks local folders, Python packages, and first-time setup status.
-- Setup first shows what will be installed, then the `Install` button starts a task list, spinner, command text, and progress bars.
-- Setup extracts the app source and resources into the install folder.
-- Setup creates `config.json`, `models\`, and `transcripts\` there.
-- Missing Python packages install into `OfflineMeetingTranscriber\.runtime\site-packages` unless the install folder is inside OneDrive.
-- For OneDrive folders, Python packages install into `%LOCALAPPDATA%\OfflineMeetingTranscriberRuntime\site-packages` so the app does not create copied `python.exe` or `pythonw.exe` files.
-- No Python packages are installed into global Python or user site-packages.
-- If an older OneDrive install already has `OfflineMeetingTranscriber\.runtime`, setup moves it to `%LOCALAPPDATA%\OfflineMeetingTranscriberRuntime` or a `legacy-runtime` backup there.
-- Important setup messages stay visible for 5 seconds before moving on.
-- When prerequisites finish, setup shows a 5-second launch countdown.
-- After setup closes, the small startup window appears again while the main transcriber loads.
-- Setup downloads `Systran/faster-whisper-small.en` by default for CPU realtime behavior.
-- Model folder buttons open/prepare local model locations for manual or optional advanced setup.
-- After setup is marked complete, future double-clicks open the GUI immediately.
-
-If default models are still missing and setup cannot download them, recording cannot start until this folder contains local model files:
-
-```text
-OfflineMeetingTranscriber\models\faster-whisper
-```
-
-For a Windows laptop that does not have Python 3.12 installed, use:
-
-```text
-Open Offline Meeting Transcriber.cmd
-```
-
-That wrapper checks for Python 3.12. If missing, it attempts a current-user install with `winget install Python.Python.3.12 --scope user`, then starts the same setup GUI. If corporate policy blocks `.cmd` files or `winget`, use the portable EXE build below.
-
-## How To Use The App
-
-1. Open the app.
-   A small startup window shows current loading status before the main window appears.
-2. Select microphone from the dropdown.
-3. Confirm model paths point to local folders:
-
-```text
-models\faster-whisper
-```
-
-4. Confirm output file path, default:
-
-```text
-transcripts\meeting_transcript.txt
-```
-
-5. Click `Record`.
-6. Speak into laptop microphone.
-7. Watch live transcript text:
-
-```text
-Meeting transcript appears here as speech is processed.
-```
-
-8. Use `Pause` to pause capture.
-9. Use `Stop` to flush final chunk and save transcript.
-10. Use `Copy` or `Copy to Clipboard` to copy transcript text.
-
-Saved transcript format:
+Transcript lines look like this:
 
 ```text
 [00:00:12] Hello team.
 [00:00:18] Let's start with actions.
 ```
 
-The console also prints live lines.
+### Capture modes
 
-## Error Logs
+- **Microphone**: your own microphone.
+- **System audio (loopback)**: what the laptop plays, for example the other people in a Teams call. This needs a WASAPI output device.
+- **Mixed**: microphone and system audio together.
 
-Setup and runtime errors are appended here:
+### Advanced settings
 
-```text
-error_log.txt
-```
+The **Advanced** section in the recording window holds the model folder and the transcript file name. Most people never need to change them.
 
-The file is created beside `Open Offline Meeting Transcriber.pyw`, not inside `OfflineMeetingTranscriber\`. Use this file when setup fails, dependencies fail to install, or Record shows a model/configuration error. The installer also shows step details on mouseover in the left task list.
+## Speech model
 
-## First-Run Folder Layout
+The default model is [`distil-whisper/distil-large-v3.5-ct2`](https://huggingface.co/distil-whisper/distil-large-v3.5). It is English-only, MIT-licensed and about 1.5 GB. It is as accurate as Whisper large-v3 (7.1% average word error rate on short-form audio) but much faster, so it runs on a laptop CPU.
 
-After opening copied `.pyw`, install folder contains:
+The model folder must contain:
 
-```text
-OfflineMeetingTranscriber/
-  app/
-  resources/
-  config.json
-  models/
-    faster-whisper/
-  transcripts/
-error_log.txt   (created after an error)
-```
+- `model.bin`
+- `config.json`
+- `tokenizer.json`
+- `vocabulary.json` or `vocabulary.txt`
+- `preprocessor_config.json` (required for this model, which uses 128 mel bins)
 
-Keep model folders and transcripts in this folder. Avoid OneDrive for large model files when possible.
+The app refuses to load an incomplete folder, because faster-whisper would otherwise try to download a missing tokenizer from the internet.
 
-The `.pyw` launcher still needs Python 3.12 to start. After that, app dependencies are loaded from a private `site-packages` folder. If the app is under OneDrive, dependencies are stored in `%LOCALAPPDATA%\OfflineMeetingTranscriberRuntime\site-packages` to avoid corporate OneDrive and group-policy blocks on copied `.exe` files.
+Live recording works in 10-second chunks with 1 second of overlap, so text appears about 10 seconds behind speech. Saved recordings use 28-second windows, which is faster and more accurate.
 
-## Portable App Status
+### Upgrading from the older model
 
-The portable build is the true no-Python option. It bundles Python and Python package dependencies into:
+Earlier versions used `Systran/faster-whisper-small.en`. When you launch the new version, setup offers **Upgrade speech model?**:
 
-```text
-dist\OfflineMeetingTranscriber\_internal
-```
+- **Install** downloads the new model once and replaces the old one. If anything fails, the old model is restored.
+- **Use current model** opens the app with the model you already have. Setup asks again on the next launch.
 
-AI model files are not bundled into the EXE. First setup can download default public models when internet is available. For air-gapped transfer, copy these folders into the portable app folder before transfer:
+If you set your own model folder in `config.json`, it is never replaced.
 
-```text
-dist\OfflineMeetingTranscriber\models\faster-whisper
-```
+## Network policy
 
-## Target Layout
+| Phase | Network use |
+|---|---|
+| Setup, after you click **Install** | `pip` downloads the packages in `resources\requirements.txt`. Hugging Face downloads the speech model with no login token. |
+| Setup window open, before **Install** | None. |
+| Running the app | None. |
 
-Portable EXE folder to copy to a corporate laptop:
+How the app stays offline after setup:
 
-```text
-OfflineMeetingTranscriber/
-  OfflineMeetingTranscriber.exe
-  Run-OfflineMeetingTranscriber.bat
-  config.json
-  _internal/
-  models/
-    faster-whisper/
-  transcripts/
-  offline_setup.md
-```
+- It forces `HF_HUB_OFFLINE`, `TRANSFORMERS_OFFLINE`, `HF_DATASETS_OFFLINE` and `HF_HUB_DISABLE_TELEMETRY` to `1`, even if they are set differently on the laptop.
+- It loads models with `local_files_only=True` and only from a complete local folder.
+- It blocks Python network connections to anything other than this laptop (loopback). An attempt fails with "Network access is disabled after setup".
 
-Run:
+The Python block cannot stop code in native libraries. If IT wants an operating-system guarantee, an outbound Windows Firewall rule for `pythonw.exe` can block everything after setup.
+
+### Corporate HTTPS inspection
+
+Setup trusts the Windows certificate store through `truststore`. If downloads still fail with `CERTIFICATE_VERIFY_FAILED`, IT can place `company-ca.pem`, `corporate-ca.pem` or `ca-bundle.pem` next to `Open Offline Meeting Transcriber.pyw`, or set `LOCAL_WHISPER_CA_BUNDLE`.
+
+## Where files go
 
 ```text
-Run-OfflineMeetingTranscriber.bat
+<folder with the .pyw>\
+  Open Offline Meeting Transcriber.pyw
+  error_log.txt              (only after an error)
+  install_log.txt            (setup progress)
+  OfflineMeetingTranscriber\
+    app\                     (extracted app source)
+    resources\
+    config.json
+    models\faster-whisper\
+    transcripts\
 ```
 
-No admin account needed if Windows policy allows unsigned local executables and microphone access.
+Python packages go to `%LOCALAPPDATA%\OfflineMeetingTranscriberRuntime\site-packages` when the folder is inside OneDrive. Otherwise they go to `OfflineMeetingTranscriber\.runtime\site-packages`. Nothing is installed into the global Python.
 
-## Build Portable Windows Bundle
+When something fails, check `error_log.txt`. It records the error and the file paths involved, but never transcript text.
 
-On an internet-connected Windows build machine:
+## GPU trial
 
-```powershell
-py -3.12 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r .\resources\requirements-build.txt
-.\packaging\build_portable.ps1 -Clean
-```
+`Open Offline Meeting Transcriber GPU Trial.pyw` is a separate launcher for testing GPU acceleration. It uses its own `OfflineMeetingTranscriberGpuTrial` folder.
 
-Then either let first setup download default models or copy model folders into:
+- **Intel GPUs** use OpenVINO GenAI 2026.1 or newer with the 828 MB `OpenVINO/whisper-large-v3-turbo-int8-ov` model.
+- **NVIDIA GPUs** use the default model through CUDA, if CUDA and cuDNN are installed.
+- **AMD GPUs** only install the DirectML runtime for probing. The transcription engine does not use it yet.
 
-```text
-dist\OfflineMeetingTranscriber\models\
-```
+## Portable build (no Python on the laptop)
 
-Move the whole `dist\OfflineMeetingTranscriber` folder to the target laptop.
+A PyInstaller build bundles Python and the packages into one folder. See [docs/PORTABLE_WINDOWS.md](docs/PORTABLE_WINDOWS.md). Endpoint security often blocks unsigned EXEs, so IT may need to sign or allow-list `OfflineMeetingTranscriber.exe`.
 
-For fully air-gapped build steps, see [PORTABLE_WINDOWS.md](docs/PORTABLE_WINDOWS.md) and [offline_setup.md](docs/offline_setup.md).
+## Development
 
-## Run From Source
+Run from source:
 
 ```powershell
 py -3.12 -m venv .venv
@@ -278,56 +137,23 @@ python -m pip install -r .\resources\requirements.txt
 python .\app\meeting_transcriber_gui.py
 ```
 
-Set model paths in GUI before pressing `Record`, or run the first-time setup flow to download defaults.
+Source runtime data defaults to `C:\Users\<you>\Apps\OfflineMeetingTranscriber`. To use another folder, set `LOCAL_WHISPER_APP_ROOT`.
 
-Source runtime data defaults to:
+Source layout:
 
-```text
-C:\Users\<you>\Apps\OfflineMeetingTranscriber
-```
+- `app/`: setup, GUI, theme, offline guard, engine and config code.
+- `resources/`: pinned requirements and the config template.
+- `packaging/`: the standalone `.pyw` generator and the PyInstaller build.
+- `tests/`: unit tests.
 
-Override for testing or custom install folders:
+The `.pyw` launchers embed `app/` and `resources/`. After changing anything there, regenerate both launchers and commit them:
 
 ```powershell
-$env:LOCAL_WHISPER_APP_ROOT = "D:\Apps\OfflineMeetingTranscriber"
+py -3.12 packaging\build_standalone_pyw.py
 ```
 
-## Model Requirements
-
-Default one-touch folders:
-
-- `models\faster-whisper`: CTranslate2 faster-whisper model downloaded from `Systran/faster-whisper-small.en`; must contain `model.bin`.
-- `models\openvino-whisper`: GPU trial OpenVINO model downloaded from `OpenVINO/whisper-large-v3-turbo-int8-ov`; must contain OpenVINO `.xml`, `.bin`, and matching `config.json` files.
-
-Existing Intel GPU Trial installs using the default model path replace the previous Small FP16 model during setup. Download and validation finish in a staging folder before replacement. Setup temporarily uses `models\.openvino-whisper.rollback` and restores it if copying or validation fails. Custom model paths and custom chunk settings remain unchanged.
-
-Runtime recording does not download models.
-
-## Source Files
-
-- `Open Offline Meeting Transcriber.pyw`: self-extracting CPU double-click launcher.
-- `Open Offline Meeting Transcriber GPU Trial.pyw`: separate self-extracting GPU trial launcher.
-- `app/`: runtime source for setup, GUI, engine, and config handling.
-- `resources/`: pip requirement files and config template.
-- `packaging/`: PyInstaller build script/spec, portable BAT, standalone launcher generator.
-- `docs/`: offline setup and portable Windows build docs.
-- `tests/`: unit tests for engine and portable config behavior.
-
-## Test
+Run the tests:
 
 ```powershell
 py -3.12 -B -m unittest discover -s tests -v
-py -3.12 -B -m py_compile app\app_config.py app\bootstrap_launcher.py app\meeting_transcriber_gui.py app\transcriber_engine.py packaging\build_standalone_pyw.py "Open Offline Meeting Transcriber.pyw" "Open Offline Meeting Transcriber GPU Trial.pyw" tests\test_bootstrap_launcher.py tests\test_app_config.py tests\test_engine_core.py tests\test_standalone_launcher.py packaging\local_whisper_transcriber.spec
 ```
-
-Expected current result: full test suite passes.
-
-## Corporate Laptop Notes
-
-- Windows microphone access must be enabled.
-- Source `.pyw` launch requires Python 3.12. `Open Offline Meeting Transcriber.cmd` can install it if `winget` is available. Portable EXE does not require system Python.
-- If endpoint security blocks unsigned EXEs, IT must allow-list or sign `OfflineMeetingTranscriber.exe`.
-- First setup uses Windows certificate trust via `truststore` for Hugging Face downloads. If corporate HTTPS inspection still causes `CERTIFICATE_VERIFY_FAILED`, IT can place `company-ca.pem`, `corporate-ca.pem`, or `ca-bundle.pem` beside `Open Offline Meeting Transcriber.pyw`, or set `LOCAL_WHISPER_CA_BUNDLE`.
-- If transcription lags on CPU, use a smaller local model or increase chunk duration.
-- Transcript output defaults to `<install folder>\transcripts\meeting_transcript.txt` when launched from the standalone `.pyw`.
-- Avoid placing model folders under OneDrive. Large model files can trigger sync errors and corporate cloud policy warnings.

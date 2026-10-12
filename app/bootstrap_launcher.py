@@ -1762,7 +1762,7 @@ def create_startup_splash():
     from tkinter import ttk
 
     splash = tk.Tk()
-    splash.title("Starting Offline Meeting Transcriber")
+    splash.title("Starting Meeting Scribe")
     splash.geometry("420x170")
     splash.resizable(False, False)
     splash.configure(bg="#f7f7f7")
@@ -1777,7 +1777,7 @@ def create_startup_splash():
 
     title = tk.Label(
         splash,
-        text="Offline Meeting Transcriber",
+        text="Meeting Scribe",
         font=("Segoe UI", 14, "bold"),
         bg="#f7f7f7",
         fg="#1f1f1f",

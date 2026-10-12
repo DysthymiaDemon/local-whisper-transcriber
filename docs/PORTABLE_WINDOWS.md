@@ -1,68 +1,36 @@
-# Portable Windows Build
+# Portable Windows build
 
-Goal: produce a folder that runs on Windows 11 Enterprise without admin rights. User opens `Run-OfflineMeetingTranscriber.bat` or `OfflineMeetingTranscriber.exe`; bundled Python runtime and Python packages run from the folder.
+The portable build is a folder that runs on Windows 11 Enterprise without Python installed and without admin rights. It bundles the Python runtime and all packages. The user starts `OfflineMeetingTranscriber.exe`.
 
-Use PyInstaller `onedir`, not `onefile`. Torch, pyannote, Qt, CTranslate2, and model files are large; one-file extraction is slow and often blocked by corporate endpoint tools.
+It uses PyInstaller `onedir`, not `onefile`. Qt and CTranslate2 are large, and corporate endpoint tools often slow down or block one-file extraction.
 
-## Folder Layout
+Managed laptops block `.cmd` and `.bat` files, so the bundle has no batch launcher. The EXE switches itself to offline mode once setup is complete.
 
-Final bundle:
+## Folder layout
 
 ```text
 OfflineMeetingTranscriber/
   OfflineMeetingTranscriber.exe
-  Run-OfflineMeetingTranscriber.bat
   config.json
   _internal/
   models/
     faster-whisper/
-    pyannote-pipeline/
-    pyannote-embedding/
   transcripts/
   offline_setup.md
 ```
 
-No admin install needed on target laptop. Microphone access still depends on Windows privacy policy:
+## Build on an internet-connected Windows machine
 
-```text
-Settings > Privacy & security > Microphone
-Microphone access: On
-Let desktop apps access your microphone: On
-```
-
-## Build On Internet-Connected Windows Machine
-
-Use same Windows architecture as target laptop. Python 3.12 64-bit recommended.
+Use the same Windows architecture as the target laptop and 64-bit Python 3.12.
 
 ```powershell
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r .\resources\requirements-build.txt
-python -m PyInstaller --clean --noconfirm .\packaging\local_whisper_transcriber.spec
-```
-
-Or use script:
-
-```powershell
 .\packaging\build_portable.ps1 -Clean
 ```
 
-## Add Models
-
-Copy local model folders into:
-
-```text
-dist\OfflineMeetingTranscriber\models\faster-whisper
-dist\OfflineMeetingTranscriber\models\pyannote-pipeline
-dist\OfflineMeetingTranscriber\models\pyannote-embedding
-```
-
-`config.json` defaults to these relative folders. Edit only if model folders use different names.
-Keep model folders beside the EXE as shown above, not inside `_internal`.
-
-## Offline Wheelhouse Build
-
-For reproducible corporate build machine:
+To build from a local wheelhouse:
 
 ```powershell
 mkdir wheelhouse
@@ -70,33 +38,21 @@ py -3.12 -m pip download -r .\resources\requirements-build.txt -d wheelhouse
 .\packaging\build_portable.ps1 -Clean -Wheelhouse .\wheelhouse
 ```
 
-For CPU-only PyTorch wheels:
+## Add the model
 
-```powershell
-py -3.12 -m pip download torch==2.11.0 torchaudio==2.11.0 `
-  --index-url https://download.pytorch.org/whl/cpu `
-  -d wheelhouse
-```
-
-## Transfer To Corporate Laptop
-
-Copy whole `dist\OfflineMeetingTranscriber` folder. Do not copy only `.exe`; `_internal`, `models`, and `config.json` are required.
-
-Run:
+The first launch can download the default model if the laptop is online during setup. For an air-gapped laptop, copy a complete model folder into the bundle before transfer (see [offline_setup.md](offline_setup.md#3-download-the-speech-model-on-an-internet-connected-machine)):
 
 ```text
-Run-OfflineMeetingTranscriber.bat
+dist\OfflineMeetingTranscriber\models\faster-whisper
 ```
 
-Output transcript writes to:
+Keep the model folder beside the EXE, not inside `_internal`.
 
-```text
-OfflineMeetingTranscriber\transcripts\meeting_transcript.txt
-```
+## Transfer to the laptop
+
+Copy the whole `dist\OfflineMeetingTranscriber` folder, not just the `.exe`. The `_internal`, `models` and `config.json` items are all required.
 
 ## Notes
 
-- Runtime sets Hugging Face/Transformers offline environment flags.
-- No admin rights required if corporate policy allows running unsigned local executables.
-- If endpoint security blocks unsigned EXEs, IT must allow-list or code-sign `OfflineMeetingTranscriber.exe`.
-- If mic level stays zero, check Windows microphone privacy and device selection.
+- If endpoint security blocks unsigned EXEs, IT must sign or allow-list `OfflineMeetingTranscriber.exe`.
+- If the microphone level stays at zero, check Windows microphone privacy settings and the selected device.
