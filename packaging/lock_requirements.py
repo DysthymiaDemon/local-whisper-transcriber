@@ -26,6 +26,9 @@ BASE_INPUT = RESOURCES / "requirements.txt"
 OPENVINO_INPUT = RESOURCES / "requirements-openvino.txt"
 BASE_LOCK = RESOURCES / "requirements.lock.txt"
 OPENVINO_LOCK = RESOURCES / "requirements-openvino.lock.txt"
+# Portable (PyInstaller) build: the base list plus PyInstaller, locked the same way.
+BUILD_INPUT = RESOURCES / "requirements-build.txt"
+BUILD_LOCK = RESOURCES / "requirements-build.lock.txt"
 # Declared dependencies the app must never install. Setup uses --no-deps, so leaving them out of the lock keeps them
 # off the laptop; app/bootstrap_launcher.py also deletes copies left by older installs.
 EXCLUDED_PACKAGES = {
@@ -85,9 +88,17 @@ def main() -> int:
     if conflicts:
         raise SystemExit(f"OpenVINO packages change shared dependencies: {', '.join(sorted(conflicts))}")
     extra = {name: value for name, value in combined.items() if name not in base}
+    build = resolve(BUILD_INPUT)
+    build_conflicts = [name for name in base if name in build and build[name] != base[name]]
+    if build_conflicts:
+        raise SystemExit(f"Build packages change shared dependencies: {', '.join(sorted(build_conflicts))}")
+    build_extra = {name: value for name, value in build.items() if name not in base}
     BASE_LOCK.write_text(render(BASE_INPUT, base), encoding="utf-8", newline="\n")
     OPENVINO_LOCK.write_text(render(OPENVINO_INPUT, extra), encoding="utf-8", newline="\n")
-    print(f"Locked {len(base)} base packages and {len(extra)} OpenVINO packages.")
+    BUILD_LOCK.write_text(render(BUILD_INPUT, build_extra), encoding="utf-8", newline="\n")
+    print(
+        f"Locked {len(base)} base packages, {len(extra)} OpenVINO packages and {len(build_extra)} build packages."
+    )
     return 0
 
 

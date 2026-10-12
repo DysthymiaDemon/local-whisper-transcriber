@@ -213,6 +213,18 @@ class RequirementLockTests(unittest.TestCase):
 
         self.assertFalse(set(base) & set(openvino))
 
+    def test_portable_build_installs_only_hash_locked_wheels(self):
+        base = read_lock(RESOURCES / "requirements.lock.txt")
+        build = read_lock(RESOURCES / "requirements-build.lock.txt")
+        script = (RESOURCES.parent / "packaging" / "build_portable.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("pyinstaller", build)
+        self.assertFalse(set(base) & set(build))
+        for flag in ("--require-hashes", "--only-binary=:all:", "--no-deps", "requirements-build.lock.txt"):
+            self.assertIn(flag, script)
+        self.assertNotIn("-r .\\resources\\requirements-build.txt", script)
+        self.assertIn('Copy-Item -LiteralPath ".\\resources" -Destination "$DistDir\\resources"', script)
+
     def test_openvino_telemetry_is_never_installed(self):
         for name in ("requirements.lock.txt", "requirements-openvino.lock.txt"):
             with self.subTest(lock=name):
