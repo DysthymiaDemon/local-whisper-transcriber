@@ -2653,7 +2653,7 @@ def run_bootstrap() -> int:
         spinner_index += 1
         render_steps()
         if not final_message_active.get():
-            window.after(180, tick_spinner)
+            window.after(90, tick_spinner)
 
     def set_step(step: str, state: StepState, detail: str = "", progress: int | None = None) -> None:
         nonlocal current_step
