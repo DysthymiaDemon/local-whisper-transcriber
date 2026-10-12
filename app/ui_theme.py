@@ -387,16 +387,20 @@ MODEL_STATE_LABELS = {
     MODEL_READY: "Ready to Transcribe",
     MODEL_STOPPING: "Stopping Model...",
 }
-MODEL_PILL = "#F3A6A0"
-MODEL_PILL_HOVER = "#EC8F88"
-MODEL_PILL_BORDER = "#E58A84"
+# (fill, hover fill, border, text) for the pill behind each traffic-light state.
+MODEL_PILL_COLOURS = {
+    MODEL_STOPPED: ("#F3A6A0", "#EC8F88", "#E58A84", "#FFFFFF"),
+    MODEL_STARTING: ("#F8E08A", "#F3D466", "#E6C65A", PAUSE_TEXT),
+    MODEL_STOPPING: ("#F8E08A", "#F3D466", "#E6C65A", PAUSE_TEXT),
+    MODEL_READY: ("#AEE3B4", "#97D9A0", "#86C98E", RECORD_TEXT),
+}
 # (lit colour, dim colour) for the red, yellow and green lights.
 TRAFFIC_LIGHTS = (("#FF3B30", "#5A1F1F"), ("#FFC531", "#5A4A1A"), ("#34C759", "#1F4A24"))
 STATE_LIGHT = {MODEL_STOPPED: 0, MODEL_STARTING: 1, MODEL_STOPPING: 1, MODEL_READY: 2}
 
 
 class ModelLightButton(QPushButton):
-    """Light-red pill with a traffic light showing whether the speech model is stopped, changing or ready."""
+    """Pill coloured to match its active light, with a traffic light showing whether the speech model is stopped, changing or ready."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(MODEL_STATE_LABELS[MODEL_STOPPED], parent)
@@ -436,9 +440,10 @@ class ModelLightButton(QPushButton):
             painter.setOpacity(0.55)
         rect = QRectF(self.rect()).adjusted(1, 1, -1, -1)
         radius = rect.height() / 2
+        fill, hover_fill, border, text_colour = MODEL_PILL_COLOURS[self.state]
         hovered = self.isEnabled() and (self.underMouse() or self.isDown())
-        painter.setPen(QPen(QColor(MODEL_PILL_BORDER), 1))
-        painter.setBrush(QColor(MODEL_PILL_HOVER if hovered else MODEL_PILL))
+        painter.setPen(QPen(QColor(border), 1))
+        painter.setBrush(QColor(hover_fill if hovered else fill))
         painter.drawRoundedRect(rect, radius, radius)
 
         light_size = min(rect.height() - 16, 28.0)
@@ -486,6 +491,6 @@ class ModelLightButton(QPushButton):
                 break
             size -= 0.5
         painter.setFont(font)
-        painter.setPen(QColor("#FFFFFF"))
+        painter.setPen(QColor(text_colour))
         painter.drawText(text_rect, int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft), self.text())
         painter.end()

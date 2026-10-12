@@ -176,6 +176,14 @@ class FileGuiTests(unittest.TestCase):
             self.window._append_transcript(row(text))
         self.assertEqual(self.window.transcript_text.toPlainText(), "Hello team. Next item.")
 
+    def test_model_pill_colour_follows_traffic_light(self):
+        from ui_theme import MODEL_PILL_COLOURS, MODEL_STATE_LABELS
+
+        self.assertEqual(set(MODEL_PILL_COLOURS), set(MODEL_STATE_LABELS))
+        fill = {state: colours[0] for state, colours in MODEL_PILL_COLOURS.items()}
+        self.assertEqual(fill[gui.MODEL_STARTING], fill[gui.MODEL_STOPPING])
+        self.assertEqual(len({fill[gui.MODEL_STOPPED], fill[gui.MODEL_STARTING], fill[gui.MODEL_READY]}), 3)
+
     def test_model_is_not_loaded_at_launch(self):
         self.preload.assert_not_called()
         self.assertEqual(self.window.model_button.state, gui.MODEL_STOPPED)
