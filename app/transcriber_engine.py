@@ -284,9 +284,10 @@ def audio_chunk_duration_seconds(chunk: "AudioChunk") -> float:
 
 
 def _force_offline_mode() -> None:
-    from offline_guard import force_offline_env
+    # Flags plus the Python socket guard, so the engine stays offline even when used without the launcher.
+    from offline_guard import enforce_offline
 
-    force_offline_env()
+    enforce_offline()
 
 
 def default_cpu_thread_count(cpu_count: int | None = None) -> int:
@@ -1205,7 +1206,6 @@ class MeetingTranscriberEngine:
                     row = self.store.add_transcript(chunk.index, start, end, text)
                     segment_count += 1
                     self._save_transcript_snapshot(final=False)
-                    print(f"[{format_timestamp(row.start)}] {row.text}", flush=True)
                     self._emit("transcript", {"row": row})
                 if segment_count == 0:
                     self._emit("log", {"message": f"No speech detected in chunk {chunk.index}"})

@@ -654,7 +654,8 @@ def fetch_model_repo_size(repo_id: str, root: Path | None = None) -> int | None:
         configure_download_tls(root)
         from huggingface_hub import HfApi
 
-        info = HfApi().model_info(repo_id, files_metadata=True)
+        # Public models only: never send a cached Hugging Face token from this laptop.
+        info = HfApi().model_info(repo_id, files_metadata=True, token=False)
     except Exception:
         return None
     return model_info_total_size(info)

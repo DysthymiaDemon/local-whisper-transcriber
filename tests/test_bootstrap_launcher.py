@@ -1831,8 +1831,8 @@ class BootstrapLauncherTests(unittest.TestCase):
             siblings = [FakeSibling()]
 
         class FakeHfApi:
-            def model_info(self, repo_id, files_metadata=False):
-                calls.append(("model_info", repo_id, files_metadata))
+            def model_info(self, repo_id, files_metadata=False, token=None):
+                calls.append(("model_info", repo_id, files_metadata, token))
                 return FakeInfo()
 
         fake_hf_module.HfApi = FakeHfApi
@@ -1844,7 +1844,7 @@ class BootstrapLauncherTests(unittest.TestCase):
 
         self.assertEqual(result, 123)
         configure_tls.assert_called_once_with(Path(tmp))
-        self.assertEqual(calls, [("model_info", "org/model", True)])
+        self.assertEqual(calls, [("model_info", "org/model", True, False)])
 
     def test_certificate_verify_failure_gets_corporate_https_error_message(self):
         message = bootstrap_launcher_module.setup_error_card_message(

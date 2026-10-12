@@ -85,6 +85,19 @@ class FileTranscriptionTests(unittest.TestCase):
         return patch.object(file_transcriber, "decoder_command",
                             return_value=[sys.executable, "-I", "-c", code])
 
+    def test_decoder_is_never_started_without_its_safety_limits_on_windows(self):
+        marker = self.root / "opened.txt"
+        code = ("import sys; data = sys.stdin.buffer.read(1)\n"
+                f"open({str(marker)!r}, 'w').write(repr(data))")
+        with self.fake_decoder(code), patch.object(file_transcriber, "contain_process", return_value=None), \
+                patch.object(file_transcriber.sys, "platform", "win32"):
+            with self.assertRaisesRegex(RuntimeError, "safety limits"):
+                DecodedAudio(self.source, threading.Event())
+        import time
+        time.sleep(0.5)
+        # The child never received the start byte: either it was killed first or it read end-of-file.
+        self.assertNotEqual(marker.read_text() if marker.exists() else "", "b'g'")
+
     def test_decoder_crash_is_reported_not_raised_in_the_app(self):
         with self.fake_decoder("import sys; sys.stdin.buffer.read(1); sys.exit(3)"):
             with self.assertRaisesRegex(RuntimeError, "exit code 3"):

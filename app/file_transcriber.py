@@ -94,6 +94,11 @@ class DecodedAudio:
         )
         try:
             self._job = contain_process(self.process, DECODER_MEMORY_LIMIT_BYTES)
+            if self._job is None and sys.platform == "win32":
+                # Fail closed: the decoder is still waiting on stdin, so it never opens the recording.
+                raise RuntimeError(
+                    "Could not apply safety limits to the audio decoder, so the recording was not opened."
+                )
             assert self.process.stdin is not None
             self.process.stdin.write(b"g")  # Contained now: let the decoder open the file.
             self.process.stdin.close()

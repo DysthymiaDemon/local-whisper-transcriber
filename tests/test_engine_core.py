@@ -828,6 +828,26 @@ class TranscriptionBacklogTests(unittest.TestCase):
         self.assertTrue(any(str(recovery_path) in message for message in messages))
 
 
+class EngineDisclosureTests(unittest.TestCase):
+    def test_engine_installs_the_socket_guard_itself(self):
+        import offline_guard
+        import transcriber_engine
+
+        self.addCleanup(offline_guard.remove_socket_guard)
+        offline_guard.remove_socket_guard()
+        with patch.dict(os.environ, {}, clear=False):
+            transcriber_engine._force_offline_mode()
+
+        self.assertTrue(offline_guard.socket_guard_installed())
+
+    def test_live_transcript_text_is_not_printed_to_the_console(self):
+        import inspect
+        import transcriber_engine
+
+        source = inspect.getsource(transcriber_engine.MeetingTranscriberEngine)
+        self.assertNotIn("print(", source)
+
+
 class MicMeterGeometryTests(unittest.TestCase):
     def test_segment_count_grows_with_width_and_bar_width_stays_constant(self):
         narrow_count, narrow_width, _ = meter_bar_geometry(220)
