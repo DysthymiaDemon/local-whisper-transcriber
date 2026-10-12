@@ -730,6 +730,47 @@ class TranscriptionBacklogTests(unittest.TestCase):
         self.assertTrue(any(payload.get("message") == "Finishing transcription" for event_type, payload in events if event_type == "status"))
         self.assertFalse(any("Catching up: skipped" in payload.get("message", "") for event_type, payload in events if event_type == "log"))
 
+    def test_backlog_is_capped_at_thirty_minutes_of_audio(self):
+        import transcriber_engine
+
+        limit = transcriber_engine.transcription_queue_limit(15.0, 1.5)
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = MeetingTranscriberEngine(EngineConfig(output_file=os.path.join(tmp, "out.txt")))
+
+        self.assertEqual(transcriber_engine.MAX_BACKLOG_SECONDS, 1800.0)
+        self.assertEqual(limit, 134)
+        self.assertEqual(engine._transcription_queue.maxsize, limit)
+        self.assertEqual(engine._raw_chunk_queue.maxsize, transcriber_engine.RAW_CHUNK_QUEUE_SIZE)
+        self.assertEqual(transcriber_engine.transcription_queue_limit(10.0, 1.0), 200)
+
+    def test_full_backlog_skips_oldest_chunk_in_order_and_warns(self):
+        import transcriber_engine
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            transcriber_engine, "transcription_queue_limit", return_value=3
+        ):
+            engine = MeetingTranscriberEngine(
+                EngineConfig(output_file=os.path.join(tmp, "out.txt"), chunk_seconds=2.0, overlap_seconds=0.5)
+            )
+            events = []
+            engine.on_event(lambda event_type, payload: events.append((event_type, payload)))
+            for index in range(5):
+                with engine._state_lock:
+                    engine._pending_transcription_chunks.add(index)
+                engine._enqueue_for_transcription(AudioChunk(index, float(index), [0.0] * 32000, 16000))
+            engine._enqueue_for_transcription(None)
+            remaining = []
+            while not engine._transcription_queue.empty():
+                item = engine._transcription_queue.get_nowait()
+                remaining.append(None if item is None else item.index)
+
+        warnings = [payload for event_type, payload in events if event_type == "warning"]
+        self.assertEqual(remaining, [3, 4, None])
+        self.assertEqual(engine._pending_transcription_chunks, {3, 4})
+        self.assertEqual(len(warnings), 3)
+        self.assertIn("30 min behind", warnings[0]["message"])
+        self.assertAlmostEqual(warnings[-1]["skipped_seconds"], 4.5)
+
     def test_lag_uses_oldest_pending_capture_time(self):
         with tempfile.TemporaryDirectory() as tmp:
             engine = MeetingTranscriberEngine(EngineConfig(output_file=os.path.join(tmp, "out.txt")))

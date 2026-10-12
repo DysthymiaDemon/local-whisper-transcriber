@@ -2,7 +2,13 @@
 
 Internet access is only allowed while the installer downloads packages and models.
 Once the app is running, everything must stay on this laptop. This module forces the
-Hugging Face offline switches and blocks Python-level sockets to non-loopback hosts.
+Hugging Face offline switches and blocks Python-level sockets (TCP connects, DNS lookups and
+UDP sends) to non-loopback hosts.
+
+Limits: these are Python hooks. They do not cover native libraries that open their own sockets,
+other processes, or code that deliberately removes them. FFmpeg decoding is restricted separately
+(local files only, in a contained child process). A hard guarantee needs an operating-system
+control such as an outbound Windows Firewall rule for the runtime.
 """
 from __future__ import annotations
 
@@ -20,6 +26,8 @@ _original_connect = socket.socket.connect
 _original_connect_ex = socket.socket.connect_ex
 _original_create_connection = socket.create_connection
 _original_getaddrinfo = socket.getaddrinfo
+_original_sendto = socket.socket.sendto
+_original_sendmsg = getattr(socket.socket, "sendmsg", None)
 
 
 class OfflineViolationError(ConnectionError):
@@ -70,6 +78,20 @@ def _guarded_getaddrinfo(host: Any, *args: Any, **kwargs: Any) -> Any:
     return _original_getaddrinfo(host, *args, **kwargs)
 
 
+def _guarded_sendto(self: socket.socket, data: Any, *args: Any) -> Any:
+    # sendto(data, address) or sendto(data, flags, address)
+    if args:
+        _check_address(args[-1])
+    return _original_sendto(self, data, *args)
+
+
+def _guarded_sendmsg(self: socket.socket, buffers: Any, *args: Any) -> Any:
+    # sendmsg(buffers[, ancdata[, flags[, address]]])
+    if len(args) >= 3:
+        _check_address(args[2])
+    return _original_sendmsg(self, buffers, *args)
+
+
 def force_offline_env() -> None:
     for name in OFFLINE_ENV_VARS:
         os.environ[name] = "1"
@@ -91,6 +113,9 @@ def install_socket_guard() -> None:
     socket.socket.connect_ex = _guarded_connect_ex  # type: ignore[method-assign]
     socket.create_connection = _guarded_create_connection  # type: ignore[assignment]
     socket.getaddrinfo = _guarded_getaddrinfo  # type: ignore[assignment]
+    socket.socket.sendto = _guarded_sendto  # type: ignore[method-assign]
+    if _original_sendmsg is not None:
+        socket.socket.sendmsg = _guarded_sendmsg  # type: ignore[method-assign]
     _guard_installed = True
 
 
@@ -101,6 +126,9 @@ def remove_socket_guard() -> None:
     socket.socket.connect_ex = _original_connect_ex  # type: ignore[method-assign]
     socket.create_connection = _original_create_connection  # type: ignore[assignment]
     socket.getaddrinfo = _original_getaddrinfo  # type: ignore[assignment]
+    socket.socket.sendto = _original_sendto  # type: ignore[method-assign]
+    if _original_sendmsg is not None:
+        socket.socket.sendmsg = _original_sendmsg  # type: ignore[method-assign]
     _guard_installed = False
 
 

@@ -798,6 +798,10 @@ class MainWindow(QMainWindow):
                 self._append_log(f"{message}\nError details saved to {log_path}")
         elif event_type == "log":
             self._append_log(str(payload.get("message", "")))
+        elif event_type == "warning":
+            message = str(payload.get("message", ""))
+            self._append_log(message)
+            self.status_label.setText("Transcription behind: some audio skipped")
         elif event_type == "model_status":
             message = str(payload.get("message", ""))
             state = payload.get("state")

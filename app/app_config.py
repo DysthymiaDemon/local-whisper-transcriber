@@ -127,7 +127,7 @@ def load_portable_config_safely(root: Path | None = None) -> tuple[EngineConfig,
 
 
 def _check_config_types(config: EngineConfig) -> None:
-    numeric = ("sample_rate", "chunk_seconds", "overlap_seconds", "cpu_threads", "num_workers", "max_queue_chunks")
+    numeric = ("sample_rate", "chunk_seconds", "overlap_seconds", "cpu_threads", "num_workers")
     for name in numeric:
         value = getattr(config, name)
         if isinstance(value, bool) or not isinstance(value, (int, float)):

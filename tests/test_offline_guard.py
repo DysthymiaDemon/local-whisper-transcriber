@@ -60,6 +60,31 @@ class OfflineGuardTests(unittest.TestCase):
             pass
         self.assertTrue(socket.getaddrinfo("localhost", 80))
 
+    def test_udp_sends_to_external_hosts_are_blocked_but_loopback_works(self):
+        with patch.dict(os.environ, {}):
+            enforce_offline()
+        receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(receiver.close)
+        self.addCleanup(sender.close)
+        receiver.bind(("127.0.0.1", 0))
+        receiver.settimeout(2)
+
+        sender.sendto(b"local", receiver.getsockname())
+        sender.sendto(b"flags", 0, receiver.getsockname())
+        self.assertEqual(receiver.recv(16), b"local")
+        for call in (
+            lambda: sender.sendto(b"x", ("8.8.8.8", 53)),
+            lambda: sender.sendto(b"x", 0, ("8.8.8.8", 53)),
+        ):
+            with self.assertRaises(OfflineViolationError):
+                call()
+        if hasattr(socket.socket, "sendmsg"):
+            with self.assertRaises(OfflineViolationError):
+                sender.sendmsg([b"x"], [], 0, ("8.8.8.8", 53))
+        offline_guard.remove_socket_guard()
+        self.assertIs(socket.socket.sendto, offline_guard._original_sendto)
+
     def test_guard_is_idempotent_and_removable(self):
         with patch.dict(os.environ, {}):
             enforce_offline()

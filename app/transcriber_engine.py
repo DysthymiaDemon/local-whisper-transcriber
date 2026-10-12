@@ -8,7 +8,7 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
-from math import log, pi
+from math import ceil, log, pi
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Optional
@@ -263,6 +263,16 @@ def audio_chunk_has_activity(samples: Any, noise_floor: float = DEFAULT_NOISE_FL
     return rms >= threshold or peak >= threshold * 2.5
 
 
+# Untranscribed live audio kept in memory before the oldest chunk is skipped (about 130 MB at 15 s chunks).
+MAX_BACKLOG_SECONDS = 1800.0
+RAW_CHUNK_QUEUE_SIZE = 8
+
+
+def transcription_queue_limit(chunk_seconds: float, overlap_seconds: float) -> int:
+    step = max(0.001, float(chunk_seconds) - float(overlap_seconds))
+    return max(2, ceil(MAX_BACKLOG_SECONDS / step))
+
+
 def audio_chunk_duration_seconds(chunk: "AudioChunk") -> float:
     try:
         sample_count = len(chunk.samples)
@@ -310,7 +320,6 @@ class EngineConfig:
     system_device_index: Optional[int] = None
     allow_mixed_fallback: bool = False
     language: Optional[str] = "en"
-    max_queue_chunks: int = 8
 
     def validate(self) -> list[str]:
         errors: list[str] = []
@@ -663,8 +672,12 @@ class MeetingTranscriberEngine:
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()
         self._threads: list[threading.Thread] = []
-        self._raw_chunk_queue: queue.Queue[AudioChunk | None] = queue.Queue()
-        self._transcription_queue: queue.Queue[AudioChunk | None] = queue.Queue()
+        # Recorder -> fan-out hand-off; the fan-out thread never blocks, so this stays near empty.
+        self._raw_chunk_queue: queue.Queue[AudioChunk | None] = queue.Queue(maxsize=RAW_CHUNK_QUEUE_SIZE)
+        self._transcription_queue: queue.Queue[AudioChunk | None] = queue.Queue(
+            maxsize=transcription_queue_limit(config.chunk_seconds, config.overlap_seconds)
+        )
+        self._skipped_seconds = 0.0
         self._pending_transcription_chunks: set[int] = set()
         self._active_transcription_chunk: AudioChunk | None = None
         self._transcript_save_error_reported = False
@@ -1037,12 +1050,43 @@ class MeetingTranscriberEngine:
             chunk = self._raw_chunk_queue.get()
             if chunk is None:
                 self._emit("status", {"message": "Finishing transcription"})
-                self._transcription_queue.put(None)
+                self._enqueue_for_transcription(None)
                 return
             with self._state_lock:
                 self._pending_transcription_chunks.add(chunk.index)
-            self._transcription_queue.put(chunk)
+            self._enqueue_for_transcription(chunk)
             self._emit_transcription_lag(active=True)
+
+    def _enqueue_for_transcription(self, item: AudioChunk | None) -> None:
+        """Queue without ever blocking the recorder: past the backlog limit the oldest chunk is skipped."""
+        while True:
+            try:
+                self._transcription_queue.put_nowait(item)
+                return
+            except queue.Full:
+                pass
+            try:
+                dropped = self._transcription_queue.get_nowait()
+            except queue.Empty:
+                continue
+            if not isinstance(dropped, AudioChunk):
+                continue
+            skipped = max(0.0, audio_chunk_duration_seconds(dropped) - self.config.overlap_seconds)
+            with self._state_lock:
+                self._pending_transcription_chunks.discard(dropped.index)
+                self._skipped_seconds += skipped
+                total_skipped = self._skipped_seconds
+            minutes = MAX_BACKLOG_SECONDS / 60
+            self._emit(
+                "warning",
+                {
+                    "message": (
+                        f"Transcription fell {minutes:.0f} min behind, so {skipped:.0f} s of the oldest "
+                        f"untranscribed audio was skipped ({total_skipped:.0f} s skipped so far)."
+                    ),
+                    "skipped_seconds": total_skipped,
+                },
+            )
 
     def _queued_audio_seconds(self) -> float:
         total = 0.0
