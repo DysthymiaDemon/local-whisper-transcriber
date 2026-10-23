@@ -104,10 +104,12 @@ CA_BUNDLE_ENV = "LOCAL_WHISPER_CA_BUNDLE"
 TLS_CERT_ENV_VARS = ("REQUESTS_CA_BUNDLE", "SSL_CERT_FILE", "CURL_CA_BUNDLE")
 CA_BUNDLE_FILENAMES = ("company-ca.pem", "corporate-ca.pem", "ca-bundle.pem")
 WINDOWS_CA_BUNDLE_NAME = "windows-ca-bundle.pem"
-PIP_CPU_LIMIT_PERCENT = 25
+SETUP_CPU_LIMIT_PERCENT = 25
 JobObjectCpuRateControlInformation = 15
 JOB_OBJECT_CPU_RATE_CONTROL_ENABLE = 0x1
 JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP = 0x4
+PROCESS_TERMINATE = 0x0001
+PROCESS_SET_QUOTA = 0x0100
 INSTALL_LOG_FILE_NAME = "install_log.txt"
 SETUP_PROGRESS_STYLE = "Setup.Horizontal.TProgressbar"
 DETAIL_PROGRESS_STYLE = "Detail.Horizontal.TProgressbar"
@@ -1791,6 +1793,38 @@ def verify_downloaded_model(
     )
 
 
+class _DiscardWriter:
+    def write(self, value: str) -> int:
+        return len(value)
+
+    def flush(self) -> None:
+        pass
+
+
+def _byte_progress_tqdm_class(byte_bars: list[Any]) -> type | None:
+    """A tqdm class for snapshot_download that records its byte progress bar instead of drawing it.
+
+    snapshot_download builds one shared byte bar (unit "B") from tqdm_class and every file download, hf_xet
+    included, updates it as bytes arrive. It also uses the class for its file-count bar, so this stays a real
+    tqdm subclass. None when tqdm is not installed; progress then falls back to the staging folder size.
+    """
+    try:
+        from tqdm import tqdm
+    except ImportError:
+        return None
+
+    class ByteProgressTqdm(tqdm):
+        def __init__(self, *args, **kwargs):
+            # pythonw has no stderr, and nothing should be drawn anyway.
+            kwargs["file"] = _DiscardWriter()
+            kwargs["disable"] = False
+            super().__init__(*args, **kwargs)
+            if self.unit == "B":
+                byte_bars.append(self)
+
+    return ByteProgressTqdm
+
+
 def download_snapshot_with_progress(
     spec: ModelDownloadSpec,
     staging: Path,
@@ -1801,6 +1835,8 @@ def download_snapshot_with_progress(
     downloader: Callable[..., str],
 ) -> str:
     result: dict[str, Any] = {}
+    byte_bars: list[Any] = []
+    byte_bar_class = _byte_progress_tqdm_class(byte_bars)
 
     def worker() -> None:
         try:
@@ -1816,23 +1852,32 @@ def download_snapshot_with_progress(
             }
             if spec.allow_patterns:
                 kwargs["allow_patterns"] = list(spec.allow_patterns)
+            if byte_bar_class is not None:
+                kwargs["tqdm_class"] = byte_bar_class
             result["path"] = downloader(**kwargs)
         except BaseException as exc:  # pragma: no cover - propagated below
             result["error"] = exc
+
+    def downloaded_bytes() -> int:
+        # hf_xet writes files in large bursts, so the staging folder can sit still for minutes while bytes arrive.
+        # The byte counter huggingface_hub keeps for the whole snapshot shows the real progress.
+        counted = max((int(bar.n) for bar in byte_bars), default=0)
+        return max(counted, folder_size_bytes(staging))
 
     thread = threading.Thread(target=worker, name=f"download-{spec.name}", daemon=True)
     started = time.time()
     thread.start()
 
     while thread.is_alive():
-        downloaded = folder_size_bytes(staging)
+        downloaded = downloaded_bytes()
         elapsed = time.time() - started
         filename = largest_file_name(staging, spec.repo_id)
         progress = None
-        if total_bytes and total_bytes > 0:
-            local_percent = max(0, min(100, int((min(downloaded, total_bytes) / total_bytes) * 100)))
+        total = total_bytes or max((int(bar.total or 0) for bar in byte_bars), default=0)
+        if total > 0:
+            local_percent = max(0, min(100, int((min(downloaded, total) / total) * 100)))
             progress = base_progress + int(((end_progress - base_progress) * local_percent) / 100)
-        detail = format_model_download_status(filename, downloaded, total_bytes, elapsed)
+        detail = format_model_download_status(filename, downloaded, total or None, elapsed)
         on_event(PipProgressEvent("Downloading model", detail, progress, detail))
         thread.join(MODEL_DOWNLOAD_POLL_SECONDS)
 
@@ -1983,6 +2028,8 @@ def close_startup_splash(splash) -> None:
 
 
 def launch_gui(root: Path, splash=None, splash_status=None) -> int:
+    # The app runs in this process after setup: it must not keep setup's CPU cap.
+    release_setup_cpu_cap()
     os.chdir(root)
     os.environ["LOCAL_WHISPER_APP_ROOT"] = str(root)
     os.environ["LOCAL_WHISPER_SOURCE_ROOT"] = str(installer_source_root())
@@ -2017,7 +2064,7 @@ def launch_gui(root: Path, splash=None, splash_status=None) -> int:
 
 def apply_windows_cpu_limit(
     process: subprocess.Popen,
-    percent: int = PIP_CPU_LIMIT_PERCENT,
+    percent: int = SETUP_CPU_LIMIT_PERCENT,
     platform_name: str | None = None,
     kernel32: Any | None = None,
 ) -> bool:
@@ -2030,11 +2077,20 @@ def apply_windows_cpu_limit(
         return False
 
     kernel32 = kernel32 or ctypes.WinDLL("kernel32", use_last_error=True)
+    job_handle = _cpu_capped_job_for(kernel32, int(process_handle), percent)
+    if not job_handle:
+        return False
+    setattr(process, "_cpu_limit_job_handle", job_handle)
+    return True
+
+
+def _cpu_capped_job_for(kernel32: Any, process_handle: int, percent: int) -> Any | None:
+    """Put a process into a new job object with a CPU hard cap; the job handle, or None if Windows refused."""
     job_handle = None
     try:
         job_handle = kernel32.CreateJobObjectW(None, None)
         if not job_handle:
-            return False
+            return None
         cpu_rate = max(1, min(100, int(percent))) * 100
         info = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION(
             JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
@@ -2048,27 +2104,22 @@ def apply_windows_cpu_limit(
         )
         if not configured:
             kernel32.CloseHandle(job_handle)
-            return False
-        assigned = kernel32.AssignProcessToJobObject(job_handle, int(process_handle))
+            return None
+        assigned = kernel32.AssignProcessToJobObject(job_handle, process_handle)
         if not assigned:
             kernel32.CloseHandle(job_handle)
-            return False
-        setattr(process, "_cpu_limit_job_handle", job_handle)
-        return True
+            return None
+        return job_handle
     except Exception:
         if job_handle:
             try:
                 kernel32.CloseHandle(job_handle)
             except Exception:
                 pass
-        return False
+        return None
 
 
-def remove_windows_cpu_limit(process: subprocess.Popen, kernel32: Any | None = None) -> bool:
-    """Lift the CPU hard cap on a running process by switching off rate control on its job object."""
-    job_handle = getattr(process, "_cpu_limit_job_handle", None)
-    if not job_handle:
-        return False
+def _lift_job_cpu_cap(job_handle: Any, kernel32: Any | None = None) -> bool:
     try:
         kernel32 = kernel32 or ctypes.WinDLL("kernel32", use_last_error=True)
         info = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION(0, 0)
@@ -2082,6 +2133,73 @@ def remove_windows_cpu_limit(process: subprocess.Popen, kernel32: Any | None = N
         )
     except Exception:
         return False
+
+
+def remove_windows_cpu_limit(process: subprocess.Popen, kernel32: Any | None = None) -> bool:
+    """Lift the CPU hard cap on a running process by switching off rate control on its job object."""
+    job_handle = getattr(process, "_cpu_limit_job_handle", None)
+    if not job_handle:
+        return False
+    return _lift_job_cpu_cap(job_handle, kernel32)
+
+
+SETUP_CPU_JOB: dict[str, Any] = {"handle": None, "kernel32": None}
+
+
+def apply_setup_cpu_cap(
+    percent: int = SETUP_CPU_LIMIT_PERCENT,
+    platform_name: str | None = None,
+    kernel32: Any | None = None,
+) -> bool:
+    """Cap this setup process at percent of total CPU while it installs.
+
+    Windows puts processes started from here (pip) into the same job, so the cap covers the whole install:
+    package install, model download, digest checks and the model copy. Returns False when Windows refuses,
+    for example when an older Windows does not allow nested jobs; pip then gets its own cap instead.
+    """
+    platform_name = sys.platform if platform_name is None else platform_name
+    if platform_name != "win32" or SETUP_CPU_JOB["handle"]:
+        return bool(SETUP_CPU_JOB["handle"])
+    kernel32 = kernel32 or ctypes.WinDLL("kernel32", use_last_error=True)
+    try:
+        # A real handle, not GetCurrentProcess()'s -1 pseudo handle, which ctypes would pass as a 32-bit int.
+        process_handle = kernel32.OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, False, os.getpid())
+    except Exception:
+        return False
+    if not process_handle:
+        return False
+    try:
+        job_handle = _cpu_capped_job_for(kernel32, int(process_handle), percent)
+    finally:
+        try:
+            kernel32.CloseHandle(process_handle)
+        except Exception:
+            pass
+    if not job_handle:
+        return False
+    SETUP_CPU_JOB["handle"] = job_handle
+    SETUP_CPU_JOB["kernel32"] = kernel32
+    return True
+
+
+def setup_cpu_cap_active() -> bool:
+    return bool(SETUP_CPU_JOB["handle"])
+
+
+def release_setup_cpu_cap() -> bool:
+    """Remove the setup CPU cap. A process cannot leave its job, but a job without rate control limits nothing."""
+    job_handle = SETUP_CPU_JOB["handle"]
+    if not job_handle:
+        return False
+    kernel32 = SETUP_CPU_JOB["kernel32"]
+    released = _lift_job_cpu_cap(job_handle, kernel32)
+    try:
+        (kernel32 or ctypes.WinDLL("kernel32", use_last_error=True)).CloseHandle(job_handle)
+    except Exception:
+        pass
+    SETUP_CPU_JOB["handle"] = None
+    SETUP_CPU_JOB["kernel32"] = None
+    return released
 
 
 def close_windows_cpu_limit(process: subprocess.Popen, kernel32: Any | None = None) -> None:
@@ -2100,13 +2218,13 @@ def close_windows_cpu_limit(process: subprocess.Popen, kernel32: Any | None = No
 
 
 ACTIVE_PIP_PROCESSES: set[subprocess.Popen] = set()
-PIP_CPU_CAP = {"enabled": True}
+SETUP_CPU_CAP = {"enabled": True}
 
 
-def use_full_cpu_for_pip() -> bool:
-    """User says the laptop is idle: lift the cap now and skip it for later pip runs (for example Retry)."""
-    PIP_CPU_CAP["enabled"] = False
-    released = False
+def use_full_cpu_for_setup() -> bool:
+    """User says the laptop is idle: lift the cap now and skip it for the rest of setup (for example Retry)."""
+    SETUP_CPU_CAP["enabled"] = False
+    released = release_setup_cpu_cap()
     for process in list(ACTIVE_PIP_PROCESSES):
         released = remove_windows_cpu_limit(process) or released
     return released
@@ -2138,9 +2256,10 @@ def run_pip_install(root: Path, on_event, package_root: Path | None = None) -> P
         errors="replace",
     )
     ACTIVE_PIP_PROCESSES.add(process)
-    cpu_limited = apply_windows_cpu_limit(process) if PIP_CPU_CAP["enabled"] else False
+    # pip already shares the setup job's cap when that is active; its own job is the fallback.
+    cpu_limited = apply_windows_cpu_limit(process) if SETUP_CPU_CAP["enabled"] and not setup_cpu_cap_active() else False
     if cpu_limited:
-        detail = f"pip CPU hard cap: {PIP_CPU_LIMIT_PERCENT}% of total CPU"
+        detail = f"pip CPU hard cap: {SETUP_CPU_LIMIT_PERCENT}% of total CPU"
         on_event(PipProgressEvent("CPU limit", detail, None, detail))
     assert process.stdout is not None
     parser = PipProgressParser()
@@ -2603,7 +2722,7 @@ def run_bootstrap() -> int:
     full_cpu_button = tk.Button(full_cpu_row, text="I am not doing work, use 100% of CPU")
 
     def show_full_cpu_button() -> None:
-        if PIP_CPU_CAP["enabled"] and not full_cpu_button.winfo_ismapped():
+        if SETUP_CPU_CAP["enabled"] and not full_cpu_button.winfo_ismapped():
             full_cpu_button.config(state="normal", text="I am not doing work, use 100% of CPU")
             full_cpu_button.pack(side="left")
 
@@ -2611,18 +2730,25 @@ def run_bootstrap() -> int:
         full_cpu_button.pack_forget()
 
     def use_full_cpu() -> None:
-        released = use_full_cpu_for_pip()
+        released = use_full_cpu_for_setup()
         message = (
-            "pip CPU cap removed: using 100% of CPU"
+            "Setup CPU cap removed: using 100% of CPU"
             if released
-            else "pip CPU cap will not be applied to the next install run"
+            else "Setup CPU cap will not be applied to the rest of setup"
         )
         full_cpu_button.config(state="disabled", text="Using 100% of CPU")
         package_detail.set(message)
         set_text(package_text, message)
-        log_install(BOOTSTRAP_STEPS[3], "CPU cap removed by user", {"released_running_pip": released})
+        log_install(BOOTSTRAP_STEPS[0], "CPU cap removed by user", {"released_running_cap": released})
 
     full_cpu_button.config(command=use_full_cpu)
+
+    def start_setup_cpu_cap() -> None:
+        if not SETUP_CPU_CAP["enabled"] or not apply_setup_cpu_cap():
+            return
+        detail = f"Setup CPU hard cap: {SETUP_CPU_LIMIT_PERCENT}% of total CPU"
+        log_install(BOOTSTRAP_STEPS[0], "CPU limit", {"detail": detail})
+        show_full_cpu_button()
 
     button_row = tk.Frame(progress_frame, bg="#ffffff")
     button_row.pack(fill="x", padx=18, pady=(0, 6))
@@ -2844,6 +2970,7 @@ def run_bootstrap() -> int:
             render_steps()
 
         run_on_ui(reset_failed_steps)
+        run_on_ui(start_setup_cpu_cap)
         threading.Thread(target=lambda: run_setup_flow(step), name="setup-retry", daemon=True).start()
 
     def on_close_setup() -> None:
@@ -3022,6 +3149,7 @@ def run_bootstrap() -> int:
 
     def finish_with_launch_countdown() -> None:
         final_message_active.set(True)
+        hide_full_cpu_button()
         step_states[BOOTSTRAP_STEPS[-1]] = StepState.RUNNING
         log_install(BOOTSTRAP_STEPS[-1], "Launch countdown started", {"delay_seconds": IMPORTANT_MESSAGE_SECONDS})
         if not launch_now_button.winfo_ismapped():
@@ -3124,7 +3252,6 @@ def run_bootstrap() -> int:
                         result = run_pip_install(root, update_from_pip, package_root)
                     finally:
                         set_sensitive_install_phase(False)
-                        window.after(0, hide_full_cpu_button)
                     if result.code != 0:
                         log_path = write_setup_error_log(
                             root,
@@ -3239,6 +3366,7 @@ def run_bootstrap() -> int:
                 child.config(state="disabled")
         for child in model_button_row.winfo_children():
             child.config(state="disabled")
+        start_setup_cpu_cap()
         threading.Thread(target=run_setup_flow, name="setup-flow", daemon=True).start()
 
     def use_current_model() -> None:

@@ -1129,6 +1129,102 @@ class BootstrapLauncherTests(unittest.TestCase):
         self.assertIn(("AssignProcessToJobObject", 1234, 5678), calls)
         self.assertNotIn(("CloseHandle", 1234), calls)
 
+    def _setup_cap_kernel32(self, calls, assign_result=1):
+        class FakeKernel32:
+            def OpenProcess(self, access, inherit, pid):
+                calls.append(("OpenProcess", access, inherit, pid))
+                return 77
+
+            def CreateJobObjectW(self, security_attributes, name):
+                return 1234
+
+            def SetInformationJobObject(self, job, info_class, info_ptr, info_size):
+                info = ctypes.cast(
+                    info_ptr,
+                    ctypes.POINTER(bootstrap_launcher_module.JOBOBJECT_CPU_RATE_CONTROL_INFORMATION),
+                ).contents
+                calls.append(("SetInformationJobObject", job, info.ControlFlags, info.CpuRate))
+                return 1
+
+            def AssignProcessToJobObject(self, job, process_handle):
+                calls.append(("AssignProcessToJobObject", job, process_handle))
+                return assign_result
+
+            def CloseHandle(self, handle):
+                calls.append(("CloseHandle", handle))
+                return 1
+
+        self.addCleanup(bootstrap_launcher_module.SETUP_CPU_JOB.update, {"handle": None, "kernel32": None})
+        return FakeKernel32()
+
+    def test_setup_cpu_cap_puts_setup_process_in_capped_job_until_released(self):
+        calls = []
+        kernel32 = self._setup_cap_kernel32(calls)
+
+        applied = bootstrap_launcher_module.apply_setup_cpu_cap(platform_name="win32", kernel32=kernel32)
+        active = bootstrap_launcher_module.setup_cpu_cap_active()
+        released = bootstrap_launcher_module.release_setup_cpu_cap()
+
+        self.assertTrue(applied)
+        self.assertTrue(active)
+        self.assertTrue(released)
+        self.assertFalse(bootstrap_launcher_module.setup_cpu_cap_active())
+        access = bootstrap_launcher_module.PROCESS_SET_QUOTA | bootstrap_launcher_module.PROCESS_TERMINATE
+        self.assertEqual(calls[0], ("OpenProcess", access, False, os.getpid()))
+        self.assertIn(("AssignProcessToJobObject", 1234, 77), calls)
+        self.assertIn(("CloseHandle", 77), calls)
+        cap_flags = (
+            bootstrap_launcher_module.JOB_OBJECT_CPU_RATE_CONTROL_ENABLE
+            | bootstrap_launcher_module.JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP
+        )
+        self.assertIn(("SetInformationJobObject", 1234, cap_flags, 2500), calls)
+        # Released: rate control off, then the job handle closed.
+        self.assertEqual(calls[-2:], [("SetInformationJobObject", 1234, 0, 0), ("CloseHandle", 1234)])
+
+    def test_setup_cpu_cap_reports_failure_when_windows_refuses(self):
+        calls = []
+        kernel32 = self._setup_cap_kernel32(calls, assign_result=0)
+
+        self.assertFalse(bootstrap_launcher_module.apply_setup_cpu_cap(platform_name="win32", kernel32=kernel32))
+        self.assertFalse(bootstrap_launcher_module.setup_cpu_cap_active())
+        self.assertFalse(bootstrap_launcher_module.apply_setup_cpu_cap(platform_name="linux", kernel32=kernel32))
+        self.assertFalse(bootstrap_launcher_module.release_setup_cpu_cap())
+
+    def test_pip_install_shares_setup_cap_instead_of_its_own_job(self):
+        from bootstrap_launcher import run_pip_install
+
+        self.addCleanup(bootstrap_launcher_module.SETUP_CPU_JOB.update, {"handle": None, "kernel32": None})
+        bootstrap_launcher_module.SETUP_CPU_JOB["handle"] = 1234
+        with tempfile.TemporaryDirectory() as runtime_tmp, tempfile.TemporaryDirectory() as package_tmp:
+            package_root = Path(package_tmp)
+            (package_root / "resources").mkdir()
+            (package_root / "resources" / "requirements.txt").write_text("example==1.0\n", encoding="utf-8")
+
+            class FakeProcess:
+                def __init__(self, cmd, **kwargs):
+                    self.stdout = iter([])
+
+                def wait(self):
+                    return 0
+
+            with patch("bootstrap_launcher.subprocess.Popen", FakeProcess), patch(
+                "bootstrap_launcher.apply_windows_cpu_limit"
+            ) as apply_limit:
+                run_pip_install(Path(runtime_tmp), lambda event: None, package_root)
+        apply_limit.assert_not_called()
+
+    def test_launch_gui_releases_setup_cpu_cap_before_the_app_starts(self):
+        class Stop(Exception):
+            pass
+
+        with patch("bootstrap_launcher.release_setup_cpu_cap", side_effect=Stop) as release, patch(
+            "bootstrap_launcher.os.chdir"
+        ) as chdir:
+            with self.assertRaises(Stop):
+                bootstrap_launcher_module.launch_gui(Path("unused"))
+        release.assert_called_once_with()
+        chdir.assert_not_called()
+
     def test_pip_install_applies_and_closes_cpu_limit_job(self):
         from bootstrap_launcher import run_pip_install
 
@@ -1176,13 +1272,13 @@ class BootstrapLauncherTests(unittest.TestCase):
         process = RunningPip()
         bootstrap_launcher_module.ACTIVE_PIP_PROCESSES.add(process)
         self.addCleanup(bootstrap_launcher_module.ACTIVE_PIP_PROCESSES.discard, process)
-        self.addCleanup(bootstrap_launcher_module.PIP_CPU_CAP.__setitem__, "enabled", True)
+        self.addCleanup(bootstrap_launcher_module.SETUP_CPU_CAP.__setitem__, "enabled", True)
         real_remove = bootstrap_launcher_module.remove_windows_cpu_limit
         with patch(
             "bootstrap_launcher.remove_windows_cpu_limit",
             side_effect=lambda proc: real_remove(proc, kernel32=FakeKernel32()),
         ):
-            released = bootstrap_launcher_module.use_full_cpu_for_pip()
+            released = bootstrap_launcher_module.use_full_cpu_for_setup()
 
         self.assertTrue(released)
         self.assertEqual(flag_calls, [(4321, 0)])
@@ -1216,9 +1312,9 @@ class BootstrapLauncherTests(unittest.TestCase):
         self.assertEqual(bootstrap_launcher_module.LAUNCH_COUNTDOWN_FONT_SIZE, 30)
         self.assertIn('package_text.configure(font=("Segoe UI", LAUNCH_COUNTDOWN_FONT_SIZE))', source)
 
-    def test_pip_cpu_cap_is_on_by_default(self):
-        self.assertEqual(bootstrap_launcher_module.PIP_CPU_LIMIT_PERCENT, 25)
-        self.assertTrue(bootstrap_launcher_module.PIP_CPU_CAP["enabled"])
+    def test_setup_cpu_cap_is_on_by_default(self):
+        self.assertEqual(bootstrap_launcher_module.SETUP_CPU_LIMIT_PERCENT, 25)
+        self.assertTrue(bootstrap_launcher_module.SETUP_CPU_CAP["enabled"])
 
     def test_ensure_portable_layout_uses_external_template_root(self):
         with tempfile.TemporaryDirectory() as runtime_tmp, tempfile.TemporaryDirectory() as source_tmp:
@@ -2233,6 +2329,45 @@ class BootstrapLauncherTests(unittest.TestCase):
 
             self.assertEqual(bootstrap_launcher_module.folder_size_bytes(root), 18)
             self.assertEqual(bootstrap_launcher_module.folder_size_bytes(root / "missing"), 0)
+
+    def test_model_download_progress_counts_bytes_before_files_reach_staging(self):
+        import threading
+
+        spec = bootstrap_launcher_module.OPENVINO_MODEL_DOWNLOADS[0]
+        details = []
+        counted = threading.Event()
+
+        class FakeByteBar:
+            def __init__(self, bars, **kwargs):
+                self.unit = kwargs.get("unit")
+                self.total = kwargs.get("total")
+                self.n = 0
+                bars.append(self)
+
+        def fake_download(**kwargs):
+            # Like hf_xet: bytes arrive and are counted while the staging folder is still empty.
+            bar = kwargs["tqdm_class"](total=1000, unit="B")
+            bar.n = 400
+            counted.wait(5)
+            return kwargs["local_dir"]
+
+        def on_event(event):
+            details.append(event.detail)
+            if "400 B" in event.detail:
+                counted.set()
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            bootstrap_launcher_module,
+            "_byte_progress_tqdm_class",
+            side_effect=lambda bars: lambda **kwargs: FakeByteBar(bars, **kwargs),
+        ), patch.object(bootstrap_launcher_module, "MODEL_DOWNLOAD_POLL_SECONDS", 0.01):
+            staging = Path(tmp)
+            bootstrap_launcher_module.download_snapshot_with_progress(
+                spec, staging, None, 0, 100, on_event, fake_download
+            )
+
+        self.assertTrue(counted.is_set(), details)
+        self.assertTrue(any("400 B / 1000 B" in detail for detail in details), details)
 
     def test_weighted_overall_progress_uses_expected_step_durations(self):
         states = {step: StepState.PENDING for step in BOOTSTRAP_STEPS}

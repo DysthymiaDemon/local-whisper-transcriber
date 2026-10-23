@@ -16,7 +16,7 @@ You need Python 3.12 (64-bit). On a managed laptop, install it from the company 
 1. Copy `Open Offline Meeting Transcriber.pyw` to a folder of your choice. If you received the file from someone else rather than from this repository, check it first (see [Checking the launcher](#checking-the-launcher)).
 2. Double-click it. It creates an `OfflineMeetingTranscriber` folder next to itself.
 3. The setup window lists what it will install. Click **Install**.
-4. Setup installs the Python packages and downloads the speech model: 828 MB on Intel GPU laptops, 1.5 GB otherwise. This is the only step that uses the internet.
+4. Setup installs the Python packages and downloads the speech model: 828 MB on Intel GPU laptops, 1.5 GB otherwise. This is the only step that uses the internet. Setup uses at most 25% of the CPU so you can keep working. If the laptop is idle, click **I am not doing work, use 100% of CPU** to finish sooner. The app itself runs without this limit.
 5. When setup finishes, Meeting Scribe opens. Later launches open it straight away.
 
 ## Using the app
@@ -139,7 +139,7 @@ The Python block cannot stop code in native libraries. If IT wants an operating-
 
 The launcher's checksum changes with every release:
 
-`Open Offline Meeting Transcriber.pyw` SHA-256: `5e7367eaa2a1acaf4fb564ff3da02bcef5180fb83e26772ad4764fbe666e1c74`
+`Open Offline Meeting Transcriber.pyw` SHA-256: `34cc6f71241e934570d7bd667e4b024ecdbdf8181306fa5ca61d501828590ccd`
 
 To check a copy, run this in a terminal in its folder, and compare the result with the line above as published in this repository:
 
