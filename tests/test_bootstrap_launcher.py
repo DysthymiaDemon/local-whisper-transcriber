@@ -364,6 +364,65 @@ class ModelUpgradeTests(unittest.TestCase):
 
         self.assertEqual(status["faster-whisper"], BootstrapStatus.MISSING)
 
+    def test_setup_specs_match_the_folders_the_engine_verifies(self):
+        root = Path(tempfile.gettempdir()) / "app-root"
+        for spec in DEFAULT_MODEL_DOWNLOADS + bootstrap_launcher_module.OPENVINO_MODEL_DOWNLOADS:
+            with self.subTest(spec=spec.name):
+                folder = root / spec.target_subdir
+                self.assertEqual(bootstrap_launcher_module.model_integrity.managed_model_repo(folder, root), spec.repo_id)
+
+    def test_default_folders_without_marker_need_repair_on_cpu_and_gpu(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ensure_portable_layout(root)
+            write_fake_faster_whisper(root / "models" / "faster-whisper")
+            cpu = model_upgrades_available(root)
+            gpu_root = root / "gpu"
+            write_turbo_openvino(gpu_root / "models" / "openvino-whisper")
+            with intel_backend():
+                gpu = model_upgrades_available(gpu_root)
+                write_model_source(gpu_root / "models" / "openvino-whisper", DEFAULT_MODEL_DOWNLOADS[0].repo_id)
+                gpu_foreign = model_upgrades_available(gpu_root)
+
+        self.assertEqual([spec.name for spec in cpu], ["faster-whisper"])
+        self.assertEqual([spec.name for spec in gpu], ["openvino-whisper"])
+        self.assertEqual([spec.name for spec in gpu_foreign], ["openvino-whisper"])
+
+    def test_legacy_cpu_model_cannot_be_kept_and_is_downloaded_again(self):
+        for legacy_marker in (None, "Systran/faster-whisper-small.en"):
+            with self.subTest(marker=legacy_marker), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                ensure_portable_layout(root)
+                target = root / "models" / "faster-whisper"
+                write_fake_faster_whisper(target)
+                if legacy_marker:
+                    write_model_source(target, legacy_marker)
+                keep_before = bootstrap_launcher_module.can_keep_current_model(root)
+                calls = []
+
+                def fake_download(**kwargs):
+                    calls.append(kwargs)
+                    write_fake_faster_whisper(kwargs["local_dir"])
+                    return kwargs["local_dir"]
+
+                downloaded = download_default_models(root, lambda event: None, downloader=fake_download)
+                repo_id, revision = bootstrap_launcher_module.read_model_source_details(target)
+                keep_after = bootstrap_launcher_module.can_keep_current_model(root)
+
+                self.assertFalse(keep_before)
+                self.assertEqual(downloaded, ["faster-whisper"])
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(repo_id, DEFAULT_MODEL_DOWNLOADS[0].repo_id)
+                self.assertEqual(revision, bootstrap_launcher_module.model_manifest_entry(repo_id)["revision"])
+                self.assertTrue(keep_after)
+
+
+def write_turbo_openvino(folder: Path) -> None:
+    folder.mkdir(parents=True, exist_ok=True)
+    write_complete_openvino_ir(folder)
+    config = dict(bootstrap_launcher_module.OPENVINO_MODEL_CONFIG_SIGNATURE)
+    (folder / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
 
 class DefaultBackendTests(unittest.TestCase):
     def setUp(self):
@@ -1384,7 +1443,8 @@ class BootstrapLauncherTests(unittest.TestCase):
         self.assertFalse(small_only_exists)
         self.assertFalse(rollback_exists)
 
-    def test_intel_model_downloader_skips_manually_copied_turbo_model(self):
+    def test_intel_model_downloader_skips_turbo_model_setup_recorded(self):
+        spec = bootstrap_launcher_module.OPENVINO_MODEL_DOWNLOADS[0]
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             target = root / "models" / "openvino-whisper"
@@ -1401,6 +1461,7 @@ class BootstrapLauncherTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            write_model_source(target, spec.repo_id, bootstrap_launcher_module.model_manifest_entry(spec.repo_id)["revision"])
             calls = []
 
             with intel_backend():

@@ -1404,11 +1404,12 @@ def _configured_model_dir(root: Path) -> Path | None:
 
 
 def model_needs_upgrade(root: Path, spec: ModelDownloadSpec) -> bool:
-    """True when a complete default model folder is not the approved model revision.
+    """True when a complete default model folder is not the approved model revision and must be downloaded again.
 
-    That is an older default faster-whisper model (for example small.en), or the right model whose files do not
-    match the approved digests. Only the default folder is ever upgraded; a custom model path in config.json is
-    left alone.
+    That is a folder with a missing, unreadable or foreign MODEL_SOURCE.json (including an older default model
+    such as small.en), or the right model whose files do not match the approved digests. The app refuses to load
+    such a folder (TM-004), so it is repaired, never kept. Only the default folder is ever replaced; a custom model
+    path in config.json is left alone.
     """
     target = (root / spec.target_subdir).resolve()
     if _configured_model_dir(root) not in (None, target):
@@ -1416,9 +1417,10 @@ def model_needs_upgrade(root: Path, spec: ModelDownloadSpec) -> bool:
     if not _model_folder_ready_at(target, spec.name):
         return False
     repo_id, revision = read_model_source_details(target)
-    if repo_id != spec.repo_id:
-        # Older default CPU model: offer the upgrade. Other unmarked folders were copied in by hand: leave them.
-        return spec.name == "faster-whisper"
+    # Same location-based rule the engine applies before loading: the folder decides the model, not the marker.
+    if repo_id is None or repo_id != model_integrity.managed_model_repo(target, root):
+        # Older default CPU model, or a marker removed or changed after setup: setup cannot vouch for these files.
+        return True
     approved = model_manifest_entry(spec.repo_id)["revision"]
     if revision == approved:
         return False
@@ -1431,6 +1433,11 @@ def model_needs_upgrade(root: Path, spec: ModelDownloadSpec) -> bool:
 
 def model_upgrades_available(root: Path) -> list[ModelDownloadSpec]:
     return [spec for spec in active_model_downloads() if model_needs_upgrade(root, spec)]
+
+
+def can_keep_current_model(root: Path) -> bool:
+    """True when the app would load the current default model, so setup may offer to keep it."""
+    return not model_upgrades_available(root)
 
 
 def model_folder_status(root: Path, include_optional: bool = False) -> dict[str, BootstrapStatus]:
@@ -2185,6 +2192,9 @@ def run_bootstrap() -> int:
     if not gpu_upgrade:
         update_startup_splash(splash, splash_status, "Checking speech model files...")
     upgrades = [] if gpu_upgrade else model_upgrades_available(root)
+    # Only a GPU offer may keep the current model, and only when the app would load it: a default model folder
+    # setup cannot vouch for is refused at load (TM-004), so it can only be downloaded again.
+    keep_current_offered = gpu_upgrade and can_keep_current_model(root)
     if gpu_upgrade:
         upgrades = list(wanted_backend.model_downloads)
     upgrade_only = not missing_packages and not models_missing and not setup_missing and bool(upgrades)
@@ -2195,7 +2205,7 @@ def run_bootstrap() -> int:
     if upgrade_only and gpu_upgrade:
         update_startup_splash(splash, splash_status, "Your Intel GPU can transcribe faster...")
     elif upgrade_only:
-        update_startup_splash(splash, splash_status, "A more accurate speech model is available...")
+        update_startup_splash(splash, splash_status, "The speech model must be downloaded again...")
     elif missing_packages:
         update_startup_splash(splash, splash_status, "Dependencies missing. Opening first-time setup...")
     elif models_missing:
@@ -2316,7 +2326,7 @@ def run_bootstrap() -> int:
 
     install_title = tk.Label(
         install_content,
-        text=("Use your Intel GPU?" if gpu_upgrade else "Upgrade speech model?") if upgrade_only else "Install Meeting Scribe?",
+        text=("Use your Intel GPU?" if gpu_upgrade else "Repair speech model?") if upgrade_only else "Install Meeting Scribe?",
         font=("Segoe UI", 16, "bold"),
         anchor="w",
         bg="#ffffff",
@@ -2441,13 +2451,16 @@ def run_bootstrap() -> int:
     if upgrade_only and gpu_upgrade:
         install_note_text = (
             f"Your Intel GPU can transcribe about 3x faster and more accurately ({wanted_backend.model_downloads[0].approx_size} "
-            "model plus OpenVINO). Install downloads it once. Use current model keeps the CPU model."
+            "model plus OpenVINO). Install downloads it once."
         )
+        if keep_current_offered:
+            install_note_text += " Use current model keeps the CPU model."
     elif upgrade_only:
         upgrade_sizes = ", ".join(spec.approx_size for spec in upgrades if spec.approx_size)
         install_note_text = (
-            f"A more accurate speech model is available ({upgrade_sizes}). "
-            "Install downloads it once. Use current model keeps the one you have."
+            "Setup cannot confirm that the speech model in the app's models folder is the approved one. It came "
+            "from an older version, or its files changed since setup, so the app will not load it. "
+            f"Install downloads the approved model once ({upgrade_sizes})."
         )
     else:
         install_note_text = "Internet is used only for these setup downloads. The app itself always runs offline."
@@ -3183,7 +3196,7 @@ def run_bootstrap() -> int:
     install_button = tk.Button(install_button_row, text="Install", width=14, command=start_flow)
     install_button.pack(side="right", padx=(0, 8))
     install_button_ref["value"] = install_button
-    if upgrade_only:
+    if upgrade_only and keep_current_offered:
         keep_button = tk.Button(install_button_row, text="Use current model", width=18, command=use_current_model)
         keep_button.pack(side="right", padx=(0, 8))
     for button in (

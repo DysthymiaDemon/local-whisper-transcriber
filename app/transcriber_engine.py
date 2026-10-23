@@ -1264,6 +1264,8 @@ class MeetingTranscriberEngine:
 
 _model_cache: dict[tuple[Any, ...], Any] = {}
 _warmed_models: set[tuple[Any, ...]] = set()
+# Approved repo id each cached model was verified as, or None for a custom folder that was not checked.
+_verified_models: dict[tuple[Any, ...], str | None] = {}
 _model_cache_lock = threading.Lock()
 
 
@@ -1289,13 +1291,21 @@ def load_whisper_model(config: EngineConfig) -> Any:
     with _model_cache_lock:
         model = _model_cache.get(key)
         if model is None:
-            # Every fresh load re-checks a setup-managed model against the approved digests (TM-004).
+            # Every fresh load re-checks a setup-managed model against the approved digests (TM-004). A failed
+            # check raises before the model files are parsed.
             from model_integrity import verify_managed_model
 
-            verify_managed_model(config.whisper_model_dir)
+            repo_id = verify_managed_model(config.whisper_model_dir)
             model = _create_whisper_model(config)
             _model_cache[key] = model
+            _verified_models[key] = repo_id
         return model
+
+
+def verified_model_repo(config: EngineConfig) -> str | None:
+    """Approved repo id the loaded model was verified as; None when it came from an unchecked custom folder."""
+    with _model_cache_lock:
+        return _verified_models.get(_model_cache_key(config))
 
 
 def preload_whisper_model(config: EngineConfig) -> Any:
@@ -1333,6 +1343,7 @@ def unload_whisper_model(config: EngineConfig) -> bool:
     with _model_cache_lock:
         model = _model_cache.pop(key, None)
         _warmed_models.discard(key)
+        _verified_models.pop(key, None)
     unloaded = model is not None
     del model
     gc.collect()
@@ -1343,6 +1354,7 @@ def clear_whisper_model_cache() -> None:
     with _model_cache_lock:
         _model_cache.clear()
         _warmed_models.clear()
+        _verified_models.clear()
 
 
 def _create_whisper_model(config: EngineConfig) -> Any:

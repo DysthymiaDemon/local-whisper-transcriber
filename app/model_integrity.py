@@ -3,6 +3,8 @@
 resources/model_manifest.json (written by packaging/lock_models.py) pins each setup model to a Hugging Face
 commit and records the SHA-256 of every file. Setup checks downloads against it, and the engine checks a
 setup-managed model folder again every time it loads the model, so files changed after setup are refused.
+A folder is setup-managed because of where it is (models/faster-whisper or models/openvino-whisper under the
+app root), never because of the MODEL_SOURCE.json marker inside it.
 """
 from __future__ import annotations
 
@@ -13,6 +15,12 @@ from typing import Any
 
 MODEL_SOURCE_FILE = "MODEL_SOURCE.json"
 MODEL_MANIFEST_FILE = "model_manifest.json"
+# Folder under <app root>/models -> the model setup downloads into it. Must match the ModelDownloadSpec entries
+# in bootstrap_launcher.py (a test keeps them in step).
+SETUP_MODEL_REPOS = {
+    "faster-whisper": "distil-whisper/distil-large-v3.5-ct2",
+    "openvino-whisper": "OpenVINO/whisper-large-v3-turbo-int8-ov",
+}
 
 
 class ModelIntegrityError(RuntimeError):
@@ -83,23 +91,47 @@ def verify_files(folder: Path, entry: dict[str, Any]) -> list[str]:
     return problems
 
 
-def verify_managed_model(folder: Path | str, resources_dir: Path | None = None) -> str | None:
+def managed_model_repo(folder: Path | str, app_root: Path | None = None) -> str | None:
+    """The repo id setup downloads into folder when it is a setup model folder under the app root, else None."""
+    if app_root is None:
+        from app_config import application_root
+
+        app_root = application_root()
+    try:
+        target = Path(folder).resolve()
+        models = (Path(app_root) / "models").resolve()
+    except OSError:
+        return None
+    for name, repo_id in SETUP_MODEL_REPOS.items():
+        if target == models / name:
+            return repo_id
+    return None
+
+
+def verify_managed_model(
+    folder: Path | str, resources_dir: Path | None = None, app_root: Path | None = None
+) -> str | None:
     """Re-check a setup-managed model folder before it is loaded.
 
-    Returns the approved repo id when every file matches, or None for a folder setup does not manage (no marker,
-    or a model that is not in the manifest, such as a custom folder chosen under Advanced). Raises
-    ModelIntegrityError when a managed folder's files differ from the approved digests.
+    Returns the approved repo id when every file matches, or None for a custom folder chosen under Advanced,
+    which is not checked. Raises ModelIntegrityError when a setup folder has no marker for its approved model and
+    revision, or its files differ from the approved digests. The marker only confirms what setup wrote; the
+    expected model comes from the folder's location.
     """
-    repo_id, _revision = read_model_source_details(Path(folder))
+    repo_id = managed_model_repo(folder, app_root)
     if repo_id is None:
         return None
     try:
-        manifest = load_model_manifest(resources_dir)
+        entry = manifest_entry(load_model_manifest(resources_dir), repo_id)
     except (OSError, ValueError, RuntimeError) as exc:
         raise ModelIntegrityError(f"The approved model list could not be read, so the model was not loaded: {exc}")
-    if repo_id not in manifest:
-        return None
-    problems = verify_files(Path(folder), manifest_entry(manifest, repo_id))
+    if read_model_source_details(Path(folder)) != (repo_id, entry["revision"]):
+        raise ModelIntegrityError(
+            f"Speech model in {folder} has no setup record for the approved model ({MODEL_SOURCE_FILE} is missing, "
+            "unreadable or names another model or revision), so it was not loaded. Run setup to download the "
+            "approved model again."
+        )
+    problems = verify_files(Path(folder), entry)
     if problems:
         shown = "; ".join(problems[:5])
         raise ModelIntegrityError(

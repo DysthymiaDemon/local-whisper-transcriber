@@ -94,12 +94,14 @@ Setup checks that the model folder is complete. The app never loads a partial fo
 When you launch the new version on an existing install, setup can show one of two prompts:
 
 - **Use your Intel GPU?** appears on Intel laptops still on the CPU engine.
-- **Upgrade speech model?** appears on other laptops still on the older `Systran/faster-whisper-small.en`.
+- **Repair speech model?** appears when setup cannot confirm that a model in the app's `models` folder is the approved one. That covers the older `Systran/faster-whisper-small.en`, a model from before setup recorded what it downloaded, and a model whose `MODEL_SOURCE.json` or files changed after setup. The app refuses to load such a model.
 
-Both prompts offer the same two choices:
+Choices:
 
-- **Install** downloads the new engine or model once, then switches. If a model download fails, the old model is restored.
-- **Use current model** opens the app with what you have, fully offline. Setup asks again on the next launch.
+- **Install** downloads the new engine or the approved model once, then switches. If a model download fails, the old model is restored.
+- **Use current model** appears only on the Intel GPU prompt, and only when the current CPU model passes the check. It opens the app with what you have, fully offline. Setup asks again on the next launch.
+
+The repair prompt has no **Use current model** choice, because the app would refuse that model. Until you install, the app does not start.
 
 If you set your own model folder in `config.json`, it is never replaced.
 
@@ -129,14 +131,15 @@ The Python block cannot stop code in native libraries. If IT wants an operating-
 ### What setup and the app check
 
 - **Packages:** every package, including dependencies, is pinned to one version and one SHA-256 hash in the `.lock.txt` files. pip installs with `--require-hashes --only-binary=:all: --no-deps`, so it refuses a changed file, anything built from source, and any package not in the lock. OpenVINO's telemetry package (`openvino-telemetry`) is deliberately left out. Only OpenVINO's model converter uses it, and this app never runs the converter. Setup also deletes it from older installs.
-- **Models:** `resources\model_manifest.json` pins each model to a Hugging Face commit and lists the SHA-256 of every file. Setup downloads that commit and refuses a download whose files do not match. The app checks the files again every time the model starts, and refuses to load a model whose files changed since setup. The compiled GPU cache (`.ov_cache`) is not covered. A model folder you set yourself under **Advanced** is not checked, and the log says so.
+- **Models:** `resources\model_manifest.json` pins each model to a Hugging Face commit and lists the SHA-256 of every file. Setup downloads that commit and refuses a download whose files do not match. Every time the model starts, the app checks the setup model folders, `models\faster-whisper` and `models\openvino-whisper` in the app folder. The folder's location decides which model it must hold, not the `MODEL_SOURCE.json` inside it. The app refuses to load the model when that marker is missing, unreadable or names another model or revision, or when any listed file is missing or changed.
+- **Not covered by the model check:** the compiled GPU cache (`.ov_cache`), a model folder you set yourself under **Advanced** (it loads unchecked, and the log says so), and installed packages after setup. These rely on Windows folder permissions on the app folder.
 - **Transcript text** goes only to the window, the transcript file and, when you click Copy, the clipboard. It is not printed to a console or written to `error_log.txt`.
 
 ### Checking the launcher
 
 The launcher's checksum changes with every release:
 
-`Open Offline Meeting Transcriber.pyw` SHA-256: `57fc27d90db17eb12d86f1c971f3581fbffce7bb3786aadf9c26de6989c64d03`
+`Open Offline Meeting Transcriber.pyw` SHA-256: `687108f869abc624fe367b8fc11f49be24b4596a41552b5e03a7063a830b8464`
 
 To check a copy, run this in a terminal in its folder, and compare the result with the line above as published in this repository:
 

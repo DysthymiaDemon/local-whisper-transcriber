@@ -187,12 +187,17 @@ class FileGuiTests(unittest.TestCase):
         self.assertEqual(self.window.model_button.state, gui.MODEL_STOPPED)
         self.assertEqual(self.window.model_button.text(), "Start Model")
 
-    def test_only_custom_model_folders_are_flagged_as_unverified(self):
-        models = gui.application_root() / "models"
-
-        self.assertTrue(self.window._model_folder_is_setup_managed(str(models / "faster-whisper")))
-        self.assertTrue(self.window._model_folder_is_setup_managed(str(models / "openvino-whisper")))
-        self.assertFalse(self.window._model_folder_is_setup_managed("D:/models/my-whisper"))
+    def test_unverified_model_is_flagged_from_the_engine_check(self):
+        for repo_id, flagged in (("distil-whisper/distil-large-v3.5-ct2", False), (None, True)):
+            with self.subTest(repo_id=repo_id), patch.object(gui.EngineConfig, "validate", return_value=[]), patch.object(
+                gui, "verified_model_repo", return_value=repo_id
+            ):
+                self.window.log_box.clear()
+                self.window.model_button.click()
+                self.wait_for_model_state(gui.MODEL_READY)
+                self.assertEqual("Custom model folder" in self.window.log_box.toPlainText(), flagged)
+                self.window.model_button.click()
+                self.wait_for_model_state(gui.MODEL_STOPPED)
 
     def test_home_record_starts_model_red_yellow_green(self):
         with patch.object(gui.EngineConfig, "validate", return_value=[]):

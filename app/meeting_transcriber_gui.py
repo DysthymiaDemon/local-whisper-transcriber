@@ -28,6 +28,7 @@ from transcriber_engine import (
     preload_whisper_model,
     rms_to_meter_percent,
     unload_whisper_model,
+    verified_model_repo,
 )
 from ui_helpers import meter_bar_geometry
 
@@ -400,16 +401,6 @@ class MainWindow(QMainWindow):
         elif self.model_button.state == MODEL_READY:
             self._stop_model()
 
-    @staticmethod
-    def _model_folder_is_setup_managed(model_dir: str) -> bool:
-        """True for the model folders setup downloads and digest-checks; False for a folder set in Advanced."""
-        try:
-            folder = Path(model_dir).resolve()
-            models = (application_root() / "models").resolve()
-        except OSError:
-            return False
-        return folder in (models / "faster-whisper", models / "openvino-whisper")
-
     def _start_model(self) -> bool:
         """Load and warm up the speech model in the background (red -> yellow -> green)."""
         if self.model_button.state != MODEL_STOPPED:
@@ -422,11 +413,6 @@ class MainWindow(QMainWindow):
         self._loaded_model_config = config
         self._set_model_state(MODEL_STARTING)
         self._set_model_status("Starting speech model (checking model files)...")
-        if not self._model_folder_is_setup_managed(config.whisper_model_dir):
-            self._append_log(
-                f"Custom model folder {config.whisper_model_dir}: its files were not checked against the approved "
-                "model digests that setup uses."
-            )
 
         def preload() -> None:
             started = time.monotonic()
@@ -438,7 +424,16 @@ class MainWindow(QMainWindow):
                 )
                 return
             seconds = time.monotonic() - started
-            where = "on the Intel GPU" if config.device.lower().startswith("openvino") else "on the CPU"
+            if verified_model_repo(config) is None:
+                # The engine's check found a custom folder, not one setup manages, so nothing was compared.
+                self.bridge.event.emit(
+                    "log",
+                    {
+                        "message": f"Custom model folder {config.whisper_model_dir}: its files were not checked "
+                        "against the approved model digests that setup uses."
+                    },
+                )
+            where ="on the Intel GPU" if config.device.lower().startswith("openvino") else "on the CPU"
             fallback = getattr(model, "fallback_reason", "")
             if isinstance(fallback, str) and fallback:
                 where = "on the CPU (Intel GPU unavailable)"
