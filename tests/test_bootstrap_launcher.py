@@ -1662,6 +1662,134 @@ class BootstrapLauncherTests(unittest.TestCase):
         self.assertEqual(rollback_content, "recovery")
         self.assertEqual(calls, [])
 
+    def _write_turbo_config(self, folder: Path) -> None:
+        (folder / "config.json").write_text(
+            json.dumps({"d_model": 1280, "encoder_layers": 32, "decoder_layers": 4, "num_mel_bins": 128}),
+            encoding="utf-8",
+        )
+
+    def _download_intel_models(self, root: Path, downloader):
+        with intel_backend():
+            with patch.object(
+                bootstrap_launcher_module,
+                "detect_windows_gpu_names",
+                return_value=["Intel(R) Iris(R) Xe Graphics"],
+            ), patch.object(
+                bootstrap_launcher_module,
+                "fetch_model_repo_size",
+                return_value=None,
+            ):
+                return download_default_models(root, lambda event: None, downloader=downloader)
+
+    def test_intel_model_repair_removes_empty_leftover_rollback_folder(self):
+        spec = bootstrap_launcher_module.OPENVINO_MODEL_DOWNLOADS[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "models" / "openvino-whisper"
+            target.mkdir(parents=True)
+            # Earlier repair copied the new model, then Windows refused to delete the emptied rollback folder.
+            write_complete_openvino_ir(target, "turbo")
+            self._write_turbo_config(target)
+            rollback = target.parent / ".openvino-whisper.rollback"
+            rollback.mkdir()
+
+            def fake_download(**kwargs):
+                staging = Path(kwargs["local_dir"])
+                write_complete_openvino_ir(staging, "turbo")
+                self._write_turbo_config(staging)
+                return str(staging)
+
+            downloaded = self._download_intel_models(root, fake_download)
+            rollback_exists = rollback.exists()
+            source = read_model_source(target)
+
+        self.assertEqual(downloaded, ["openvino-whisper"])
+        self.assertFalse(rollback_exists)
+        self.assertEqual(source, spec.repo_id)
+
+    def test_intel_model_setup_removes_rollback_once_target_holds_recorded_model(self):
+        spec = bootstrap_launcher_module.OPENVINO_MODEL_DOWNLOADS[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "models" / "openvino-whisper"
+            target.mkdir(parents=True)
+            write_complete_openvino_ir(target, "turbo")
+            self._write_turbo_config(target)
+            write_model_source(target, spec.repo_id, bootstrap_launcher_module.model_manifest_entry(spec.repo_id)["revision"])
+            rollback = target.parent / ".openvino-whisper.rollback"
+            rollback.mkdir()
+            (rollback / "old.bin").write_bytes(b"old weights")
+            calls = []
+
+            downloaded = self._download_intel_models(root, lambda **kwargs: calls.append(kwargs))
+            rollback_exists = rollback.exists()
+
+        self.assertEqual(downloaded, [])
+        self.assertEqual(calls, [])
+        self.assertFalse(rollback_exists)
+
+    def test_intel_model_repair_succeeds_when_rollback_folder_stays_locked(self):
+        spec = bootstrap_launcher_module.OPENVINO_MODEL_DOWNLOADS[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "models" / "openvino-whisper"
+            target.mkdir(parents=True)
+            write_complete_openvino_ir(target, "old")
+            (target / "config.json").write_text(
+                json.dumps({"d_model": 768, "encoder_layers": 12, "decoder_layers": 12, "num_mel_bins": 80}),
+                encoding="utf-8",
+            )
+            rollback = target.parent / ".openvino-whisper.rollback"
+            real_rmtree = bootstrap_launcher_module.shutil.rmtree
+
+            def locked_rollback_rmtree(path, *args, **kwargs):
+                if Path(path) == rollback:
+                    raise PermissionError(5, "Access is denied", str(rollback))
+                return real_rmtree(path, *args, **kwargs)
+
+            def fake_download(**kwargs):
+                staging = Path(kwargs["local_dir"])
+                write_complete_openvino_ir(staging, "turbo")
+                self._write_turbo_config(staging)
+                return str(staging)
+
+            with patch.object(bootstrap_launcher_module.shutil, "rmtree", side_effect=locked_rollback_rmtree), patch.object(
+                bootstrap_launcher_module.time, "sleep"
+            ):
+                downloaded = self._download_intel_models(root, fake_download)
+            installed = json.loads((target / "config.json").read_text(encoding="utf-8"))
+            source = read_model_source(target)
+            rollback_exists = rollback.exists()
+
+        self.assertEqual(downloaded, ["openvino-whisper"])
+        self.assertEqual(installed["decoder_layers"], 4)
+        self.assertEqual(source, spec.repo_id)
+        self.assertTrue(rollback_exists)
+
+    def test_remove_model_rollback_retries_while_folder_is_locked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rollback = Path(tmp) / ".openvino-whisper.rollback"
+            rollback.mkdir()
+            real_rmtree = bootstrap_launcher_module.shutil.rmtree
+            attempts = []
+
+            def flaky_rmtree(path, *args, **kwargs):
+                attempts.append(path)
+                if len(attempts) < 3:
+                    raise PermissionError(5, "Access is denied", str(path))
+                return real_rmtree(path, *args, **kwargs)
+
+            with patch.object(bootstrap_launcher_module.shutil, "rmtree", side_effect=flaky_rmtree), patch.object(
+                bootstrap_launcher_module.time, "sleep"
+            ) as sleep:
+                removed = bootstrap_launcher_module.remove_model_rollback(rollback)
+            rollback_exists = rollback.exists()
+
+        self.assertTrue(removed)
+        self.assertFalse(rollback_exists)
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(sleep.call_count, 2)
+
     def test_model_downloader_calls_snapshot_for_missing_default_models(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

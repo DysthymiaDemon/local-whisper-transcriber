@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import ssl
+import stat
 import subprocess
 import sys
 import threading
@@ -1692,6 +1693,60 @@ def model_rollback_path(target: Path) -> Path:
     return target.parent / f".{target.name}.rollback"
 
 
+MODEL_ROLLBACK_REMOVE_ATTEMPTS = 5
+MODEL_ROLLBACK_REMOVE_RETRY_SECONDS = 0.5
+
+
+def _clear_readonly_and_retry(function: Callable[..., Any], path: str, _error: BaseException) -> None:
+    os.chmod(path, stat.S_IWRITE)
+    function(path)
+
+
+def remove_model_rollback(rollback: Path) -> bool:
+    """Delete a rollback folder; True once it is gone.
+
+    OneDrive, Defender or File Explorer can briefly hold a handle on the folder after its files are deleted,
+    which makes Windows refuse the final rmdir with WinError 5. Retry a few times, then give up quietly:
+    the caller decides whether a leftover folder matters.
+    """
+    for attempt in range(MODEL_ROLLBACK_REMOVE_ATTEMPTS):
+        if not rollback.exists():
+            return True
+        try:
+            shutil.rmtree(rollback, onexc=_clear_readonly_and_retry)
+        except OSError:
+            if attempt + 1 < MODEL_ROLLBACK_REMOVE_ATTEMPTS:
+                time.sleep(MODEL_ROLLBACK_REMOVE_RETRY_SECONDS)
+    return not rollback.exists()
+
+
+def _folder_has_files(folder: Path) -> bool:
+    return any(item.is_file() for item in folder.rglob("*"))
+
+
+def clear_stale_model_rollback(spec: ModelDownloadSpec, target: Path) -> None:
+    """Remove a rollback folder left by an earlier run when it holds nothing that still needs recovering.
+
+    That is an empty folder (its files were deleted but the folder itself was locked), or any folder once the
+    target holds the complete approved model recorded by setup. Otherwise the rollback may be the only good copy
+    of the model, so setup stops and leaves it alone.
+    """
+    rollback = model_rollback_path(target)
+    if not rollback.exists():
+        return
+    leftover = not _folder_has_files(rollback)
+    if not leftover and _model_folder_ready_at(target, spec.name):
+        repo_id, revision = read_model_source_details(target)
+        leftover = repo_id == spec.repo_id and revision == model_manifest_entry(spec.repo_id)["revision"]
+    if not leftover:
+        raise RuntimeError(f"Model rollback folder already exists: {rollback}")
+    if not remove_model_rollback(rollback):
+        raise RuntimeError(
+            f"Could not remove the leftover model rollback folder {rollback} because Windows reports it is in use.\n"
+            "Close File Explorer windows showing the models folder, pause OneDrive syncing, then open the app again."
+        )
+
+
 def copy_staged_model_to_target(staging: Path, target: Path, model_name: str | None = None) -> None:
     rollback = model_rollback_path(target)
     if rollback.exists():
@@ -1713,8 +1768,6 @@ def copy_staged_model_to_target(staging: Path, target: Path, model_name: str | N
         if had_target and rollback.exists():
             rollback.replace(target)
         raise
-    if rollback.exists():
-        shutil.rmtree(rollback)
 
 
 def verify_downloaded_model(
@@ -1810,9 +1863,7 @@ def download_default_models(root: Path, on_event, downloader: Callable[..., str]
     total = len(model_downloads)
     for index, spec in enumerate(model_downloads, start=1):
         target = root / spec.target_subdir
-        rollback = model_rollback_path(target)
-        if rollback.exists():
-            raise RuntimeError(f"Model rollback folder already exists: {rollback}")
+        clear_stale_model_rollback(spec, target)
         target.mkdir(parents=True, exist_ok=True)
         base_progress = int(((index - 1) / total) * 100)
         if _model_folder_ready(root, spec.name) and not model_needs_upgrade(root, spec):
@@ -1863,6 +1914,10 @@ def download_default_models(root: Path, on_event, downloader: Callable[..., str]
         verify_downloaded_model(root, spec, target, returned_path)
         write_model_source(target, spec.repo_id, approved_revision)
         downloaded.append(spec.name)
+        rollback = model_rollback_path(target)
+        if not remove_model_rollback(rollback):
+            # The new model is installed and recorded; the next run removes the folder once nothing holds it.
+            detail = f"{detail} (old model folder {rollback} is in use and will be removed on the next start)"
         on_event(PipProgressEvent("Model downloaded", detail, end_progress, detail))
     return downloaded
 
