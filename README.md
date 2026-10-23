@@ -5,7 +5,7 @@ Meeting Scribe is a Windows desktop app that transcribes meetings on your own la
 It is built for managed corporate Windows 11 laptops:
 
 - The internet is used only while setup installs Python packages and downloads the speech model.
-- After setup, the app never uses the network. Audio, transcripts and models stay on the laptop.
+- After setup, the app makes no network connections of its own and blocks network calls from its Python code. Audio, transcripts and models stay on the laptop, unless you choose files on a network share. Native libraries are outside that block; see [Network policy](#network-policy).
 - Everything you launch is plain Python (`.pyw`). The app does not need `.cmd`, `.bat` or PowerShell scripts, which managed laptops usually block.
 - No admin rights are needed.
 
@@ -111,7 +111,7 @@ If you set your own model folder in `config.json`, it is never replaced.
 |---|---|
 | Setup, after you click **Install** | `pip` downloads the exact wheels listed in `resources\requirements.lock.txt`, plus `resources\requirements-openvino.lock.txt` on Intel GPU laptops. Hugging Face downloads the speech model at a pinned commit, with no login token. |
 | Setup window open, before **Install** | None. |
-| Running the app | None. |
+| Running the app | None from the app. Python network calls are blocked. Native libraries and network-share paths are outside that block (see the limits below). |
 
 How the app stays offline after setup:
 
@@ -139,7 +139,7 @@ The Python block cannot stop code in native libraries. If IT wants an operating-
 
 The launcher's checksum changes with every release:
 
-`Open Offline Meeting Transcriber.pyw` SHA-256: `687108f869abc624fe367b8fc11f49be24b4596a41552b5e03a7063a830b8464`
+`Open Offline Meeting Transcriber.pyw` SHA-256: `828da985f974c29b37d24642fe340fe78b92217ee4925be30b2c2d57ff2d2c4a`
 
 To check a copy, run this in a terminal in its folder, and compare the result with the line above as published in this repository:
 

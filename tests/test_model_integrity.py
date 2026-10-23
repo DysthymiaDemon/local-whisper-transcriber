@@ -1,3 +1,4 @@
+import _winapi
 import hashlib
 import json
 import os
@@ -118,6 +119,41 @@ class ManagedModelTests(unittest.TestCase):
         (self.resources / "model_manifest.json").write_text(json.dumps({}), encoding="utf-8")
         with self.assertRaises(ModelIntegrityError):
             verify_managed_model(self.model)
+
+    def junction_to(self, target: Path) -> Path:
+        """Replace the default CPU folder with a junction to target, as a writer to the models folder could."""
+        if not hasattr(_winapi, "CreateJunction"):
+            self.skipTest("Junctions need Windows.")
+        for name in FILES:
+            (self.model / name).unlink()
+        self.model.rmdir()
+        _winapi.CreateJunction(str(target), str(self.model))
+        self.addCleanup(lambda: os.path.isdir(self.model) and os.rmdir(self.model))
+        return self.model
+
+    def test_junction_at_default_folder_is_still_verified(self):
+        outside = self.root / "elsewhere"
+        write_model(outside)
+        self.junction_to(outside)
+        with self.assertRaisesRegex(ModelIntegrityError, "no setup record"):
+            verify_managed_model(self.model)
+        write_model_source(outside, CPU_REPO, REVISION)
+        self.assertEqual(verify_managed_model(self.model), CPU_REPO)
+        # The junction's target, named directly, is the same folder.
+        self.assertEqual(verify_managed_model(outside), CPU_REPO)
+        (outside / "model.bin").write_bytes(b"weightz")
+        with self.assertRaisesRegex(ModelIntegrityError, "changed: model.bin"):
+            verify_managed_model(self.model)
+
+    def test_model_behind_junction_without_marker_is_never_constructed(self):
+        outside = self.root / "elsewhere"
+        write_model(outside)
+        self.junction_to(outside)
+        calls = []
+        with self.fake_whisper(calls):
+            with self.assertRaises(ModelIntegrityError):
+                load_whisper_model(EngineConfig(whisper_model_dir=str(self.model)))
+        self.assertEqual(calls, [])
 
     def fake_whisper(self, calls):
         class FakeWhisperModel:

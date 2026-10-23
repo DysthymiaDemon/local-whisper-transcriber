@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -91,19 +92,28 @@ def verify_files(folder: Path, entry: dict[str, Any]) -> list[str]:
     return problems
 
 
+def _same_folder(folder: Path, setup_folder: Path) -> bool:
+    """True when folder names setup_folder by any route.
+
+    The plain path matters as much as the resolved one: a junction or link placed at the setup path resolves
+    somewhere else, but it is still the folder the app loads by default. samefile covers 8.3 names and subst drives.
+    """
+    if os.path.normcase(os.path.abspath(folder)) == os.path.normcase(os.path.abspath(setup_folder)):
+        return True
+    try:
+        return folder.resolve() == setup_folder.resolve() or os.path.samefile(folder, setup_folder)
+    except OSError:
+        return False
+
+
 def managed_model_repo(folder: Path | str, app_root: Path | None = None) -> str | None:
     """The repo id setup downloads into folder when it is a setup model folder under the app root, else None."""
     if app_root is None:
         from app_config import application_root
 
         app_root = application_root()
-    try:
-        target = Path(folder).resolve()
-        models = (Path(app_root) / "models").resolve()
-    except OSError:
-        return None
     for name, repo_id in SETUP_MODEL_REPOS.items():
-        if target == models / name:
+        if _same_folder(Path(folder), Path(app_root) / "models" / name):
             return repo_id
     return None
 
