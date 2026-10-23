@@ -139,7 +139,7 @@ The Python block cannot stop code in native libraries. If IT wants an operating-
 
 The launcher's checksum changes with every release:
 
-`Open Offline Meeting Transcriber.pyw` SHA-256: `34cc6f71241e934570d7bd667e4b024ecdbdf8181306fa5ca61d501828590ccd`
+`Open Offline Meeting Transcriber.pyw` SHA-256: `5e4ae9874180454a7749c10763bb6d83484d935c6101dfceeefc601d83b7c3a7`
 
 To check a copy, run this in a terminal in its folder, and compare the result with the line above as published in this repository:
 

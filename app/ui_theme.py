@@ -69,7 +69,7 @@ QWidget {{
     font-size: 10pt;
     color: {BUTTON_TEXT};
 }}
-QMainWindow, QWidget#sessionPage {{
+QMainWindow, QWidget#sessionPage, QDialog, QMessageBox {{
     background: {BACKGROUND_TOP};
 }}
 QPushButton {{
@@ -364,6 +364,17 @@ class HoverIconButton(QPushButton):
         super().changeEvent(event)
         if event.type() == event.Type.EnabledChange:
             self._refresh_icon()
+
+
+def use_light_color_scheme(app: Any) -> None:
+    """Keep Meeting Scribe light when Windows is in dark mode.
+
+    The stylesheet uses dark text everywhere. Under a dark Windows theme, Qt gives dialogs such as QMessageBox a
+    dark palette, and that text becomes unreadable on it.
+    """
+    set_color_scheme = getattr(app.styleHints(), "setColorScheme", None)  # Qt 6.8 or newer
+    if set_color_scheme is not None:
+        set_color_scheme(Qt.ColorScheme.Light)
 
 
 def add_soft_shadow(widget: QWidget) -> None:

@@ -21,6 +21,7 @@ from transcriber_engine import (
     audio_chunk_duration_seconds,
     default_cpu_thread_count,
     effective_cpu_threads,
+    default_wasapi_output_device,
     has_wasapi_output_device,
     microphone_health_message,
     preferred_input_sample_rate,
@@ -512,6 +513,45 @@ class EngineConfigTests(unittest.TestCase):
                 errors = config.validate()
 
         self.assertTrue(any("WASAPI output" in error for error in errors))
+
+    def _loopback_config(self, tmp, system_device_index=None):
+        whisper = os.path.join(tmp, "whisper")
+        os.mkdir(whisper)
+        write_model_files(whisper)
+        return EngineConfig(
+            whisper_model_dir=whisper,
+            output_file=os.path.join(tmp, "out.txt"),
+            capture_mode=CAPTURE_MODE_LOOPBACK,
+            system_device_index=system_device_index,
+        )
+
+    def test_validate_accepts_default_output_when_windows_has_a_wasapi_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._loopback_config(tmp)
+            with patch("transcriber_engine.default_wasapi_output_device", return_value=7):
+                errors = config.validate()
+
+        self.assertFalse(any("playback device" in error or "loopback" in error.lower() for error in errors), errors)
+
+    def test_validate_rejects_default_output_without_a_wasapi_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._loopback_config(tmp)
+            with patch("transcriber_engine.default_wasapi_output_device", return_value=None):
+                errors = config.validate()
+
+        self.assertTrue(any("no default playback device" in error for error in errors), errors)
+
+    def test_default_wasapi_output_device_reads_wasapi_host_api_default(self):
+        fake_sd = type(sys)("sounddevice")
+        fake_sd.query_hostapis = lambda: [
+            {"name": "MME", "default_output_device": 3},
+            {"name": "Windows WASAPI", "default_output_device": 12},
+        ]
+
+        with patch("os.name", "nt"), patch.dict(sys.modules, {"sounddevice": fake_sd}):
+            self.assertEqual(default_wasapi_output_device(), 12)
+            fake_sd.query_hostapis = lambda: [{"name": "Windows WASAPI", "default_output_device": -1}]
+            self.assertIsNone(default_wasapi_output_device())
 
     def test_has_wasapi_output_device_false_on_non_windows(self):
         with patch("os.name", "posix"):

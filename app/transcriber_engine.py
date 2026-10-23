@@ -131,6 +131,26 @@ def has_wasapi_output_device(device_index: Optional[int]) -> bool:
         return False
 
 
+def default_wasapi_output_device() -> Optional[int]:
+    """Index of the Windows default playback device under WASAPI, which loopback capture needs; None if absent.
+
+    sounddevice's own default output usually belongs to MME, so "Default output" must be resolved through the
+    WASAPI host API instead.
+    """
+    if os.name != "nt":
+        return None
+    try:
+        import sounddevice as sd
+
+        for hostapi in sd.query_hostapis():
+            if "wasapi" in str(hostapi.get("name", "")).lower():
+                index = int(hostapi.get("default_output_device", -1))
+                return index if index >= 0 else None
+    except Exception:
+        return None
+    return None
+
+
 def resample_audio(samples: Any, source_rate: int, target_rate: int) -> Any:
     import numpy as np
 
@@ -346,14 +366,16 @@ class EngineConfig:
                 "Capture mode must be one of mic, loopback, or mixed."
             )
         if capture_mode in {CAPTURE_MODE_LOOPBACK, CAPTURE_MODE_MIXED}:
-            if not isinstance(self.system_device_index, int):
-                errors.append("System loopback device is required for loopback or mixed capture.")
+            if self.system_device_index is None:
+                if default_wasapi_output_device() is None:
+                    errors.append(
+                        "Windows has no default playback device for system audio capture. "
+                        "Choose a WASAPI output device under Output."
+                    )
             elif not has_wasapi_output_device(self.system_device_index):
                 errors.append(
                     "Selected loopback device is not WASAPI output. Windows loopback capture requires WASAPI output."
                 )
-        if capture_mode == CAPTURE_MODE_MIXED and not isinstance(self.input_device, int):
-            errors.append("Microphone device is required for mixed capture.")
         if capture_mode != CAPTURE_MODE_MIC:
             if os.name != "nt":
                 errors.append("Loopback capture requires Windows platform support.")
@@ -758,7 +780,11 @@ class MeetingTranscriberEngine:
         if capture_mode in {CAPTURE_MODE_MIC, CAPTURE_MODE_MIXED}:
             specs.append((CAPTURE_SOURCES_MIC, self.config.input_device))
         if capture_mode in {CAPTURE_MODE_LOOPBACK, CAPTURE_MODE_MIXED}:
-            specs.append((CAPTURE_SOURCES_LOOPBACK, self.config.system_device_index))
+            system_device = self.config.system_device_index
+            if system_device is None:
+                # "Default output": follow whatever Windows plays through now.
+                system_device = default_wasapi_output_device()
+            specs.append((CAPTURE_SOURCES_LOOPBACK, system_device))
 
         if not specs:
             self._emit(

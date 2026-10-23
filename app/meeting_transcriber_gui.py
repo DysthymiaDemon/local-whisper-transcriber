@@ -24,6 +24,7 @@ from transcriber_engine import (
     CAPTURE_MODE_MIC,
     CAPTURE_MODE_MIXED,
     list_input_devices,
+    default_wasapi_output_device,
     list_output_devices,
     preload_whisper_model,
     rms_to_meter_percent,
@@ -87,6 +88,7 @@ try:
         HoverIconButton,
         add_soft_shadow,
         draw_icon,
+        use_light_color_scheme,
         TITLE_BLUE,
         MODEL_READY,
         MODEL_STARTING,
@@ -621,8 +623,7 @@ class MainWindow(QMainWindow):
         else:
             self.system_device_combo.setToolTip("")
 
-        fallback_possible = mode == CAPTURE_MODE_MIXED and self._selected_system_device() is not None
-        self.allow_fallback_checkbox.setEnabled(fallback_possible)
+        self.allow_fallback_checkbox.setEnabled(mode == CAPTURE_MODE_MIXED)
 
     def _selected_system_device(self) -> int | None:
         selected = self.system_device_combo.currentData()
@@ -634,7 +635,8 @@ class MainWindow(QMainWindow):
     def _is_selected_system_device_wasapi(self) -> bool:
         device_index = self._selected_system_device()
         if device_index is None:
-            return False
+            # "Default output" follows the Windows default playback device under WASAPI.
+            return default_wasapi_output_device() is not None
         return bool(self._output_devices_by_index.get(device_index, {}).get("wasapi", False))
 
     def _read_config(self) -> EngineConfig:
@@ -967,6 +969,7 @@ def main() -> int:
     enforce_offline()
     app = QApplication.instance() or QApplication(sys.argv)
     app.setStyle("Fusion")
+    use_light_color_scheme(app)
     app.setApplicationName(APP_NAME)
     app.setStyleSheet(APP_STYLESHEET)
     window = MainWindow()
