@@ -138,13 +138,19 @@ def verify_managed_model(
     if read_model_source_details(Path(folder)) != (repo_id, entry["revision"]):
         raise ModelIntegrityError(
             f"Speech model in {folder} has no setup record for the approved model ({MODEL_SOURCE_FILE} is missing, "
-            "unreadable or names another model or revision), so it was not loaded. Run setup to download the "
-            "approved model again."
+            "unreadable or names another model or revision), so it was not loaded. Close and reopen the app: "
+            "setup will download the approved model again."
         )
     problems = verify_files(Path(folder), entry)
     if problems:
+        # Setup only reads the marker at launch, so drop it: a default folder without one is offered for repair.
+        try:
+            (Path(folder) / MODEL_SOURCE_FILE).unlink(missing_ok=True)
+        except OSError:
+            pass
         shown = "; ".join(problems[:5])
         raise ModelIntegrityError(
-            f"Speech model files changed since setup ({shown}). Run setup to restore the approved model."
+            f"Speech model files changed since setup ({shown}), so it was not loaded. Close and reopen the app: "
+            "setup will download the approved model again."
         )
     return repo_id

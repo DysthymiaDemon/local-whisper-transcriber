@@ -239,13 +239,14 @@ class FileGuiTests(unittest.TestCase):
         from model_integrity import ModelIntegrityError
 
         self.preload.side_effect = ModelIntegrityError(
-            "Speech model files changed since setup (changed: model.bin). Run setup to restore the approved model."
+            "Speech model files changed since setup (changed: model.bin), so it was not loaded. Close and reopen the "
+            "app: setup will download the approved model again."
         )
         with patch.object(gui.EngineConfig, "validate", return_value=[]):
             self.window.model_button.click()
             self.wait_for_model_state(gui.MODEL_STOPPED)
         self.assertIn("changed since setup", self.window.model_status_label.text())
-        self.assertIn("Run setup", self.window.log_box.toPlainText())
+        self.assertIn("reopen the app", self.window.log_box.toPlainText())
 
     def test_missing_model_folder_keeps_red(self):
         with patch.object(gui.EngineConfig, "validate", return_value=["Whisper model path does not exist: C:/missing"]):

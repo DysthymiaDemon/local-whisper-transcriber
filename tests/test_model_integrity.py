@@ -105,15 +105,26 @@ class ManagedModelTests(unittest.TestCase):
         (self.model / "model.bin").write_bytes(b"weightz")
         with self.assertRaisesRegex(ModelIntegrityError, "changed: model.bin"):
             verify_managed_model(self.model)
+        write_model_source(self.model, CPU_REPO, REVISION)
         (self.model / "config.json").unlink()
         with self.assertRaisesRegex(ModelIntegrityError, "missing: config.json"):
             verify_managed_model(self.model)
+
+    def test_refused_files_clear_the_marker_so_setup_offers_repair(self):
+        write_model_source(self.model, CPU_REPO, REVISION)
+        (self.model / "model.bin").write_bytes(b"weightz")
+        with self.assertRaisesRegex(ModelIntegrityError, "reopen the app"):
+            verify_managed_model(self.model)
+        # Setup treats a default folder without a marker as needing a re-download.
+        self.assertFalse((self.model / MODEL_SOURCE_FILE).exists())
 
     def test_managed_folder_without_readable_manifest_is_refused(self):
         write_model_source(self.model, CPU_REPO, REVISION)
         (self.resources / "model_manifest.json").unlink()
         with self.assertRaises(ModelIntegrityError):
             verify_managed_model(self.model)
+        # The folder is not at fault, so its marker stays.
+        self.assertTrue((self.model / MODEL_SOURCE_FILE).exists())
 
     def test_default_folder_without_marker_is_refused_even_without_a_manifest_entry(self):
         (self.resources / "model_manifest.json").write_text(json.dumps({}), encoding="utf-8")
@@ -192,7 +203,7 @@ class ManagedModelTests(unittest.TestCase):
     def test_default_model_without_marker_is_never_constructed(self):
         calls = []
         with self.fake_whisper(calls):
-            with self.assertRaisesRegex(ModelIntegrityError, "Run setup"):
+            with self.assertRaisesRegex(ModelIntegrityError, "reopen the app"):
                 load_whisper_model(EngineConfig(whisper_model_dir=str(self.model)))
         self.assertEqual(calls, [])
         self.assertFalse(transcriber_engine.whisper_model_is_loaded(EngineConfig(whisper_model_dir=str(self.model))))

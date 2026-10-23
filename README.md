@@ -94,7 +94,7 @@ Setup checks that the model folder is complete. The app never loads a partial fo
 When you launch the new version on an existing install, setup can show one of two prompts:
 
 - **Use your Intel GPU?** appears on Intel laptops still on the CPU engine.
-- **Repair speech model?** appears when setup cannot confirm that a model in the app's `models` folder is the approved one. That covers the older `Systran/faster-whisper-small.en`, a model from before setup recorded what it downloaded, and a model whose `MODEL_SOURCE.json` or files changed after setup. The app refuses to load such a model.
+- **Repair speech model?** appears when setup cannot confirm that a model in the app's `models` folder is the approved one. That covers the older `Systran/faster-whisper-small.en`, a model from before setup recorded what it downloaded, and a model whose `MODEL_SOURCE.json` or files changed after setup. The app refuses to load such a model. Changed files are found when the model starts; close and reopen the app to get this prompt.
 
 Choices:
 
@@ -139,7 +139,7 @@ The Python block cannot stop code in native libraries. If IT wants an operating-
 
 The launcher's checksum changes with every release:
 
-`Open Offline Meeting Transcriber.pyw` SHA-256: `828da985f974c29b37d24642fe340fe78b92217ee4925be30b2c2d57ff2d2c4a`
+`Open Offline Meeting Transcriber.pyw` SHA-256: `85b91e9590b1e6c862016830b2017c377d00805fc4e08421c896518a5ff9e27e`
 
 To check a copy, run this in a terminal in its folder, and compare the result with the line above as published in this repository:
 
